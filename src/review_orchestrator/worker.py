@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
@@ -939,44 +940,78 @@ async def _extract_openhands_json_result(
 ) -> dict[str, Any] | None:
     if not conversation_id:
         return None
-    page = await openhands_client.list_events(conversation_id, limit=100)
-    for event in reversed(page.items):
-        candidate = _extract_text(event)
-        if not candidate:
-            continue
-        parsed = _try_json(candidate)
-        if isinstance(parsed, dict) and "summary" in parsed and "findings" in parsed:
-            return parsed
+    events: list[dict[str, Any]] = []
+    page_id: str | None = None
+    for _ in range(20):
+        page = await openhands_client.list_events(
+            conversation_id,
+            page_id=page_id,
+            limit=100,
+        )
+        events.extend(page.items)
+        if not page.next_page_id:
+            break
+        page_id = page.next_page_id
+    for event in reversed(events):
+        for candidate in _extract_text_candidates(event):
+            parsed = _try_json(candidate)
+            if _is_review_result_payload(parsed):
+                return parsed
     return None
 
 
-def _extract_text(value: Any) -> str | None:
+def _is_review_result_payload(value: Any) -> bool:
+    return isinstance(value, dict) and "summary" in value and "findings" in value
+
+
+def _extract_text_candidates(value: Any) -> list[str]:
     if isinstance(value, str):
-        return value
+        return [value]
     if isinstance(value, dict):
-        for key in ("text", "content", "message"):
-            text = _extract_text(value.get(key))
-            if text:
-                return text
-        return None
+        candidates: list[str] = []
+        for key in ("text", "content", "message", "thought", "observation"):
+            candidates.extend(_extract_text_candidates(value.get(key)))
+        for key, item in value.items():
+            if key not in {"text", "content", "message", "thought", "observation"}:
+                candidates.extend(_extract_text_candidates(item))
+        return candidates
     if isinstance(value, list):
-        parts = [_extract_text(item) for item in value]
-        joined = "\n".join(part for part in parts if part)
-        return joined or None
-    return None
+        candidates = []
+        for item in value:
+            candidates.extend(_extract_text_candidates(item))
+        return candidates
+    return []
 
 
 def _try_json(text: str) -> Any:
     stripped = text.strip()
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
+    candidates = [stripped]
+    candidates.extend(
+        match.group("json").strip() for match in _FENCED_JSON_RE.finditer(stripped)
+    )
+    for candidate in candidates:
+        parsed = _loads_json(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+_FENCED_JSON_RE = re.compile(
+    r"```(?:json|JSON)?\s*(?P<json>.*?)```",
+    re.DOTALL,
+)
+
+
+def _loads_json(text: str) -> Any:
+    if text.startswith("```"):
+        lines = text.splitlines()
         if lines and lines[0].startswith("```"):
             lines = lines[1:]
         if lines and lines[-1].startswith("```"):
             lines = lines[:-1]
-        stripped = "\n".join(lines).strip()
+        text = "\n".join(lines).strip()
     try:
-        return json.loads(stripped)
+        return json.loads(text)
     except json.JSONDecodeError:
         return None
 

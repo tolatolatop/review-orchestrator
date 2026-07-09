@@ -157,7 +157,10 @@ class OpenHandsClient:
         return response.json()
 
     def _start_payload(self, review_input: ReviewSkillInput) -> dict[str, Any]:
-        prompt = json.dumps(review_input.model_dump(), ensure_ascii=False, indent=2)
+        prompt_input = review_input.model_copy(
+            update={"workspace_path": _openhands_workspace_path(review_input)}
+        )
+        prompt = json.dumps(prompt_input.model_dump(), ensure_ascii=False, indent=2)
         return {
             "title": (
                 f"Review PR #{review_input.pr_number}: {review_input.repo_full_name}"
@@ -182,10 +185,17 @@ class OpenHandsClient:
             "system_message_suffix": (
                 "You are running inside an automated PR review session. "
                 "Use the workspace path and base/head commit range from the "
-                "user message. Do not publish to GitHub. Return only JSON with "
-                "`summary` and `findings` matching the Review Orchestrator schema."
+                "user message. If the workspace path is unavailable, use the "
+                "current repository checkout. Do not publish to GitHub. Return "
+                "only JSON with `summary` and `findings` matching the Review "
+                "Orchestrator schema."
             ),
         }
+
+
+def _openhands_workspace_path(review_input: ReviewSkillInput) -> str:
+    repo_name = review_input.repo_full_name.rsplit("/", 1)[-1]
+    return f"/workspace/project/{repo_name}"
 
 
 def _first_item(response: Any) -> dict[str, Any] | None:
