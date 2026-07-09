@@ -25,6 +25,12 @@ uv run ruff check .
 uv run pytest
 ```
 
+The BDD/E2E scenario matrix and local-only fixture strategy are documented in
+[`docs/bdd-e2e.md`](docs/bdd-e2e.md). The default E2E tests use SQLite, a
+temporary git repository, fixture GitHub payloads, and a fake OpenHands client;
+optional real PostgreSQL/OpenHands/GitHub integration tests are intentionally not
+part of the default command.
+
 Default database:
 
 ```text

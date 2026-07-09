@@ -1,0 +1,10 @@
+[
+  {
+    "path": "src/auth.py",
+    "commentable_lines": [
+      1,
+      2,
+      3
+    ]
+  }
+]
