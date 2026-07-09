@@ -31,6 +31,9 @@ temporary git repository, fixture GitHub payloads, and a fake OpenHands client;
 optional real PostgreSQL/OpenHands/GitHub integration tests are intentionally not
 part of the default command.
 
+Deployment guidance for local, test, and production environments is documented
+in [`docs/deployment.md`](docs/deployment.md).
+
 Default database:
 
 ```text
