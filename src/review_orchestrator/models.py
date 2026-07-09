@@ -136,6 +136,7 @@ class ReviewRun(Base):
         ForeignKey("provider_event_inbox.id"), nullable=True, index=True
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    stage: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     summary_comment_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     workspace_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     review_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -149,6 +150,19 @@ class ReviewRun(Base):
     validation_errors_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
     failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lock_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    locked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    superseded_by_review_run_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True
+    )
+    soft_timeout_emitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    hard_timeout_emitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -198,16 +212,31 @@ class Finding(Base):
     review_run_id: Mapped[str] = mapped_column(
         ForeignKey("review_run.id"), nullable=False, index=True
     )
+    pull_request_context_id: Mapped[str | None] = mapped_column(
+        ForeignKey("pull_request_context.id"), nullable=True, index=True
+    )
     fingerprint: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     file_path: Mapped[str] = mapped_column(Text, nullable=False)
     line_start: Mapped[int | None] = mapped_column(nullable=True)
     line_end: Mapped[int | None] = mapped_column(nullable=True)
+    diff_hunk_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     severity: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     category: Mapped[str | None] = mapped_column(String(64), nullable=True)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     suggestion: Mapped[str | None] = mapped_column(Text, nullable=True)
     confidence: Mapped[float | None] = mapped_column(nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="new")
+    first_seen_run_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True
+    )
+    last_seen_run_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True
+    )
+    resolved_run_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, index=True
+    )
+    outcome: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     raw_payload_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
@@ -273,6 +302,36 @@ class RetryJob(Base):
         DateTime(timezone=True), index=True
     )
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class AgentTask(Base):
+    __tablename__ = "agent_task"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    provider_event_id: Mapped[str | None] = mapped_column(
+        ForeignKey("provider_event_inbox.id"), nullable=True, index=True
+    )
+    pull_request_context_id: Mapped[str | None] = mapped_column(
+        ForeignKey("pull_request_context.id"), nullable=True, index=True
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    repo_full_name: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    pull_request_number: Mapped[int] = mapped_column(nullable=False, index=True)
+    task_type: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="mention"
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    input_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

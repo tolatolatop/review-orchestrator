@@ -34,6 +34,7 @@ class ReviewRunRead(BaseModel):
     attempt: int
     trigger_type: str
     status: ReviewRunStatus
+    stage: str | None
     summary_comment_id: str | None
     workspace_path: str | None
     review_summary: str | None
@@ -43,6 +44,11 @@ class ReviewRunRead(BaseModel):
     finding_count_by_severity: dict | None
     failure_code: str | None
     error: str | None
+    lock_owner: str | None
+    locked_until: datetime | None
+    superseded_by_review_run_id: str | None
+    soft_timeout_emitted_at: datetime | None
+    hard_timeout_emitted_at: datetime | None
     started_at: datetime | None
     completed_at: datetime | None
     deadline_at: datetime | None
@@ -57,6 +63,7 @@ class WebhookAccepted(BaseModel):
     status: str = "received"
     internal_event: str | None = None
     review_run_id: str | None = None
+    agent_task_id: str | None = None
     duplicate: bool = False
 
 
