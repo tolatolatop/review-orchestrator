@@ -81,6 +81,33 @@ def test_parse_review_result_downgrades_uncommentable_line_to_summary() -> None:
     assert parsed.summary_only_findings[0].line == 99
 
 
+def test_parse_review_result_accepts_summary_only_finding_without_line() -> None:
+    parsed = parse_review_result(
+        {
+            "summary": "One repo-level issue found.",
+            "findings": [
+                {
+                    "file": "src/app.py",
+                    "severity": "info",
+                    "category": "maintainability",
+                    "message": "The new module lacks a clear ownership boundary.",
+                    "confidence": 0.7,
+                }
+            ],
+        },
+        changed_files=[ChangedFile(path="src/app.py", commentable_lines={12, 13})],
+        provider="github",
+        repo_full_name="owner/repo",
+        pr_number=10,
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+    )
+
+    assert parsed.findings[0].publish_as_line_comment is False
+    assert parsed.findings[0].reason == "line_not_provided"
+    assert parsed.summary_only_findings[0].line is None
+
+
 def test_parse_review_result_rejects_invalid_json() -> None:
     with pytest.raises(ReviewResultError) as error:
         parse_review_result(
