@@ -36,7 +36,9 @@ in [`docs/deployment.md`](docs/deployment.md).
 
 Guidance for extending the GitHub MVP to GitLab, Azure DevOps, Bitbucket,
 GitCode, and other providers is documented in
-[`docs/platform-extension.md`](docs/platform-extension.md).
+[`docs/platform-extension.md`](docs/platform-extension.md). A Chinese version is
+also available at
+[`docs/platform-extension_zh.md`](docs/platform-extension_zh.md).
 
 Default database:
 
