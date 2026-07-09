@@ -16,6 +16,13 @@ class Settings(BaseSettings):
         default="sqlite+aiosqlite:///./review_orchestrator.db",
         description="SQLAlchemy async database URL for SQLite or PostgreSQL.",
     )
+    github_webhook_secret: str | None = Field(
+        default=None,
+        description=(
+            "GitHub App webhook secret. If unset, signature verification is "
+            "skipped for local development."
+        ),
+    )
 
 
 @lru_cache

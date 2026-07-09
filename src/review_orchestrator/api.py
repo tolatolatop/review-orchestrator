@@ -1,21 +1,69 @@
-from typing import Any
-
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from review_orchestrator.db import get_session
+from review_orchestrator.github import (
+    GitHubWebhookError,
+    normalize_github_event,
+    parse_json_body,
+    verify_signature,
+)
 from review_orchestrator.schemas import ReviewRunCreate, ReviewRunRead, WebhookAccepted
-from review_orchestrator.services import create_review_run, get_review_run
+from review_orchestrator.services import (
+    accept_github_webhook,
+    create_review_run,
+    get_review_run,
+)
 
 router = APIRouter(prefix="/api/v1")
 session_dependency = Depends(get_session)
 
 
 @router.post("/webhooks/{provider}", response_model=WebhookAccepted)
-async def accept_webhook(provider: str, payload: dict[str, Any]) -> WebhookAccepted:
-    # MVP placeholder: validate/authenticate provider payloads before enqueueing work.
-    _ = payload
-    return WebhookAccepted(provider=provider)
+async def accept_webhook(
+    provider: str,
+    request: Request,
+    session: AsyncSession = session_dependency,
+) -> WebhookAccepted:
+    if provider != "github":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unsupported provider: {provider}",
+        )
+
+    raw_body = await request.body()
+    delivery_id = request.headers.get("X-GitHub-Delivery")
+    provider_event = request.headers.get("X-GitHub-Event")
+    if not delivery_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing X-GitHub-Delivery header.",
+        )
+    if not provider_event:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing X-GitHub-Event header.",
+        )
+
+    try:
+        verify_signature(
+            raw_body,
+            request.headers.get("X-Hub-Signature-256"),
+            request.app.state.settings.github_webhook_secret,
+        )
+        payload = parse_json_body(raw_body)
+        normalized_event = normalize_github_event(provider_event, payload)
+    except GitHubWebhookError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
+    return await accept_github_webhook(
+        session,
+        delivery_id=delivery_id,
+        provider_event=provider_event,
+        normalized_event=normalized_event,
+        payload=payload,
+        raw_body=raw_body,
+    )
 
 
 @router.post(

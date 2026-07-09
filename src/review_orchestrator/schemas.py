@@ -41,3 +41,8 @@ class ReviewRunRead(BaseModel):
 class WebhookAccepted(BaseModel):
     accepted: bool = True
     provider: str
+    delivery_id: str | None = None
+    status: str = "received"
+    internal_event: str | None = None
+    review_run_id: str | None = None
+    duplicate: bool = False
