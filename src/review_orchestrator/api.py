@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from review_orchestrator.db import get_session
@@ -9,6 +11,8 @@ from review_orchestrator.providers import ProviderRegistry, ProviderWebhookError
 from review_orchestrator.review_results import ReviewResultError
 from review_orchestrator.schemas import (
     CleanupSummary,
+    ProviderEventInboxDetail,
+    ProviderEventInboxListResponse,
     PullRequestWorkspaceCleanupRequest,
     ReviewResultCollect,
     ReviewResultCollectResponse,
@@ -32,7 +36,9 @@ from review_orchestrator.services import (
     cancel_review_session,
     collect_review_result,
     create_review_run,
+    get_provider_event_inbox_detail,
     get_review_run,
+    list_provider_event_inbox,
     retry_review_run,
     start_review_session,
     sync_review_session,
@@ -104,6 +110,56 @@ async def accept_webhook(
         payload=parsed.payload,
         raw_body=parsed.raw_body,
     )
+
+
+@router.get("/provider-events", response_model=ProviderEventInboxListResponse)
+async def list_provider_events_endpoint(
+    provider: str | None = Query(default=None, min_length=1, max_length=64),
+    repo_full_name: str | None = Query(default=None, min_length=1, max_length=512),
+    pull_request_number: int | None = Query(default=None, gt=0),
+    internal_event: str | None = Query(default=None, min_length=1, max_length=128),
+    status_filter: str | None = Query(
+        default=None,
+        alias="status",
+        min_length=1,
+        max_length=32,
+    ),
+    delivery_id: str | None = Query(default=None, min_length=1, max_length=128),
+    created_from: datetime | None = None,
+    created_to: datetime | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = session_dependency,
+) -> ProviderEventInboxListResponse:
+    return await list_provider_event_inbox(
+        session,
+        provider=provider,
+        repo_full_name=repo_full_name,
+        pull_request_number=pull_request_number,
+        internal_event=internal_event,
+        status=status_filter,
+        delivery_id=delivery_id,
+        created_from=created_from,
+        created_to=created_to,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/provider-events/{event_id}", response_model=ProviderEventInboxDetail)
+async def get_provider_event_endpoint(
+    event_id: str,
+    include_payload: bool = False,
+    session: AsyncSession = session_dependency,
+) -> ProviderEventInboxDetail:
+    event = await get_provider_event_inbox_detail(
+        session,
+        event_id,
+        include_payload=include_payload,
+    )
+    if event is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return event
 
 
 @router.post(

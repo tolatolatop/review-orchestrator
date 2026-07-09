@@ -408,6 +408,88 @@ def test_pr_issue_comment_mention_creates_agent_task(tmp_path: Path) -> None:
     assert response.json()["agent_task_id"] is not None
 
 
+def test_list_provider_events_filters_and_returns_safe_summary(
+    tmp_path: Path,
+) -> None:
+    opened_payload = pull_request_payload(action="opened")
+    opened_body = json_body(opened_payload)
+    comment_payload = {
+        "action": "created",
+        "repository": {"full_name": "example/repo"},
+        "issue": {"number": 42, "pull_request": {"url": "https://api.github/pr"}},
+        "comment": {"id": 123, "body": "@review-agent should I re-review this?"},
+    }
+    comment_body = json_body(comment_payload)
+
+    with make_signed_client(tmp_path) as client:
+        client.post(
+            "/api/v1/webhooks/github",
+            content=opened_body,
+            headers=github_headers(opened_body, delivery_id="delivery-opened"),
+        )
+        mention_response = client.post(
+            "/api/v1/webhooks/github",
+            content=comment_body,
+            headers=github_headers(
+                comment_body,
+                delivery_id="delivery-comment",
+                event="issue_comment",
+            ),
+        )
+
+        response = client.get(
+            "/api/v1/provider-events",
+            params={
+                "provider": "github",
+                "repo_full_name": "example/repo",
+                "pull_request_number": 42,
+                "internal_event": "agent_mention",
+                "status": "queued",
+                "delivery_id": "delivery-comment",
+            },
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 1
+    assert data["items"][0]["delivery_id"] == "delivery-comment"
+    assert data["items"][0]["payload_digest"]
+    assert data["items"][0]["coalesce_key"].startswith("github:example/repo:42")
+    assert data["items"][0]["agent_task_id"] == mention_response.json()["agent_task_id"]
+    assert "payload" not in data["items"][0]
+
+
+def test_get_provider_event_detail_omits_payload_by_default(
+    tmp_path: Path,
+) -> None:
+    payload = pull_request_payload(action="opened")
+    payload["installation"] = {"id": 1, "token": "sensitive-token"}
+    body = json_body(payload)
+
+    with make_signed_client(tmp_path) as client:
+        client.post(
+            "/api/v1/webhooks/github",
+            content=body,
+            headers=github_headers(body, delivery_id="delivery-detail"),
+        )
+        listed = client.get(
+            "/api/v1/provider-events",
+            params={"delivery_id": "delivery-detail"},
+        ).json()
+        event_id = listed["items"][0]["id"]
+
+        default_detail = client.get(f"/api/v1/provider-events/{event_id}")
+        payload_detail = client.get(
+            f"/api/v1/provider-events/{event_id}",
+            params={"include_payload": True},
+        )
+
+    assert default_detail.status_code == 200
+    assert default_detail.json()["payload"] is None
+    assert payload_detail.status_code == 200
+    assert payload_detail.json()["payload"]["installation"] == "[redacted]"
+
+
 def test_start_review_session_records_openhands_identifiers(tmp_path: Path) -> None:
     payload = {
         "provider": "github",
