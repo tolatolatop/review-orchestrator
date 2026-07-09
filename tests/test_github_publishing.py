@@ -129,3 +129,41 @@ async def test_publish_summary_and_line_comments(session_factory) -> None:
     assert summary_ref.provider_comment_id == "summary-1"
     assert line_stats["published"] == 1
     assert client.review_comments[0]["path"] == "src/app.py"
+
+
+async def test_empty_commentable_lines_falls_back_to_summary_only(
+    session_factory,
+) -> None:
+    client = FakeGitHubClient()
+    async with session_factory() as session:
+        review_run = await create_review_run(
+            session,
+            ReviewRunCreate(
+                provider="github",
+                repo_full_name="example/repo",
+                pull_request_number=42,
+                base_sha="a" * 40,
+                head_sha="b" * 40,
+            ),
+        )
+        finding = Finding(
+            review_run_id=review_run.id,
+            fingerprint="finding-1",
+            file_path="src/app.py",
+            line_start=2,
+            severity="high",
+            message="Auth check is skipped.",
+        )
+        session.add(finding)
+        await session.commit()
+
+        line_stats = await publish_github_line_comments(
+            session,
+            review_run,
+            github_client=client,
+            changed_files=[ChangedFile(path="src/app.py", commentable_lines=set())],
+        )
+
+    assert line_stats["summary_only"] == 1
+    assert line_stats["published"] == 0
+    assert client.review_comments == []

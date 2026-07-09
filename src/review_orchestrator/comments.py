@@ -85,7 +85,8 @@ async def publish_github_line_comments(
         if (
             line is None
             or file_lines is None
-            or (file_lines and line not in file_lines)
+            or not file_lines
+            or line not in file_lines
         ):
             stats["summary_only"] += 1
             continue

@@ -4,7 +4,8 @@ import pytest
 
 from review_orchestrator.config import Settings
 from review_orchestrator.db import create_engine, create_session_factory, init_models
-from review_orchestrator.models import AgentTask, Finding, PullRequestContext
+from review_orchestrator.github import GitHubClientError
+from review_orchestrator.models import AgentTask, Finding, PullRequestContext, ReviewRun
 from review_orchestrator.openhands import (
     OpenHandsConversation,
     OpenHandsEventPage,
@@ -52,6 +53,27 @@ class FakeOpenHandsClient:
         return self.events
 
 
+class ResultOpenHandsClient(FakeOpenHandsClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.events = OpenHandsEventPage(
+            items=[
+                {
+                    "message": {
+                        "content": {
+                            "text": (
+                                '{"summary":"Done.",'
+                                '"findings":[{"file":"src/app.py","line":2,'
+                                '"severity":"high","message":"Bug.",'
+                                '"confidence":0.9}]}'
+                            )
+                        }
+                    }
+                }
+            ]
+        )
+
+
 class FakeGitHubClient:
     async def get_pull_request(self, repo_full_name: str, pull_request_number: int):
         return {
@@ -72,6 +94,23 @@ class FakeGitHubClient:
                 "repo": {"full_name": repo_full_name},
             },
         }
+
+    async def list_pull_request_files(self, repo_full_name, pull_request_number):
+        return []
+
+    async def list_issue_comments(self, repo_full_name, pull_request_number):
+        return []
+
+    async def create_issue_comment(self, repo_full_name, pull_request_number, body):
+        return "summary-1"
+
+    async def update_issue_comment(self, repo_full_name, comment_id, body):
+        return comment_id
+
+
+class FailingChangedFilesGitHubClient(FakeGitHubClient):
+    async def list_pull_request_files(self, repo_full_name, pull_request_number):
+        raise GitHubClientError("permission denied")
 
 
 @pytest.fixture
@@ -413,4 +452,95 @@ async def test_review_worker_releases_lock_when_openhands_result_not_ready(
     assert processed.status == "running"
     assert processed.stage == "waiting_for_result"
     assert processed.lock_owner is None
-    assert processed.locked_until is None
+    assert processed.locked_until is not None
+
+
+async def test_waiting_review_run_backs_off_and_queued_run_is_prioritized(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        waiting = ReviewRun(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=41,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="running",
+            stage="waiting_for_result",
+            locked_until=utc_future(),
+        )
+        queued = ReviewRun(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="c" * 40,
+            status="queued",
+        )
+        session.add_all([waiting, queued])
+        await session.commit()
+
+        acquired = await acquire_next_review_run(session, worker_id="worker-1")
+
+    assert acquired is not None
+    assert acquired.id == queued.id
+
+
+async def test_changed_files_failure_degrades_to_summary_only_collection(
+    session_factory,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+        workspace_root=str(tmp_path / "workspaces"),
+        git_cache_root=str(tmp_path / "git-cache"),
+    )
+    async with session_factory() as session:
+        context = PullRequestContext(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="open",
+        )
+        session.add(context)
+        await session.commit()
+        review_run = await create_review_run(
+            session,
+            ReviewRunCreate(
+                provider="github",
+                repo_full_name="example/repo",
+                pull_request_number=42,
+                base_sha="a" * 40,
+                head_sha="b" * 40,
+            ),
+        )
+        review_run.pull_request_context_id = context.id
+        review_run.workspace_path = str(tmp_path / "existing-workspace")
+        session.add(review_run)
+        await session.commit()
+
+        processed = await process_next_review_run(
+            session,
+            settings=settings,
+            openhands_client=ResultOpenHandsClient(),
+            worker_id="worker-1",
+            github_client=FailingChangedFilesGitHubClient(),
+        )
+
+    assert processed is not None
+    assert processed.status == "completed"
+    assert processed.review_summary == "Done."
+    assert (
+        processed.validation_warnings_json[0]["code"]
+        == "changed_files_lookup_failed"
+    )
+
+
+def utc_future():
+    from datetime import timedelta
+
+    from review_orchestrator.models import utc_now
+
+    return utc_now() + timedelta(minutes=5)

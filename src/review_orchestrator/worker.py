@@ -14,8 +14,16 @@ from review_orchestrator.comments import (
     publish_gitlab_summary_comment,
 )
 from review_orchestrator.config import Settings
-from review_orchestrator.github import GitHubClient, fetch_changed_files
-from review_orchestrator.gitlab import GitLabClient, fetch_gitlab_changed_files
+from review_orchestrator.github import (
+    GitHubClient,
+    GitHubClientError,
+    fetch_changed_files,
+)
+from review_orchestrator.gitlab import (
+    GitLabClient,
+    GitLabClientError,
+    fetch_gitlab_changed_files,
+)
 from review_orchestrator.models import (
     AgentTask,
     ProviderEventInbox,
@@ -62,7 +70,7 @@ async def acquire_next_review_run(
                 ReviewRun.locked_until < now,
             ),
         )
-        .order_by(ReviewRun.status.desc(), ReviewRun.created_at)
+        .order_by(ReviewRun.status == "running", ReviewRun.created_at)
         .limit(1)
     )
     review_run = result.scalar_one_or_none()
@@ -168,6 +176,7 @@ async def process_next_review_run(
     if review_run is None:
         return None
 
+    release_lock = True
     try:
         context = await _review_run_context(session, review_run)
         if context is None:
@@ -221,9 +230,14 @@ async def process_next_review_run(
         )
         if raw_result is None:
             review_run.stage = "waiting_for_result"
+            review_run.lock_owner = None
+            review_run.locked_until = utc_now() + timedelta(
+                seconds=settings.worker_poll_interval_seconds
+            )
             session.add(review_run)
             await session.commit()
             await session.refresh(review_run)
+            release_lock = False
             return review_run
 
         changed_files = await _fetch_changed_files(
@@ -267,7 +281,8 @@ async def process_next_review_run(
             )
         return await session.get(ReviewRun, review_run.id)
     finally:
-        await release_review_run_lock(session, review_run.id)
+        if release_lock:
+            await release_review_run_lock(session, review_run.id)
 
 
 async def mark_review_run_stage(
@@ -537,18 +552,28 @@ async def _fetch_changed_files(
     github_client: GitHubClient | None,
     gitlab_client: GitLabClient | None,
 ):
-    if review_run.provider == "github" and github_client is not None:
-        return await fetch_changed_files(
-            github_client,
-            repo_full_name=review_run.repo_full_name,
-            pull_request_number=review_run.pull_request_number,
+    try:
+        if review_run.provider == "github" and github_client is not None:
+            return await fetch_changed_files(
+                github_client,
+                repo_full_name=review_run.repo_full_name,
+                pull_request_number=review_run.pull_request_number,
+            )
+        if review_run.provider == "gitlab" and gitlab_client is not None:
+            return await fetch_gitlab_changed_files(
+                gitlab_client,
+                project_path=review_run.repo_full_name,
+                merge_request_iid=review_run.pull_request_number,
+            )
+    except (GitHubClientError, GitLabClientError) as exc:
+        warnings = list(review_run.validation_warnings_json or [])
+        warnings.append(
+            {
+                "code": "changed_files_lookup_failed",
+                "message": f"Using summary-only fallback: {exc}",
+            }
         )
-    if review_run.provider == "gitlab" and gitlab_client is not None:
-        return await fetch_gitlab_changed_files(
-            gitlab_client,
-            project_path=review_run.repo_full_name,
-            merge_request_iid=review_run.pull_request_number,
-        )
+        review_run.validation_warnings_json = warnings
     return []
 
 
