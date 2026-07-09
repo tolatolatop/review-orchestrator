@@ -19,7 +19,7 @@ sessions.
 
 ```bash
 uv sync
-cp .env.template .env
+cp .env.example .env
 uv run uvicorn review_orchestrator.main:app --reload
 uv run ruff check .
 uv run pytest
@@ -30,6 +30,9 @@ The BDD/E2E scenario matrix and local-only fixture strategy are documented in
 temporary git repository, fixture GitHub payloads, and a fake OpenHands client;
 optional real PostgreSQL/OpenHands/GitHub integration tests are intentionally not
 part of the default command.
+
+Deployment guidance for local, test, and production environments is documented
+in [`docs/deployment.md`](docs/deployment.md).
 
 Default database:
 
@@ -99,7 +102,7 @@ Duplicate delivery IDs are idempotent and return the original event status.
 ## Runtime Configuration
 
 Infrastructure and secret values are read from environment variables. Use
-`.env.template` as the local starting point. Repository-level review behavior is
+`.env.example` as the local starting point. Repository-level review behavior is
 stored in the database with conservative defaults:
 
 - `review_enabled = true`
