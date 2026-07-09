@@ -87,6 +87,41 @@ class ResultOpenHandsClient(FakeOpenHandsClient):
         )
 
 
+class FencedThoughtResultOpenHandsClient(FakeOpenHandsClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.events = OpenHandsEventPage(
+            items=[
+                {
+                    "source": "agent",
+                    "thought": [
+                        {
+                            "text": (
+                                "Review complete.\n"
+                                "```json\n"
+                                "{\n"
+                                '  "summary": "No issues found.",\n'
+                                '  "findings": []\n'
+                                "}\n"
+                                "```"
+                            )
+                        }
+                    ],
+                }
+            ]
+        )
+
+
+class PaginatedFencedThoughtResultOpenHandsClient(FakeOpenHandsClient):
+    async def list_events(self, conversation_id: str, *, page_id=None, limit=100):
+        if page_id is None:
+            return OpenHandsEventPage(
+                items=[{"message": {"content": {"text": "still reviewing"}}}],
+                next_page_id="next",
+            )
+        return FencedThoughtResultOpenHandsClient().events
+
+
 class InvalidResultOpenHandsClient(FakeOpenHandsClient):
     def __init__(self) -> None:
         super().__init__()
@@ -638,6 +673,103 @@ async def test_changed_files_failure_degrades_to_summary_only_collection(
         processed.validation_warnings_json[0]["code"]
         == "changed_files_lookup_failed"
     )
+
+
+async def test_worker_extracts_fenced_json_result_from_openhands_thought(
+    session_factory,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+        workspace_root=str(tmp_path / "workspaces"),
+        git_cache_root=str(tmp_path / "git-cache"),
+    )
+    async with session_factory() as session:
+        context = PullRequestContext(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="open",
+        )
+        session.add(context)
+        await session.commit()
+        review_run = await create_review_run(
+            session,
+            ReviewRunCreate(
+                provider="github",
+                repo_full_name="example/repo",
+                pull_request_number=42,
+                base_sha="a" * 40,
+                head_sha="b" * 40,
+            ),
+        )
+        review_run.pull_request_context_id = context.id
+        review_run.workspace_path = str(tmp_path / "existing-workspace")
+        session.add(review_run)
+        await session.commit()
+
+        processed = await process_next_review_run(
+            session,
+            settings=settings,
+            openhands_client=FencedThoughtResultOpenHandsClient(),
+            worker_id="worker-1",
+            github_client=FakeGitHubClient(),
+        )
+
+    assert processed is not None
+    assert processed.status == "completed"
+    assert processed.review_summary == "No issues found."
+    assert processed.finding_count_by_severity == {}
+
+
+async def test_worker_extracts_result_from_paginated_openhands_events(
+    session_factory,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+        workspace_root=str(tmp_path / "workspaces"),
+        git_cache_root=str(tmp_path / "git-cache"),
+    )
+    async with session_factory() as session:
+        context = PullRequestContext(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="open",
+        )
+        session.add(context)
+        await session.commit()
+        review_run = await create_review_run(
+            session,
+            ReviewRunCreate(
+                provider="github",
+                repo_full_name="example/repo",
+                pull_request_number=42,
+                base_sha="a" * 40,
+                head_sha="b" * 40,
+            ),
+        )
+        review_run.pull_request_context_id = context.id
+        review_run.workspace_path = str(tmp_path / "existing-workspace")
+        session.add(review_run)
+        await session.commit()
+
+        processed = await process_next_review_run(
+            session,
+            settings=settings,
+            openhands_client=PaginatedFencedThoughtResultOpenHandsClient(),
+            worker_id="worker-1",
+            github_client=FakeGitHubClient(),
+        )
+
+    assert processed is not None
+    assert processed.status == "completed"
+    assert processed.review_summary == "No issues found."
 
 
 async def test_review_worker_publishes_failed_summary_on_openhands_start_failure(
