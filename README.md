@@ -34,6 +34,10 @@ part of the default command.
 Deployment guidance for local, test, and production environments is documented
 in [`docs/deployment.md`](docs/deployment.md).
 
+Guidance for extending the GitHub MVP to GitLab, Azure DevOps, Bitbucket,
+GitCode, and other providers is documented in
+[`docs/platform-extension.md`](docs/platform-extension.md).
+
 Default database:
 
 ```text
