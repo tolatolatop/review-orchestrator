@@ -9,7 +9,11 @@ from review_orchestrator.db import create_engine, create_session_factory, init_m
 from review_orchestrator.github import GitHubClient
 from review_orchestrator.gitlab import GitLabClient
 from review_orchestrator.openhands import OpenHandsClient
-from review_orchestrator.worker import process_next_agent_task, process_next_review_run
+from review_orchestrator.worker import (
+    process_next_agent_task,
+    process_next_review_run,
+    process_review_run_timeouts,
+)
 
 
 def main() -> None:
@@ -54,6 +58,14 @@ async def run_worker(
 
     try:
         while True:
+            async with session_factory() as session:
+                await process_review_run_timeouts(
+                    session,
+                    settings=settings,
+                    openhands_client=openhands_client,
+                    github_client=github_client,
+                    gitlab_client=gitlab_client,
+                )
             async with session_factory() as session:
                 agent_task = await process_next_agent_task(
                     session,

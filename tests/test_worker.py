@@ -1,3 +1,4 @@
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -5,8 +6,15 @@ import pytest
 from review_orchestrator.config import Settings
 from review_orchestrator.db import create_engine, create_session_factory, init_models
 from review_orchestrator.github import GitHubClientError
-from review_orchestrator.models import AgentTask, Finding, PullRequestContext, ReviewRun
+from review_orchestrator.models import (
+    AgentTask,
+    Finding,
+    PullRequestContext,
+    ReviewRun,
+    utc_now,
+)
 from review_orchestrator.openhands import (
+    OpenHandsClientError,
     OpenHandsConversation,
     OpenHandsEventPage,
     OpenHandsStartTask,
@@ -20,6 +28,7 @@ from review_orchestrator.worker import (
     emit_timeout_event,
     process_next_agent_task,
     process_next_review_run,
+    process_review_run_timeouts,
     release_review_run_lock,
 )
 
@@ -27,6 +36,7 @@ from review_orchestrator.worker import (
 class FakeOpenHandsClient:
     def __init__(self) -> None:
         self.events = OpenHandsEventPage(items=[])
+        self.deleted_conversation_ids = []
         self.start_task = OpenHandsStartTask(
             id="task-1",
             status=OpenHandsStartTaskStatus.ready,
@@ -52,6 +62,9 @@ class FakeOpenHandsClient:
     async def list_events(self, conversation_id: str, *, page_id=None, limit=100):
         return self.events
 
+    async def delete_conversation(self, conversation_id: str):
+        self.deleted_conversation_ids.append(conversation_id)
+
 
 class ResultOpenHandsClient(FakeOpenHandsClient):
     def __init__(self) -> None:
@@ -74,7 +87,65 @@ class ResultOpenHandsClient(FakeOpenHandsClient):
         )
 
 
+class FencedThoughtResultOpenHandsClient(FakeOpenHandsClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.events = OpenHandsEventPage(
+            items=[
+                {
+                    "source": "agent",
+                    "thought": [
+                        {
+                            "text": (
+                                "Review complete.\n"
+                                "```json\n"
+                                "{\n"
+                                '  "summary": "No issues found.",\n'
+                                '  "findings": []\n'
+                                "}\n"
+                                "```"
+                            )
+                        }
+                    ],
+                }
+            ]
+        )
+
+
+class PaginatedFencedThoughtResultOpenHandsClient(FakeOpenHandsClient):
+    async def list_events(self, conversation_id: str, *, page_id=None, limit=100):
+        if page_id is None:
+            return OpenHandsEventPage(
+                items=[{"message": {"content": {"text": "still reviewing"}}}],
+                next_page_id="next",
+            )
+        return FencedThoughtResultOpenHandsClient().events
+
+
+class InvalidResultOpenHandsClient(FakeOpenHandsClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.events = OpenHandsEventPage(
+            items=[
+                {
+                    "message": {
+                        "content": {"text": '{"summary":"bad","findings":{}}'}
+                    }
+                }
+            ]
+        )
+
+
+class StartFailingOpenHandsClient(FakeOpenHandsClient):
+    async def start_conversation(self, review_input):
+        raise OpenHandsClientError("OpenHands token invalid")
+
+
 class FakeGitHubClient:
+    def __init__(self) -> None:
+        self.issue_comments = []
+        self.updated_issue_comment_count = 0
+
     async def get_pull_request(self, repo_full_name: str, pull_request_number: int):
         return {
             "id": 2002,
@@ -99,18 +170,44 @@ class FakeGitHubClient:
         return []
 
     async def list_issue_comments(self, repo_full_name, pull_request_number):
-        return []
+        return [
+            comment
+            for comment in self.issue_comments
+            if comment.pull_request_number == pull_request_number
+        ]
 
     async def create_issue_comment(self, repo_full_name, pull_request_number, body):
-        return "summary-1"
+        comment_id = f"summary-{len(self.issue_comments) + 1}"
+        self.issue_comments.append(
+            type(
+                "Comment",
+                (),
+                {
+                    "id": comment_id,
+                    "pull_request_number": pull_request_number,
+                    "body": body,
+                },
+            )
+        )
+        return comment_id
 
     async def update_issue_comment(self, repo_full_name, comment_id, body):
+        self.updated_issue_comment_count += 1
+        for comment in self.issue_comments:
+            if str(comment.id) == str(comment_id):
+                comment.body = body
+                break
         return comment_id
 
 
 class FailingChangedFilesGitHubClient(FakeGitHubClient):
     async def list_pull_request_files(self, repo_full_name, pull_request_number):
         raise GitHubClientError("permission denied")
+
+
+class FailingPullRequestGitHubClient(FakeGitHubClient):
+    async def get_pull_request(self, repo_full_name: str, pull_request_number: int):
+        raise GitHubClientError("GitHub token invalid")
 
 
 @pytest.fixture
@@ -406,6 +503,46 @@ async def test_agent_task_worker_hydrates_context_for_first_mention(
     assert processed.pull_request_context_id is not None
 
 
+async def test_agent_task_hydrate_failure_marks_failed_and_publishes_summary(
+    session_factory,
+) -> None:
+    github_client = FailingPullRequestGitHubClient()
+    async with session_factory() as session:
+        task = AgentTask(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            task_type="mention",
+            status="queued",
+            input_json={
+                "payload": {
+                    "pull_request": {
+                        "head": {"sha": "b" * 40},
+                    }
+                }
+            },
+        )
+        session.add(task)
+        await session.commit()
+
+        processed = await process_next_agent_task(
+            session,
+            worker_id="worker-1",
+            github_client=github_client,
+        )
+
+    assert processed is not None
+    assert processed.status == "failed"
+    assert processed.error_message == "GitHub token invalid"
+    assert len(github_client.issue_comments) == 1
+    assert "Review status: failed" in github_client.issue_comments[0].body
+    assert (
+        "Failure category: provider_context_lookup_failed"
+        in github_client.issue_comments[0].body
+    )
+    assert "token [redacted]" in github_client.issue_comments[0].body
+
+
 async def test_review_worker_releases_lock_when_openhands_result_not_ready(
     session_factory,
     tmp_path: Path,
@@ -536,6 +673,376 @@ async def test_changed_files_failure_degrades_to_summary_only_collection(
         processed.validation_warnings_json[0]["code"]
         == "changed_files_lookup_failed"
     )
+
+
+async def test_worker_extracts_fenced_json_result_from_openhands_thought(
+    session_factory,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+        workspace_root=str(tmp_path / "workspaces"),
+        git_cache_root=str(tmp_path / "git-cache"),
+    )
+    async with session_factory() as session:
+        context = PullRequestContext(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="open",
+        )
+        session.add(context)
+        await session.commit()
+        review_run = await create_review_run(
+            session,
+            ReviewRunCreate(
+                provider="github",
+                repo_full_name="example/repo",
+                pull_request_number=42,
+                base_sha="a" * 40,
+                head_sha="b" * 40,
+            ),
+        )
+        review_run.pull_request_context_id = context.id
+        review_run.workspace_path = str(tmp_path / "existing-workspace")
+        session.add(review_run)
+        await session.commit()
+
+        processed = await process_next_review_run(
+            session,
+            settings=settings,
+            openhands_client=FencedThoughtResultOpenHandsClient(),
+            worker_id="worker-1",
+            github_client=FakeGitHubClient(),
+        )
+
+    assert processed is not None
+    assert processed.status == "completed"
+    assert processed.review_summary == "No issues found."
+    assert processed.finding_count_by_severity == {}
+
+
+async def test_worker_extracts_result_from_paginated_openhands_events(
+    session_factory,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+        workspace_root=str(tmp_path / "workspaces"),
+        git_cache_root=str(tmp_path / "git-cache"),
+    )
+    async with session_factory() as session:
+        context = PullRequestContext(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="open",
+        )
+        session.add(context)
+        await session.commit()
+        review_run = await create_review_run(
+            session,
+            ReviewRunCreate(
+                provider="github",
+                repo_full_name="example/repo",
+                pull_request_number=42,
+                base_sha="a" * 40,
+                head_sha="b" * 40,
+            ),
+        )
+        review_run.pull_request_context_id = context.id
+        review_run.workspace_path = str(tmp_path / "existing-workspace")
+        session.add(review_run)
+        await session.commit()
+
+        processed = await process_next_review_run(
+            session,
+            settings=settings,
+            openhands_client=PaginatedFencedThoughtResultOpenHandsClient(),
+            worker_id="worker-1",
+            github_client=FakeGitHubClient(),
+        )
+
+    assert processed is not None
+    assert processed.status == "completed"
+    assert processed.review_summary == "No issues found."
+
+
+async def test_review_worker_publishes_failed_summary_on_openhands_start_failure(
+    session_factory,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+        workspace_root=str(tmp_path / "workspaces"),
+        git_cache_root=str(tmp_path / "git-cache"),
+    )
+    github_client = FakeGitHubClient()
+    async with session_factory() as session:
+        context = PullRequestContext(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="open",
+        )
+        session.add(context)
+        await session.commit()
+        review_run = await create_review_run(
+            session,
+            ReviewRunCreate(
+                provider="github",
+                repo_full_name="example/repo",
+                pull_request_number=42,
+                base_sha="a" * 40,
+                head_sha="b" * 40,
+            ),
+        )
+        review_run.pull_request_context_id = context.id
+        review_run.workspace_path = str(tmp_path / "existing-workspace")
+        session.add(review_run)
+        await session.commit()
+
+        processed = await process_next_review_run(
+            session,
+            settings=settings,
+            openhands_client=StartFailingOpenHandsClient(),
+            worker_id="worker-1",
+            github_client=github_client,
+        )
+
+    assert processed is not None
+    assert processed.status == "failed"
+    assert "Review status: failed" in github_client.issue_comments[0].body
+    assert "Failure category: openhands_error" in github_client.issue_comments[0].body
+    assert "token [redacted]" in github_client.issue_comments[0].body
+
+
+async def test_review_worker_publishes_failed_summary_on_invalid_result(
+    session_factory,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+        workspace_root=str(tmp_path / "workspaces"),
+        git_cache_root=str(tmp_path / "git-cache"),
+    )
+    github_client = FakeGitHubClient()
+    async with session_factory() as session:
+        context = PullRequestContext(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="open",
+        )
+        session.add(context)
+        await session.commit()
+        review_run = await create_review_run(
+            session,
+            ReviewRunCreate(
+                provider="github",
+                repo_full_name="example/repo",
+                pull_request_number=42,
+                base_sha="a" * 40,
+                head_sha="b" * 40,
+            ),
+        )
+        review_run.pull_request_context_id = context.id
+        review_run.workspace_path = str(tmp_path / "existing-workspace")
+        session.add(review_run)
+        await session.commit()
+
+        processed = await process_next_review_run(
+            session,
+            settings=settings,
+            openhands_client=InvalidResultOpenHandsClient(),
+            worker_id="worker-1",
+            github_client=github_client,
+        )
+
+    assert processed is not None
+    assert processed.status == "failed"
+    assert processed.failure_code == "invalid_result"
+    assert "Review status: failed" in github_client.issue_comments[0].body
+    assert "Failure category: invalid_result" in github_client.issue_comments[0].body
+
+
+async def test_review_worker_marks_failed_on_unexpected_result_collection_error(
+    session_factory,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+        workspace_root=str(tmp_path / "workspaces"),
+        git_cache_root=str(tmp_path / "git-cache"),
+    )
+    github_client = FakeGitHubClient()
+
+    async def fail_collect(*args, **kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(
+        "review_orchestrator.worker.collect_review_result",
+        fail_collect,
+    )
+    async with session_factory() as session:
+        context = PullRequestContext(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="open",
+        )
+        session.add(context)
+        await session.commit()
+        review_run = await create_review_run(
+            session,
+            ReviewRunCreate(
+                provider="github",
+                repo_full_name="example/repo",
+                pull_request_number=42,
+                base_sha="a" * 40,
+                head_sha="b" * 40,
+            ),
+        )
+        review_run.pull_request_context_id = context.id
+        review_run.workspace_path = str(tmp_path / "existing-workspace")
+        session.add(review_run)
+        await session.commit()
+
+        processed = await process_next_review_run(
+            session,
+            settings=settings,
+            openhands_client=ResultOpenHandsClient(),
+            worker_id="worker-1",
+            github_client=github_client,
+        )
+
+    assert processed is not None
+    assert processed.status == "failed"
+    assert processed.failure_code == "worker_exception"
+    assert processed.error == "database unavailable"
+    assert "Review status: failed" in github_client.issue_comments[0].body
+    assert "Failure category: worker_exception" in github_client.issue_comments[0].body
+
+
+async def test_review_run_timeouts_publish_summary_and_cancel_openhands(
+    session_factory,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+        review_run_soft_timeout_seconds=10,
+        review_run_timeout_seconds=20,
+    )
+    github_client = FakeGitHubClient()
+    openhands_client = FakeOpenHandsClient()
+    async with session_factory() as session:
+        soft_run = ReviewRun(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=41,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="running",
+            started_at=utc_now() - timedelta(seconds=11),
+        )
+        hard_run = ReviewRun(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="c" * 40,
+            status="running",
+            started_at=utc_now() - timedelta(seconds=21),
+            openhands_conversation_id="conversation-hard",
+        )
+        session.add_all([soft_run, hard_run])
+        await session.commit()
+
+        touched = await process_review_run_timeouts(
+            session,
+            settings=settings,
+            openhands_client=openhands_client,
+            github_client=github_client,
+        )
+
+    statuses = {run.pull_request_number: run.status for run in touched}
+    assert statuses == {41: "running", 42: "failed"}
+    assert openhands_client.deleted_conversation_ids == ["conversation-hard"]
+    bodies = [comment.body for comment in github_client.issue_comments]
+    assert any("Review status: delayed" in body for body in bodies)
+    assert any("Failure category: hard_timeout" in body for body in bodies)
+
+
+async def test_soft_timeout_summary_is_not_overwritten_by_same_worker_pass(
+    session_factory,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+        workspace_root=str(tmp_path / "workspaces"),
+        git_cache_root=str(tmp_path / "git-cache"),
+        review_run_soft_timeout_seconds=10,
+        review_run_timeout_seconds=60,
+    )
+    github_client = FakeGitHubClient()
+    openhands_client = FakeOpenHandsClient()
+    async with session_factory() as session:
+        context = PullRequestContext(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="open",
+        )
+        session.add(context)
+        await session.commit()
+        review_run = ReviewRun(
+            pull_request_context_id=context.id,
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="running",
+            stage="waiting_for_result",
+            workspace_path=str(tmp_path / "existing-workspace"),
+            openhands_conversation_id="conversation-1",
+            started_at=utc_now() - timedelta(seconds=11),
+        )
+        session.add(review_run)
+        await session.commit()
+
+        await process_review_run_timeouts(
+            session,
+            settings=settings,
+            openhands_client=openhands_client,
+            github_client=github_client,
+        )
+        processed = await process_next_review_run(
+            session,
+            settings=settings,
+            openhands_client=openhands_client,
+            worker_id="worker-1",
+            github_client=github_client,
+        )
+
+    assert processed is not None
+    assert processed.status == "running"
+    assert len(github_client.issue_comments) == 1
+    assert "Review status: delayed" in github_client.issue_comments[0].body
+    assert "Review status: reviewing" not in github_client.issue_comments[0].body
 
 
 def utc_future():

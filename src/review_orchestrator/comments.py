@@ -23,12 +23,17 @@ def build_summary_comment_body(
     stat_text = ", ".join(f"{key}: {value}" for key, value in sorted(stats.items()))
     if not stat_text:
         stat_text = "no findings published"
-    return (
+    lines = [
         f"{SUMMARY_MARKER} "
-        f"run_id={review_run.id} head_sha={review_run.head_sha} -->\n"
-        f"Review status: {status_text}\n\n"
-        f"Findings: {stat_text}"
-    )
+        f"run_id={review_run.id} head_sha={review_run.head_sha} -->",
+        f"Review status: {status_text}",
+    ]
+    if review_run.failure_code:
+        lines.append(f"Failure category: {review_run.failure_code}")
+    if review_run.error:
+        lines.append(f"Error: {_safe_error_text(review_run.error)}")
+    lines.extend(["", f"Findings: {stat_text}"])
+    return "\n".join(lines)
 
 
 async def publish_github_summary_comment(
@@ -44,6 +49,9 @@ async def publish_github_summary_comment(
         status_text=status_text,
         finding_stats=finding_stats,
     )
+    existing_ref = await _existing_summary_ref_with_body(session, review_run, body)
+    if existing_ref is not None:
+        return existing_ref
     try:
         provider_comment_id = await _upsert_github_issue_comment(
             github_client,
@@ -136,6 +144,9 @@ async def publish_gitlab_summary_comment(
         status_text=status_text,
         finding_stats=finding_stats,
     )
+    existing_ref = await _existing_summary_ref_with_body(session, review_run, body)
+    if existing_ref is not None:
+        return existing_ref
     try:
         provider_comment_id = await _upsert_gitlab_note(
             gitlab_client,
@@ -230,6 +241,53 @@ async def ensure_line_comment_ref(
 
 def body_hash(body: str) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+async def _existing_summary_ref_with_body(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    body: str,
+) -> ReviewCommentRef | None:
+    result = await session.execute(
+        select(ReviewCommentRef).where(
+            ReviewCommentRef.provider == review_run.provider,
+            ReviewCommentRef.repo_full_name == review_run.repo_full_name,
+            ReviewCommentRef.pull_request_number == review_run.pull_request_number,
+            ReviewCommentRef.comment_type == "summary",
+            ReviewCommentRef.last_published_body_hash == body_hash(body),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+def _safe_error_text(error: str, *, max_length: int = 500) -> str:
+    redacted = error.replace("\r", " ").replace("\n", " ")
+    for marker in ("token", "secret", "password", "authorization"):
+        redacted = _redact_marker_value(redacted, marker)
+    if len(redacted) > max_length:
+        return redacted[: max_length - 3].rstrip() + "..."
+    return redacted
+
+
+def _redact_marker_value(text: str, marker: str) -> str:
+    lowered = text.lower()
+    start = 0
+    while True:
+        index = lowered.find(marker, start)
+        if index == -1:
+            return text
+        value_start = index + len(marker)
+        while value_start < len(text) and text[value_start] in " \t:=_-":
+            value_start += 1
+        value_end = value_start
+        while value_end < len(text) and text[value_end] not in " \t,;":
+            value_end += 1
+        if value_end > value_start:
+            text = text[:value_start] + "[redacted]" + text[value_end:]
+            lowered = text.lower()
+            start = value_start + len("[redacted]")
+        else:
+            start = value_start
 
 
 async def _upsert_github_issue_comment(

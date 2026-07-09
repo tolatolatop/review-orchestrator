@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
@@ -31,7 +32,7 @@ from review_orchestrator.models import (
     ReviewRun,
     utc_now,
 )
-from review_orchestrator.openhands import OpenHandsClient
+from review_orchestrator.openhands import OpenHandsClient, OpenHandsClientError
 from review_orchestrator.schemas import ReviewRunCreate, WorkspacePrepareRequest
 from review_orchestrator.services import (
     collect_review_result,
@@ -122,41 +123,161 @@ async def process_next_agent_task(
     if task is None:
         return None
 
-    context = await _task_context(session, task)
-    if context is None:
-        context = await _hydrate_task_context(
+    try:
+        context = await _task_context(session, task)
+        if context is None:
+            try:
+                context = await _hydrate_task_context(
+                    session,
+                    task,
+                    github_client=github_client,
+                    gitlab_client=gitlab_client,
+                )
+            except (GitHubClientError, GitLabClientError) as exc:
+                return await _fail_agent_task(
+                    session,
+                    task,
+                    failure_code="provider_context_lookup_failed",
+                    error=str(exc),
+                    github_client=github_client,
+                    gitlab_client=gitlab_client,
+                )
+        if context is None:
+            return await _fail_agent_task(
+                session,
+                task,
+                failure_code="missing_pr_context",
+                error="Pull request context was not found for mention task.",
+                github_client=github_client,
+                gitlab_client=gitlab_client,
+            )
+
+        review_run = await create_review_run(
             session,
-            task,
-            github_client=github_client,
-            gitlab_client=gitlab_client,
+            ReviewRunCreate(
+                provider=context.provider,
+                repo_full_name=context.repo_full_name,
+                pull_request_number=context.pull_request_number,
+                base_sha=context.base_sha,
+                head_sha=context.head_sha,
+                force=True,
+            ),
+            trigger_type="mention",
+            trigger_event_id=task.provider_event_id,
         )
-    if context is None:
-        task.status = "failed"
-        task.error_message = "Pull request context was not found for mention task."
+        task.status = "completed"
+        task.result_json = {"review_run_id": review_run.id, "status": review_run.status}
         session.add(task)
         await session.commit()
         await session.refresh(task)
         return task
+    except Exception as exc:
+        return await _fail_agent_task(
+            session,
+            task,
+            failure_code="agent_task_failed",
+            error=str(exc),
+            github_client=github_client,
+            gitlab_client=gitlab_client,
+        )
 
+
+async def _fail_agent_task(
+    session: AsyncSession,
+    task: AgentTask,
+    *,
+    failure_code: str,
+    error: str,
+    github_client: GitHubClient | None,
+    gitlab_client: GitLabClient | None,
+) -> AgentTask:
+    task.status = "failed"
+    task.error_message = error
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    try:
+        review_run = await _review_run_for_failed_agent_task(
+            session,
+            task,
+            failure_code=failure_code,
+            error=error,
+        )
+        await publish_review_run_status_comment(
+            session,
+            review_run,
+            github_client=github_client,
+            gitlab_client=gitlab_client,
+            status_text="failed",
+        )
+    except Exception as exc:
+        task.result_json = {
+            **(task.result_json or {}),
+            "summary_publish_error": str(exc),
+        }
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+    return task
+
+
+async def _review_run_for_failed_agent_task(
+    session: AsyncSession,
+    task: AgentTask,
+    *,
+    failure_code: str,
+    error: str,
+) -> ReviewRun:
+    context = await _task_context(session, task)
     review_run = await create_review_run(
         session,
         ReviewRunCreate(
-            provider=context.provider,
-            repo_full_name=context.repo_full_name,
-            pull_request_number=context.pull_request_number,
-            base_sha=context.base_sha,
-            head_sha=context.head_sha,
+            provider=task.provider,
+            repo_full_name=task.repo_full_name,
+            pull_request_number=task.pull_request_number,
+            base_sha=context.base_sha if context else None,
+            head_sha=(context.head_sha if context else _task_head_sha(task)),
             force=True,
         ),
         trigger_type="mention",
         trigger_event_id=task.provider_event_id,
     )
-    task.status = "completed"
-    task.result_json = {"review_run_id": review_run.id, "status": review_run.status}
-    session.add(task)
+    review_run.status = "failed"
+    review_run.failure_code = failure_code
+    review_run.error = error
+    review_run.completed_at = utc_now()
+    session.add(review_run)
     await session.commit()
-    await session.refresh(task)
-    return task
+    await session.refresh(review_run)
+    return review_run
+
+
+def _task_head_sha(task: AgentTask) -> str:
+    payload = (task.input_json or {}).get("payload")
+    if isinstance(payload, dict):
+        head_sha = _head_sha_from_payload(payload)
+        if head_sha:
+            return head_sha
+    return "unknown"
+
+
+def _head_sha_from_payload(payload: dict[str, Any]) -> str | None:
+    pull_request = payload.get("pull_request")
+    if isinstance(pull_request, dict):
+        head = pull_request.get("head")
+        if isinstance(head, dict):
+            return _str_or_none(head.get("sha"))
+    merge_request = payload.get("merge_request") or payload.get("object_attributes")
+    if isinstance(merge_request, dict):
+        last_commit = merge_request.get("last_commit")
+        last_commit_sha = (
+            _str_or_none(last_commit.get("id"))
+            if isinstance(last_commit, dict)
+            else None
+        )
+        return _str_or_none(merge_request.get("sha")) or last_commit_sha
+    return None
 
 
 async def process_next_review_run(
@@ -178,6 +299,14 @@ async def process_next_review_run(
 
     release_lock = True
     try:
+        if _should_publish_reviewing(review_run):
+            await publish_review_run_status_comment(
+                session,
+                review_run,
+                github_client=github_client,
+                gitlab_client=gitlab_client,
+                status_text="reviewing",
+            )
         context = await _review_run_context(session, review_run)
         if context is None:
             review_run.status = "failed"
@@ -188,14 +317,37 @@ async def process_next_review_run(
             session.add(review_run)
             await session.commit()
             await session.refresh(review_run)
+            await publish_review_run_status_comment(
+                session,
+                review_run,
+                github_client=github_client,
+                gitlab_client=gitlab_client,
+                status_text="failed",
+            )
             return review_run
 
         if not review_run.workspace_path:
-            workspace = await prepare_workspace(
-                session,
-                settings,
-                _workspace_request_from_context(context),
-            )
+            try:
+                workspace = await prepare_workspace(
+                    session,
+                    settings,
+                    _workspace_request_from_context(context),
+                )
+            except Exception as exc:
+                review_run.status = "failed"
+                review_run.failure_code = "workspace_failed"
+                review_run.error = str(exc)
+                session.add(review_run)
+                await session.commit()
+                await session.refresh(review_run)
+                await publish_review_run_status_comment(
+                    session,
+                    review_run,
+                    github_client=github_client,
+                    gitlab_client=gitlab_client,
+                    status_text="failed",
+                )
+                return review_run
             if workspace.status == "failed":
                 review_run.status = "failed"
                 review_run.failure_code = workspace.failure_code or "workspace_failed"
@@ -203,6 +355,13 @@ async def process_next_review_run(
                 session.add(review_run)
                 await session.commit()
                 await session.refresh(review_run)
+                await publish_review_run_status_comment(
+                    session,
+                    review_run,
+                    github_client=github_client,
+                    gitlab_client=gitlab_client,
+                    status_text="failed",
+                )
                 return review_run
             review_run.workspace_path = workspace.workspace_path
             session.add(review_run)
@@ -219,11 +378,29 @@ async def process_next_review_run(
                 openhands_client=openhands_client,
                 workspace_path=review_run.workspace_path,
             )
+            if review_run.status == "failed":
+                await publish_review_run_status_comment(
+                    session,
+                    review_run,
+                    github_client=github_client,
+                    gitlab_client=gitlab_client,
+                    status_text="failed",
+                )
+                return review_run
         review_run = await sync_review_session(
             session,
             review_run,
             openhands_client=openhands_client,
         )
+        if review_run.status == "failed":
+            await publish_review_run_status_comment(
+                session,
+                review_run,
+                github_client=github_client,
+                gitlab_client=gitlab_client,
+                status_text="failed",
+            )
+            return review_run
         raw_result = await _extract_openhands_json_result(
             openhands_client,
             review_run.openhands_conversation_id,
@@ -245,12 +422,31 @@ async def process_next_review_run(
             github_client=github_client,
             gitlab_client=gitlab_client,
         )
-        await collect_review_result(
-            session,
-            review_run,
-            raw_output=raw_result,
-            changed_files=changed_files,
-        )
+        try:
+            await collect_review_result(
+                session,
+                review_run,
+                raw_output=raw_result,
+                changed_files=changed_files,
+            )
+        except Exception as exc:
+            await session.refresh(review_run)
+            if review_run.status != "failed":
+                review_run.status = "failed"
+                review_run.failure_code = "worker_exception"
+                review_run.error = str(exc)
+                review_run.completed_at = utc_now()
+                session.add(review_run)
+                await session.commit()
+                await session.refresh(review_run)
+            await publish_review_run_status_comment(
+                session,
+                review_run,
+                github_client=github_client,
+                gitlab_client=gitlab_client,
+                status_text="failed",
+            )
+            return review_run
         config = await get_or_create_review_config(
             session,
             provider=review_run.provider,
@@ -280,9 +476,170 @@ async def process_next_review_run(
                 finding_stats=review_run.finding_count_by_severity,
             )
         return await session.get(ReviewRun, review_run.id)
+    except Exception as exc:
+        review_run.status = "failed"
+        review_run.failure_code = review_run.failure_code or "worker_exception"
+        review_run.error = review_run.error or str(exc)
+        review_run.completed_at = utc_now()
+        session.add(review_run)
+        await session.commit()
+        await session.refresh(review_run)
+        await publish_review_run_status_comment(
+            session,
+            review_run,
+            github_client=github_client,
+            gitlab_client=gitlab_client,
+            status_text="failed",
+        )
+        return review_run
     finally:
         if release_lock:
             await release_review_run_lock(session, review_run.id)
+
+
+def _should_publish_reviewing(review_run: ReviewRun) -> bool:
+    return (
+        review_run.summary_comment_id is None
+        and review_run.soft_timeout_emitted_at is None
+        and review_run.stage in {None, "start"}
+    )
+
+
+async def process_review_run_timeouts(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    openhands_client: OpenHandsClient,
+    github_client: GitHubClient | None = None,
+    gitlab_client: GitLabClient | None = None,
+    now: datetime | None = None,
+) -> list[ReviewRun]:
+    now = now or utc_now()
+    result = await session.execute(
+        select(ReviewRun).where(
+            ReviewRun.status.in_(WORKER_ACTIVE_STATUSES),
+        )
+    )
+    touched: list[ReviewRun] = []
+    for review_run in result.scalars().all():
+        started_at = review_run.started_at or review_run.created_at
+        elapsed = (now - started_at).total_seconds()
+        if (
+            elapsed >= settings.review_run_timeout_seconds
+            and review_run.hard_timeout_emitted_at is None
+        ):
+            await emit_timeout_event(
+                session,
+                review_run.id,
+                timeout_kind="hard",
+                now=now,
+            )
+            refreshed = await session.get(ReviewRun, review_run.id)
+            if refreshed is None:
+                continue
+            await _cancel_openhands_after_hard_timeout(
+                session,
+                refreshed,
+                openhands_client=openhands_client,
+            )
+            await publish_review_run_status_comment(
+                session,
+                refreshed,
+                github_client=github_client,
+                gitlab_client=gitlab_client,
+                status_text="failed",
+            )
+            touched.append(refreshed)
+            continue
+
+        if (
+            elapsed >= settings.review_run_soft_timeout_seconds
+            and review_run.soft_timeout_emitted_at is None
+        ):
+            await emit_timeout_event(
+                session,
+                review_run.id,
+                timeout_kind="soft",
+                now=now,
+            )
+            refreshed = await session.get(ReviewRun, review_run.id)
+            if refreshed is None:
+                continue
+            await publish_review_run_status_comment(
+                session,
+                refreshed,
+                github_client=github_client,
+                gitlab_client=gitlab_client,
+                status_text="delayed",
+            )
+            touched.append(refreshed)
+    return touched
+
+
+async def publish_review_run_status_comment(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    github_client: GitHubClient | None,
+    gitlab_client: GitLabClient | None,
+    status_text: str,
+) -> None:
+    original_failure_code = review_run.failure_code
+    original_error = review_run.error
+    if github_client is not None and review_run.provider == "github":
+        await publish_github_summary_comment(
+            session,
+            review_run,
+            github_client=github_client,
+            status_text=status_text,
+            finding_stats=review_run.finding_count_by_severity,
+        )
+    elif gitlab_client is not None and review_run.provider == "gitlab":
+        await publish_gitlab_summary_comment(
+            session,
+            review_run,
+            gitlab_client=gitlab_client,
+            status_text=status_text,
+            finding_stats=review_run.finding_count_by_severity,
+        )
+    else:
+        return
+
+    await session.refresh(review_run)
+    if original_failure_code and review_run.failure_code != original_failure_code:
+        warnings = list(review_run.validation_warnings_json or [])
+        warnings.append(
+            {
+                "code": "summary_publish_failed",
+                "message": review_run.error,
+            }
+        )
+        review_run.failure_code = original_failure_code
+        review_run.error = original_error
+        review_run.validation_warnings_json = warnings
+        session.add(review_run)
+        await session.commit()
+        await session.refresh(review_run)
+
+
+async def _cancel_openhands_after_hard_timeout(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    openhands_client: OpenHandsClient,
+) -> None:
+    if not review_run.openhands_conversation_id:
+        return
+    try:
+        await openhands_client.delete_conversation(review_run.openhands_conversation_id)
+    except OpenHandsClientError as exc:
+        review_run.error = (
+            f"{review_run.error or 'Review run exceeded hard timeout.'} "
+            f"OpenHands cleanup failed: {exc}"
+        )
+        session.add(review_run)
+        await session.commit()
+        await session.refresh(review_run)
 
 
 async def mark_review_run_stage(
@@ -583,44 +940,78 @@ async def _extract_openhands_json_result(
 ) -> dict[str, Any] | None:
     if not conversation_id:
         return None
-    page = await openhands_client.list_events(conversation_id, limit=100)
-    for event in reversed(page.items):
-        candidate = _extract_text(event)
-        if not candidate:
-            continue
-        parsed = _try_json(candidate)
-        if isinstance(parsed, dict) and "summary" in parsed and "findings" in parsed:
-            return parsed
+    events: list[dict[str, Any]] = []
+    page_id: str | None = None
+    for _ in range(20):
+        page = await openhands_client.list_events(
+            conversation_id,
+            page_id=page_id,
+            limit=100,
+        )
+        events.extend(page.items)
+        if not page.next_page_id:
+            break
+        page_id = page.next_page_id
+    for event in reversed(events):
+        for candidate in _extract_text_candidates(event):
+            parsed = _try_json(candidate)
+            if _is_review_result_payload(parsed):
+                return parsed
     return None
 
 
-def _extract_text(value: Any) -> str | None:
+def _is_review_result_payload(value: Any) -> bool:
+    return isinstance(value, dict) and "summary" in value and "findings" in value
+
+
+def _extract_text_candidates(value: Any) -> list[str]:
     if isinstance(value, str):
-        return value
+        return [value]
     if isinstance(value, dict):
-        for key in ("text", "content", "message"):
-            text = _extract_text(value.get(key))
-            if text:
-                return text
-        return None
+        candidates: list[str] = []
+        for key in ("text", "content", "message", "thought", "observation"):
+            candidates.extend(_extract_text_candidates(value.get(key)))
+        for key, item in value.items():
+            if key not in {"text", "content", "message", "thought", "observation"}:
+                candidates.extend(_extract_text_candidates(item))
+        return candidates
     if isinstance(value, list):
-        parts = [_extract_text(item) for item in value]
-        joined = "\n".join(part for part in parts if part)
-        return joined or None
-    return None
+        candidates = []
+        for item in value:
+            candidates.extend(_extract_text_candidates(item))
+        return candidates
+    return []
 
 
 def _try_json(text: str) -> Any:
     stripped = text.strip()
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
+    candidates = [stripped]
+    candidates.extend(
+        match.group("json").strip() for match in _FENCED_JSON_RE.finditer(stripped)
+    )
+    for candidate in candidates:
+        parsed = _loads_json(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+_FENCED_JSON_RE = re.compile(
+    r"```(?:json|JSON)?\s*(?P<json>.*?)```",
+    re.DOTALL,
+)
+
+
+def _loads_json(text: str) -> Any:
+    if text.startswith("```"):
+        lines = text.splitlines()
         if lines and lines[0].startswith("```"):
             lines = lines[1:]
         if lines and lines[-1].startswith("```"):
             lines = lines[:-1]
-        stripped = "\n".join(lines).strip()
+        text = "\n".join(lines).strip()
     try:
-        return json.loads(stripped)
+        return json.loads(text)
     except json.JSONDecodeError:
         return None
 
