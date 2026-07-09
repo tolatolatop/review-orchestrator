@@ -149,16 +149,33 @@ docker compose -f docker-compose.self_host.yaml up --build -d
 ```
 
 Before starting the self-host stack, edit `.env` and set production secrets such
-as `GITHUB_WEBHOOK_SECRET`, `GITHUB_INSTALLATION_TOKEN`, and
-`OPENHANDS_API_TOKEN` when your OpenHands deployment requires one. Override
+as `REVIEW_PROXY_TOKEN`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_INSTALLATION_TOKEN`,
+and `OPENHANDS_API_TOKEN` when your OpenHands deployment requires one. Override
 `POSTGRES_PASSWORD` in `.env` or the shell; the compose default is only suitable
 for local testing.
+
+The self-host compose file publishes Nginx as the public Review Orchestrator
+entrypoint and keeps the FastAPI service on the private Docker network. Requests
+outside `/health` and `/api/v1/webhooks/github` must include the fixed token:
+
+```bash
+curl -fsS http://localhost:${REVIEW_PROXY_PORT:-18080}/api/v1/review-runs/<review_run_id> \
+  -H "X-Review-Token: ${REVIEW_PROXY_TOKEN}"
+```
+
+For manual browser access, `?token=<REVIEW_PROXY_TOKEN>` is also accepted, but
+the header form is preferred because query strings are commonly stored in
+browser history, proxy logs, and analytics systems. GitHub webhooks cannot send
+this custom header, so `/api/v1/webhooks/github` is allowed through Nginx and
+must be protected by setting `GITHUB_WEBHOOK_SECRET`.
 
 Recommended production settings:
 
 - Set `APP_ENV=production`.
 - Use PostgreSQL with TLS and regular backups.
 - Set `GITHUB_WEBHOOK_SECRET` and reject unsigned webhook traffic.
+- Set `REVIEW_PROXY_TOKEN` to a strong random value and expose only the Nginx
+  port from the host or load balancer.
 - Store `.env` values in the platform secret manager instead of the repository.
 - Put `WORKSPACE_ROOT` and `GIT_CACHE_ROOT` on a disk with enough space for the
   largest expected pull requests.
