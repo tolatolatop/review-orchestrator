@@ -4,13 +4,14 @@ import pytest
 
 from review_orchestrator.config import Settings
 from review_orchestrator.db import create_engine, create_session_factory, init_models
-from review_orchestrator.models import Finding
+from review_orchestrator.models import AgentTask, Finding, PullRequestContext
 from review_orchestrator.review_results import parse_review_result
 from review_orchestrator.schemas import ReviewRunCreate
 from review_orchestrator.services import create_review_run
 from review_orchestrator.worker import (
     acquire_next_review_run,
     emit_timeout_event,
+    process_next_agent_task,
     release_review_run_lock,
 )
 
@@ -248,3 +249,36 @@ async def test_comment_refs_upsert_summary_and_dedupe_line_comments(
     assert first_created is True
     assert second_created is False
     assert second_line_ref.id == first_line_ref.id
+
+
+async def test_agent_task_worker_creates_review_run_for_mention(
+    session_factory,
+) -> None:
+    async with session_factory() as session:
+        context = PullRequestContext(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="open",
+        )
+        session.add(context)
+        await session.commit()
+        await session.refresh(context)
+        task = AgentTask(
+            pull_request_context_id=context.id,
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            task_type="mention",
+            status="queued",
+        )
+        session.add(task)
+        await session.commit()
+
+        processed = await process_next_agent_task(session, worker_id="worker-1")
+
+    assert processed is not None
+    assert processed.status == "completed"
+    assert processed.result_json["review_run_id"]

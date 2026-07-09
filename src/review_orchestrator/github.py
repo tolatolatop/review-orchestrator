@@ -7,22 +7,29 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+import httpx
+from pydantic import BaseModel, ConfigDict
 
-class GitHubWebhookError(Exception):
-    status_code = 400
+from review_orchestrator.providers import (
+    ParsedProviderWebhook,
+    ProviderPayloadError,
+    ProviderSignatureError,
+    ProviderWebhookError,
+    ProviderWebhookEvent,
+    lower_headers,
+)
+from review_orchestrator.review_results import ChangedFile
+
+
+class GitHubWebhookError(ProviderWebhookError):
     error_code = "github_webhook_error"
 
-    def __init__(self, message: str) -> None:
-        super().__init__(message)
-        self.message = message
 
-
-class GitHubSignatureError(GitHubWebhookError):
-    status_code = 401
+class GitHubSignatureError(GitHubWebhookError, ProviderSignatureError):
     error_code = "github_signature_invalid"
 
 
-class GitHubPayloadError(GitHubWebhookError):
+class GitHubPayloadError(GitHubWebhookError, ProviderPayloadError):
     error_code = "github_payload_invalid"
 
 
@@ -38,6 +45,252 @@ class NormalizedGitHubEvent:
     should_create_review_run: bool
     should_create_agent_task: bool
     status: str
+
+    def to_provider_event(self) -> ProviderWebhookEvent:
+        return ProviderWebhookEvent(
+            provider="github",
+            provider_event=self.provider_event,
+            provider_action=self.provider_action,
+            internal_event=self.internal_event,
+            repository=self.repository,
+            pull_request_number=self.pull_request_number,
+            head_sha=self.head_sha,
+            should_update_context=self.should_update_context,
+            should_create_review_run=self.should_create_review_run,
+            should_create_agent_task=self.should_create_agent_task,
+            status=self.status,
+        )
+
+
+class GitHubAdapter:
+    provider = "github"
+
+    def parse_webhook(
+        self,
+        *,
+        headers: dict[str, str],
+        raw_body: bytes,
+        settings: Any,
+    ) -> ParsedProviderWebhook:
+        normalized_headers = lower_headers(headers)
+        delivery_id = normalized_headers.get("x-github-delivery")
+        provider_event = normalized_headers.get("x-github-event")
+        if not delivery_id:
+            raise GitHubPayloadError("Missing X-GitHub-Delivery header.")
+        if not provider_event:
+            raise GitHubPayloadError("Missing X-GitHub-Event header.")
+
+        verify_signature(
+            raw_body,
+            normalized_headers.get("x-hub-signature-256"),
+            getattr(settings, "github_webhook_secret", None),
+        )
+        payload = parse_json_body(raw_body)
+        normalized_event = normalize_github_event(
+            provider_event,
+            payload,
+            bot_login=getattr(settings, "review_bot_login", None),
+        )
+        return ParsedProviderWebhook(
+            delivery_id=delivery_id,
+            provider_event=normalized_event.to_provider_event(),
+            payload=payload,
+            raw_body=raw_body,
+        )
+
+
+class GitHubClientError(RuntimeError):
+    pass
+
+
+class GitHubComment(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: int | str
+    body: str | None = None
+
+
+class GitHubClient:
+    def __init__(
+        self,
+        *,
+        api_base_url: str = "https://api.github.com",
+        token: str | None = None,
+        timeout: float = 30.0,
+    ) -> None:
+        self.api_base_url = api_base_url.rstrip("/")
+        self.token = token
+        self.timeout = timeout
+
+    async def list_pull_request_files(
+        self,
+        repo_full_name: str,
+        pull_request_number: int,
+    ) -> list[dict[str, Any]]:
+        return await self._paginate(
+            f"/repos/{repo_full_name}/pulls/{pull_request_number}/files"
+        )
+
+    async def list_issue_comments(
+        self,
+        repo_full_name: str,
+        pull_request_number: int,
+    ) -> list[GitHubComment]:
+        items = await self._paginate(
+            f"/repos/{repo_full_name}/issues/{pull_request_number}/comments"
+        )
+        return [GitHubComment.model_validate(item) for item in items]
+
+    async def create_issue_comment(
+        self,
+        repo_full_name: str,
+        pull_request_number: int,
+        body: str,
+    ) -> str:
+        response = await self._request(
+            "POST",
+            f"/repos/{repo_full_name}/issues/{pull_request_number}/comments",
+            json={"body": body},
+        )
+        return str(response["id"])
+
+    async def update_issue_comment(
+        self,
+        repo_full_name: str,
+        comment_id: str,
+        body: str,
+    ) -> str:
+        response = await self._request(
+            "PATCH",
+            f"/repos/{repo_full_name}/issues/comments/{comment_id}",
+            json={"body": body},
+        )
+        return str(response["id"])
+
+    async def create_review_comment(
+        self,
+        repo_full_name: str,
+        pull_request_number: int,
+        *,
+        body: str,
+        commit_id: str,
+        path: str,
+        line: int,
+    ) -> str:
+        response = await self._request(
+            "POST",
+            f"/repos/{repo_full_name}/pulls/{pull_request_number}/comments",
+            json={
+                "body": body,
+                "commit_id": commit_id,
+                "path": path,
+                "line": line,
+                "side": "RIGHT",
+            },
+        )
+        return str(response["id"])
+
+    async def _paginate(self, path: str) -> list[dict[str, Any]]:
+        page = 1
+        items: list[dict[str, Any]] = []
+        while True:
+            response = await self._request(
+                "GET", path, params={"per_page": 100, "page": page}
+            )
+            if not isinstance(response, list):
+                raise GitHubClientError(f"GitHub response for {path} is not a list.")
+            items.extend(response)
+            if len(response) < 100:
+                return items
+            page += 1
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        try:
+            async with httpx.AsyncClient(
+                base_url=self.api_base_url,
+                timeout=self.timeout,
+                headers=headers,
+            ) as client:
+                response = await client.request(method, path, json=json, params=params)
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise GitHubClientError(
+                f"GitHub request failed ({exc.response.status_code} {method} {path}): "
+                f"{exc.response.text[:500]}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise GitHubClientError(
+                f"GitHub request failed ({method} {path}): {exc}"
+            ) from exc
+        return response.json() if response.content else {}
+
+
+async def fetch_changed_files(
+    client: GitHubClient,
+    *,
+    repo_full_name: str,
+    pull_request_number: int,
+) -> list[ChangedFile]:
+    files = await client.list_pull_request_files(repo_full_name, pull_request_number)
+    changed_files: list[ChangedFile] = []
+    for item in files:
+        filename = item.get("filename")
+        if not isinstance(filename, str) or not filename:
+            continue
+        changed_files.append(
+            ChangedFile(
+                path=filename,
+                commentable_lines=parse_commentable_lines(item.get("patch")),
+            )
+        )
+    return changed_files
+
+
+def parse_commentable_lines(patch: Any) -> set[int]:
+    if not isinstance(patch, str) or not patch:
+        return set()
+
+    lines: set[int] = set()
+    new_line: int | None = None
+    for raw_line in patch.splitlines():
+        if raw_line.startswith("@@"):
+            new_line = _parse_hunk_new_start(raw_line)
+            continue
+        if new_line is None:
+            continue
+        if raw_line.startswith("+") and not raw_line.startswith("+++"):
+            lines.add(new_line)
+            new_line += 1
+        elif raw_line.startswith("-") and not raw_line.startswith("---"):
+            continue
+        else:
+            new_line += 1
+    return lines
+
+
+def _parse_hunk_new_start(header: str) -> int | None:
+    marker = header.split(" +", 1)
+    if len(marker) != 2:
+        return None
+    range_part = marker[1].split(" ", 1)[0]
+    start = range_part.split(",", 1)[0]
+    try:
+        return int(start)
+    except ValueError:
+        return None
 
 
 PR_ACTIONS_TO_INTERNAL_EVENT = {

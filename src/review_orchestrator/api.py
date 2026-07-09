@@ -2,13 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from review_orchestrator.db import get_session
-from review_orchestrator.github import (
-    GitHubWebhookError,
-    normalize_github_event,
-    parse_json_body,
-    verify_signature,
-)
+from review_orchestrator.github import GitHubAdapter
+from review_orchestrator.gitlab import GitLabAdapter
 from review_orchestrator.openhands import OpenHandsClient
+from review_orchestrator.providers import ProviderRegistry, ProviderWebhookError
 from review_orchestrator.review_results import ReviewResultError
 from review_orchestrator.schemas import (
     CleanupSummary,
@@ -30,7 +27,7 @@ from review_orchestrator.schemas import (
 )
 from review_orchestrator.services import (
     ReviewRunTransitionError,
-    accept_github_webhook,
+    accept_provider_webhook,
     cancel_review_run,
     cancel_review_session,
     collect_review_result,
@@ -52,6 +49,7 @@ from review_orchestrator.workspaces import (
 
 router = APIRouter(prefix="/api/v1")
 session_dependency = Depends(get_session)
+provider_registry = ProviderRegistry([GitHubAdapter(), GitLabAdapter()])
 
 
 def get_openhands_client(request: Request) -> OpenHandsClient:
@@ -81,48 +79,30 @@ async def accept_webhook(
     request: Request,
     session: AsyncSession = session_dependency,
 ) -> WebhookAccepted:
-    if provider != "github":
+    adapter = provider_registry.get(provider)
+    if adapter is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Unsupported provider: {provider}",
         )
 
     raw_body = await request.body()
-    delivery_id = request.headers.get("X-GitHub-Delivery")
-    provider_event = request.headers.get("X-GitHub-Event")
-    if not delivery_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing X-GitHub-Delivery header.",
-        )
-    if not provider_event:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing X-GitHub-Event header.",
-        )
-
     try:
-        verify_signature(
-            raw_body,
-            request.headers.get("X-Hub-Signature-256"),
-            request.app.state.settings.github_webhook_secret,
+        parsed = adapter.parse_webhook(
+            headers=dict(request.headers),
+            raw_body=raw_body,
+            settings=request.app.state.settings,
         )
-        payload = parse_json_body(raw_body)
-        normalized_event = normalize_github_event(
-            provider_event,
-            payload,
-            bot_login=request.app.state.settings.review_bot_login,
-        )
-    except GitHubWebhookError as exc:
+    except ProviderWebhookError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
-    return await accept_github_webhook(
+    return await accept_provider_webhook(
         session,
-        delivery_id=delivery_id,
-        provider_event=provider_event,
-        normalized_event=normalized_event,
-        payload=payload,
-        raw_body=raw_body,
+        delivery_id=parsed.delivery_id,
+        provider_event=parsed.provider_event.provider_event,
+        normalized_event=parsed.provider_event,
+        payload=parsed.payload,
+        raw_body=parsed.raw_body,
     )
 
 

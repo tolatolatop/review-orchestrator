@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     github_private_key_path: str | None = None
     github_api_base_url: str = "https://api.github.com"
     review_bot_login: str = "review-agent"
+    gitlab_webhook_secret: str | None = Field(
+        default=None,
+        description=(
+            "GitLab webhook shared token. If unset, token verification is skipped."
+        ),
+    )
     workspace_root: str = "./.workspaces"
     git_cache_root: str = "./.git-cache"
     review_run_timeout_seconds: int = 1800

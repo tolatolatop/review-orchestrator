@@ -22,6 +22,8 @@ from review_orchestrator.openhands import (
     OpenHandsClientError,
     OpenHandsStartTaskStatus,
 )
+from review_orchestrator.providers import ProviderWebhookEvent
+from review_orchestrator.reconciliation import persist_and_reconcile_findings
 from review_orchestrator.review_results import (
     ChangedFile,
     ParsedReviewResult,
@@ -35,6 +37,7 @@ OPENHANDS_TERMINAL_SUCCESS_STATUSES = {"FINISHED", "COMPLETED", "STOPPED"}
 OPENHANDS_TERMINAL_FAILURE_STATUSES = {"ERROR", "STUCK", "FAILED"}
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "superseded"}
 CANCELLABLE_STATUSES = {"queued", "running"}
+
 
 class ReviewRunTransitionError(ValueError):
     def __init__(self, message: str, *, status_code: int = 409) -> None:
@@ -260,12 +263,9 @@ async def collect_review_result(
         await session.commit()
         raise
 
+    await persist_and_reconcile_findings(session, review_run, parsed)
     review_run.status = "completed"
     review_run.review_summary = parsed.result.summary
-    review_run.finding_count_total = len(parsed.result.findings)
-    review_run.finding_count_by_severity = _finding_count_by_severity(
-        parsed.result.findings
-    )
     review_run.failure_code = None
     review_run.error = None
     review_run.completed_at = utc_now()
@@ -353,19 +353,20 @@ async def cancel_review_run(
     return review_run
 
 
-async def accept_github_webhook(
+async def accept_provider_webhook(
     session: AsyncSession,
     *,
     delivery_id: str,
     provider_event: str,
-    normalized_event: NormalizedGitHubEvent,
+    normalized_event: ProviderWebhookEvent,
     payload: dict[str, Any],
     raw_body: bytes,
 ) -> WebhookAccepted:
-    existing_event = await get_provider_event(session, "github", delivery_id)
+    provider = normalized_event.provider
+    existing_event = await get_provider_event(session, provider, delivery_id)
     if existing_event:
         return WebhookAccepted(
-            provider="github",
+            provider=provider,
             delivery_id=delivery_id,
             status=existing_event.status,
             internal_event=existing_event.internal_event,
@@ -377,7 +378,7 @@ async def accept_github_webhook(
         )
 
     event = ProviderEventInbox(
-        provider="github",
+        provider=provider,
         delivery_id=delivery_id,
         provider_event=provider_event,
         provider_action=normalized_event.provider_action,
@@ -387,7 +388,7 @@ async def accept_github_webhook(
         head_sha=normalized_event.head_sha,
         dedupe_key=f"github:{delivery_id}",
         coalesce_key=_build_coalesce_key(
-            "github",
+            provider,
             normalized_event.repository,
             normalized_event.pull_request_number,
             normalized_event.head_sha,
@@ -408,15 +409,16 @@ async def accept_github_webhook(
     if normalized_event.internal_event in {"pr_closed", "pr_merged"}:
         await cancel_active_review_runs_for_pr(
             session,
-            provider="github",
+            provider=provider,
             repo_full_name=event.repo_full_name,
             pull_request_number=event.pull_request_number,
             failure_code=normalized_event.internal_event,
         )
 
     if normalized_event.should_create_review_run:
-        review_run = await create_review_run_from_github_payload(
+        review_run = await create_review_run_from_provider_payload(
             session,
+            event.provider,
             payload,
             trigger_event_id=event.id,
         )
@@ -443,12 +445,31 @@ async def accept_github_webhook(
 
     await session.commit()
     return WebhookAccepted(
-        provider="github",
+        provider=provider,
         delivery_id=delivery_id,
         status=event.status,
         internal_event=event.internal_event,
         review_run_id=review_run_id,
         agent_task_id=agent_task_id,
+    )
+
+
+async def accept_github_webhook(
+    session: AsyncSession,
+    *,
+    delivery_id: str,
+    provider_event: str,
+    normalized_event: NormalizedGitHubEvent,
+    payload: dict[str, Any],
+    raw_body: bytes,
+) -> WebhookAccepted:
+    return await accept_provider_webhook(
+        session,
+        delivery_id=delivery_id,
+        provider_event=provider_event,
+        normalized_event=normalized_event.to_provider_event(),
+        payload=payload,
+        raw_body=raw_body,
     )
 
 
@@ -471,19 +492,18 @@ async def upsert_pull_request_context(
     event: ProviderEventInbox,
     payload: dict[str, Any],
 ) -> PullRequestContext | None:
-    pull_request = payload.get("pull_request")
-    repository = payload.get("repository")
-    if not isinstance(pull_request, dict) or not isinstance(repository, dict):
+    identity = _pull_request_identity(event.provider, payload)
+    if identity is None:
         return None
 
-    repository_name = _str_or_none(repository.get("full_name"))
-    pull_request_number = pull_request.get("number")
+    repository_name = identity["repository"]
+    pull_request_number = identity["number"]
     if not repository_name or not isinstance(pull_request_number, int):
         return None
 
     result = await session.execute(
         select(PullRequestContext).where(
-            PullRequestContext.provider == "github",
+            PullRequestContext.provider == event.provider,
             PullRequestContext.repo_full_name == repository_name,
             PullRequestContext.pull_request_number == pull_request_number,
         )
@@ -491,36 +511,31 @@ async def upsert_pull_request_context(
     context = result.scalar_one_or_none()
     if context is None:
         context = PullRequestContext(
-            provider="github",
+            provider=event.provider,
             repo_full_name=repository_name,
             pull_request_number=pull_request_number,
-            head_sha=_head_sha(pull_request) or "",
+            head_sha=identity["head_sha"] or "",
         )
         session.add(context)
 
-    base = pull_request.get("base")
-    head = pull_request.get("head")
-    base_repo = base.get("repo") if isinstance(base, dict) else None
-    head_repo = head.get("repo") if isinstance(head, dict) else None
-
-    context.provider_repo_id = _id_to_str(repository.get("id"))
-    context.provider_pr_id = _id_to_str(pull_request.get("id"))
-    context.title = _str_or_none(pull_request.get("title"))
-    context.author_login = _login(pull_request.get("user"))
-    context.base_ref = _ref(base)
-    context.base_sha = _sha(base)
-    context.head_ref = _ref(head)
-    context.head_sha = _head_sha(pull_request) or context.head_sha
-    context.head_repo_full_name = _repo_full_name(head_repo)
+    context.provider_repo_id = identity["provider_repo_id"]
+    context.provider_pr_id = identity["provider_pr_id"]
+    context.title = identity["title"]
+    context.author_login = identity["author_login"]
+    context.base_ref = identity["base_ref"]
+    context.base_sha = identity["base_sha"]
+    context.head_ref = identity["head_ref"]
+    context.head_sha = identity["head_sha"] or context.head_sha
+    context.head_repo_full_name = identity["head_repo_full_name"]
     context.is_fork = bool(
         context.head_repo_full_name
-        and context.head_repo_full_name != _repo_full_name(base_repo)
+        and context.head_repo_full_name != identity["base_repo_full_name"]
     )
-    context.status = _pull_request_status(pull_request)
-    context.html_url = _str_or_none(pull_request.get("html_url"))
+    context.status = identity["status"]
+    context.html_url = identity["html_url"]
     context.latest_event_id = event.id
-    context.closed_at = parse_github_datetime(pull_request.get("closed_at"))
-    context.merged_at = parse_github_datetime(pull_request.get("merged_at"))
+    context.closed_at = identity["closed_at"]
+    context.merged_at = identity["merged_at"]
 
     return context
 
@@ -664,6 +679,35 @@ async def create_review_run_from_github_payload(
     )
 
 
+async def create_review_run_from_provider_payload(
+    session: AsyncSession,
+    provider: str,
+    payload: dict[str, Any],
+    *,
+    trigger_event_id: str | None = None,
+) -> ReviewRun:
+    if provider == "github":
+        return await create_review_run_from_github_payload(
+            session, payload, trigger_event_id=trigger_event_id
+        )
+
+    identity = _pull_request_identity(provider, payload)
+    if identity is None:
+        raise ValueError(f"{provider} payload is missing PR identity fields.")
+    return await create_review_run(
+        session,
+        ReviewRunCreate(
+            provider=provider,
+            repo_full_name=identity["repository"],
+            pull_request_number=identity["number"],
+            base_sha=identity["base_sha"],
+            head_sha=identity["head_sha"],
+        ),
+        trigger_type="webhook",
+        trigger_event_id=trigger_event_id,
+    )
+
+
 async def get_or_create_review_config(
     session: AsyncSession,
     *,
@@ -700,6 +744,84 @@ def _build_coalesce_key(
     return f"{provider}:{repo_full_name}:{pull_request_number}:lifecycle"
 
 
+def _pull_request_identity(
+    provider: str,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    if provider == "github":
+        pull_request = payload.get("pull_request")
+        repository = payload.get("repository")
+        if not isinstance(pull_request, dict) or not isinstance(repository, dict):
+            return None
+        repository_name = _str_or_none(repository.get("full_name"))
+        pull_request_number = pull_request.get("number")
+        if not repository_name or not isinstance(pull_request_number, int):
+            return None
+        base = pull_request.get("base")
+        head = pull_request.get("head")
+        base_repo = base.get("repo") if isinstance(base, dict) else None
+        head_repo = head.get("repo") if isinstance(head, dict) else None
+        return {
+            "repository": repository_name,
+            "number": pull_request_number,
+            "provider_repo_id": _id_to_str(repository.get("id")),
+            "provider_pr_id": _id_to_str(pull_request.get("id")),
+            "title": _str_or_none(pull_request.get("title")),
+            "author_login": _login(pull_request.get("user")),
+            "base_ref": _ref(base),
+            "base_sha": _sha(base),
+            "head_ref": _ref(head),
+            "head_sha": _head_sha(pull_request),
+            "base_repo_full_name": _repo_full_name(base_repo),
+            "head_repo_full_name": _repo_full_name(head_repo),
+            "status": _pull_request_status(pull_request),
+            "html_url": _str_or_none(pull_request.get("html_url")),
+            "closed_at": parse_github_datetime(pull_request.get("closed_at")),
+            "merged_at": parse_github_datetime(pull_request.get("merged_at")),
+        }
+
+    if provider == "gitlab":
+        attrs = payload.get("object_attributes")
+        project = payload.get("project")
+        if not isinstance(attrs, dict) or not isinstance(project, dict):
+            return None
+        repository_name = _str_or_none(project.get("path_with_namespace"))
+        pull_request_number = attrs.get("iid")
+        head_sha = None
+        last_commit = attrs.get("last_commit")
+        if isinstance(last_commit, dict):
+            head_sha = _str_or_none(last_commit.get("id"))
+        head_sha = head_sha or _str_or_none(attrs.get("last_commit_id"))
+        if (
+            not repository_name
+            or not isinstance(pull_request_number, int)
+            or not head_sha
+        ):
+            return None
+        target = attrs.get("target")
+        source = attrs.get("source")
+        return {
+            "repository": repository_name,
+            "number": pull_request_number,
+            "provider_repo_id": _id_to_str(project.get("id")),
+            "provider_pr_id": _id_to_str(attrs.get("id")),
+            "title": _str_or_none(attrs.get("title")),
+            "author_login": _gitlab_username(payload.get("user")),
+            "base_ref": _str_or_none(attrs.get("target_branch")),
+            "base_sha": _str_or_none(attrs.get("target_branch_sha")),
+            "head_ref": _str_or_none(attrs.get("source_branch")),
+            "head_sha": head_sha,
+            "base_repo_full_name": _gitlab_project_path(target),
+            "head_repo_full_name": _gitlab_project_path(source),
+            "status": _str_or_none(attrs.get("state")) or "open",
+            "html_url": _str_or_none(attrs.get("url")),
+            "closed_at": parse_github_datetime(attrs.get("closed_at")),
+            "merged_at": parse_github_datetime(attrs.get("merged_at")),
+        }
+
+    return None
+
+
 def _pull_request_status(pull_request: dict[str, Any]) -> str:
     if pull_request.get("merged") is True:
         return "merged"
@@ -733,6 +855,18 @@ def _repo_full_name(repo: Any) -> str | None:
     if not isinstance(repo, dict):
         return None
     return _str_or_none(repo.get("full_name"))
+
+
+def _gitlab_project_path(project: Any) -> str | None:
+    if not isinstance(project, dict):
+        return None
+    return _str_or_none(project.get("path_with_namespace"))
+
+
+def _gitlab_username(user: Any) -> str | None:
+    if not isinstance(user, dict):
+        return None
+    return _str_or_none(user.get("username")) or _str_or_none(user.get("name"))
 
 
 async def _mark_failed(
