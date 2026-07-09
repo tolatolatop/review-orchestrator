@@ -10,6 +10,7 @@ from review_orchestrator.github import (
     payload_digest,
 )
 from review_orchestrator.models import (
+    AgentTask,
     ProviderEventInbox,
     PullRequestContext,
     ReviewConfig,
@@ -369,6 +370,9 @@ async def accept_github_webhook(
             status=existing_event.status,
             internal_event=existing_event.internal_event,
             review_run_id=existing_event.review_run_id,
+            agent_task_id=await _get_agent_task_id_for_event(
+                session, existing_event.id
+            ),
             duplicate=True,
         )
 
@@ -396,9 +400,19 @@ async def accept_github_webhook(
     await session.flush()
 
     review_run_id: str | None = None
+    agent_task_id: str | None = None
     context: PullRequestContext | None = None
     if normalized_event.should_update_context:
         context = await upsert_pull_request_context(session, event, payload)
+
+    if normalized_event.internal_event in {"pr_closed", "pr_merged"}:
+        await cancel_active_review_runs_for_pr(
+            session,
+            provider="github",
+            repo_full_name=event.repo_full_name,
+            pull_request_number=event.pull_request_number,
+            failure_code=normalized_event.internal_event,
+        )
 
     if normalized_event.should_create_review_run:
         review_run = await create_review_run_from_github_payload(
@@ -406,11 +420,22 @@ async def accept_github_webhook(
             payload,
             trigger_event_id=event.id,
         )
+        await supersede_older_review_runs(session, review_run)
         review_run_id = review_run.id
         event.review_run_id = review_run_id
         event.status = "queued"
         if context is not None:
             context.latest_review_run_id = review_run_id
+
+    if normalized_event.should_create_agent_task:
+        agent_task = await create_agent_task_from_event(
+            session,
+            event,
+            payload=payload,
+            context=context,
+        )
+        agent_task_id = agent_task.id
+        event.status = "queued"
 
     if event.status == "received":
         event.status = "processed"
@@ -423,6 +448,7 @@ async def accept_github_webhook(
         status=event.status,
         internal_event=event.internal_event,
         review_run_id=review_run_id,
+        agent_task_id=agent_task_id,
     )
 
 
@@ -497,6 +523,114 @@ async def upsert_pull_request_context(
     context.merged_at = parse_github_datetime(pull_request.get("merged_at"))
 
     return context
+
+
+async def create_agent_task_from_event(
+    session: AsyncSession,
+    event: ProviderEventInbox,
+    *,
+    payload: dict[str, Any],
+    context: PullRequestContext | None = None,
+) -> AgentTask:
+    if not event.repo_full_name or event.pull_request_number is None:
+        raise ValueError("Agent task event is missing PR identity fields.")
+
+    if context is None:
+        result = await session.execute(
+            select(PullRequestContext).where(
+                PullRequestContext.provider == event.provider,
+                PullRequestContext.repo_full_name == event.repo_full_name,
+                PullRequestContext.pull_request_number == event.pull_request_number,
+            )
+        )
+        context = result.scalar_one_or_none()
+
+    agent_task = AgentTask(
+        provider_event_id=event.id,
+        pull_request_context_id=context.id if context else None,
+        provider=event.provider,
+        repo_full_name=event.repo_full_name,
+        pull_request_number=event.pull_request_number,
+        task_type="mention",
+        status="queued",
+        input_json={
+            "internal_event": event.internal_event,
+            "provider_action": event.provider_action,
+            "payload": payload,
+        },
+    )
+    session.add(agent_task)
+    await session.flush()
+    return agent_task
+
+
+async def _get_agent_task_id_for_event(
+    session: AsyncSession,
+    provider_event_id: str,
+) -> str | None:
+    result = await session.execute(
+        select(AgentTask.id)
+        .where(AgentTask.provider_event_id == provider_event_id)
+        .order_by(AgentTask.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def cancel_active_review_runs_for_pr(
+    session: AsyncSession,
+    *,
+    provider: str,
+    repo_full_name: str | None,
+    pull_request_number: int | None,
+    failure_code: str,
+) -> list[ReviewRun]:
+    if repo_full_name is None or pull_request_number is None:
+        return []
+
+    result = await session.execute(
+        select(ReviewRun).where(
+            ReviewRun.provider == provider,
+            ReviewRun.repo_full_name == repo_full_name,
+            ReviewRun.pull_request_number == pull_request_number,
+            ReviewRun.status.in_(CANCELLABLE_STATUSES),
+        )
+    )
+    review_runs = list(result.scalars().all())
+    now = utc_now()
+    for review_run in review_runs:
+        review_run.status = "cancelled"
+        review_run.stage = "cleanup"
+        review_run.failure_code = failure_code
+        review_run.completed_at = now
+        session.add(review_run)
+    return review_runs
+
+
+async def supersede_older_review_runs(
+    session: AsyncSession,
+    current_run: ReviewRun,
+) -> list[ReviewRun]:
+    result = await session.execute(
+        select(ReviewRun).where(
+            ReviewRun.provider == current_run.provider,
+            ReviewRun.repo_full_name == current_run.repo_full_name,
+            ReviewRun.pull_request_number == current_run.pull_request_number,
+            ReviewRun.id != current_run.id,
+            ReviewRun.head_sha != current_run.head_sha,
+            ReviewRun.status.in_(CANCELLABLE_STATUSES),
+        )
+    )
+    older_runs = list(result.scalars().all())
+    now = utc_now()
+    for review_run in older_runs:
+        review_run.status = "superseded"
+        review_run.stage = "cleanup"
+        review_run.failure_code = "superseded_by_new_head"
+        review_run.superseded_by_review_run_id = current_run.id
+        review_run.completed_at = now
+        session.add(review_run)
+    return older_runs
 
 
 async def create_review_run_from_github_payload(

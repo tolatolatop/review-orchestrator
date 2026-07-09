@@ -41,9 +41,11 @@ class Settings(BaseSettings):
     github_app_id: str | None = None
     github_private_key_path: str | None = None
     github_api_base_url: str = "https://api.github.com"
+    review_bot_login: str = "review-agent"
     workspace_root: str = "./.workspaces"
     git_cache_root: str = "./.git-cache"
     review_run_timeout_seconds: int = 1800
+    review_run_soft_timeout_seconds: int = 900
     retry_max_attempts: int = 2
     retry_initial_delay_seconds: int = 60
 

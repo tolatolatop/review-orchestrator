@@ -36,6 +36,7 @@ class NormalizedGitHubEvent:
     head_sha: str | None
     should_update_context: bool
     should_create_review_run: bool
+    should_create_agent_task: bool
     status: str
 
 
@@ -45,14 +46,14 @@ PR_ACTIONS_TO_INTERNAL_EVENT = {
     "reopened": "pr_reopened",
     "closed": "pr_closed",
     "edited": "pr_metadata_changed",
-    "ready_for_review": "pr_metadata_changed",
-    "converted_to_draft": "pr_metadata_changed",
+    "ready_for_review": "pr_ready_for_review",
+    "converted_to_draft": "pr_converted_to_draft",
     "labeled": "pr_metadata_changed",
     "unlabeled": "pr_metadata_changed",
     "assigned": "pr_metadata_changed",
     "unassigned": "pr_metadata_changed",
 }
-REVIEW_RUN_ACTIONS = {"opened", "synchronize", "reopened"}
+REVIEW_RUN_ACTIONS = {"opened", "synchronize", "reopened", "ready_for_review"}
 COMMENT_CONTEXT_EVENTS = {
     "issue_comment": "pr_comment_context",
     "pull_request_review": "pr_comment_context",
@@ -92,6 +93,8 @@ def verify_signature(body: bytes, signature: str | None, secret: str | None) -> 
 def normalize_github_event(
     provider_event: str,
     payload: dict[str, Any],
+    *,
+    bot_login: str | None = None,
 ) -> NormalizedGitHubEvent:
     action = _optional_str(payload.get("action"))
 
@@ -99,7 +102,12 @@ def normalize_github_event(
         return _normalize_pull_request_event(action, payload)
 
     if provider_event in COMMENT_CONTEXT_EVENTS:
-        return _normalize_comment_context_event(provider_event, action, payload)
+        return _normalize_comment_context_event(
+            provider_event,
+            action,
+            payload,
+            bot_login=bot_login,
+        )
 
     return NormalizedGitHubEvent(
         provider_event=provider_event,
@@ -110,6 +118,7 @@ def normalize_github_event(
         head_sha=_pull_request_head_sha(payload),
         should_update_context=False,
         should_create_review_run=False,
+        should_create_agent_task=False,
         status="ignored",
     )
 
@@ -138,6 +147,7 @@ def _normalize_pull_request_event(
         head_sha=_pull_request_head_sha(payload),
         should_update_context=internal_event is not None,
         should_create_review_run=action in REVIEW_RUN_ACTIONS,
+        should_create_agent_task=False,
         status=status,
     )
 
@@ -146,10 +156,17 @@ def _normalize_comment_context_event(
     provider_event: str,
     action: str | None,
     payload: dict[str, Any],
+    *,
+    bot_login: str | None,
 ) -> NormalizedGitHubEvent:
     pull_request_number = _pull_request_number(payload)
+    mentions_bot = _comment_mentions_bot(payload, bot_login)
     internal_event = (
-        COMMENT_CONTEXT_EVENTS[provider_event] if pull_request_number else None
+        "agent_mention"
+        if pull_request_number and mentions_bot
+        else COMMENT_CONTEXT_EVENTS[provider_event]
+        if pull_request_number
+        else None
     )
     return NormalizedGitHubEvent(
         provider_event=provider_event,
@@ -160,6 +177,7 @@ def _normalize_comment_context_event(
         head_sha=_pull_request_head_sha(payload),
         should_update_context=False,
         should_create_review_run=False,
+        should_create_agent_task=pull_request_number is not None and mentions_bot,
         status="received" if internal_event else "ignored",
     )
 
@@ -200,6 +218,21 @@ def _pull_request_head_sha(payload: dict[str, Any]) -> str | None:
 def _pull_request_merged(payload: dict[str, Any]) -> bool:
     pull_request = payload.get("pull_request")
     return isinstance(pull_request, dict) and pull_request.get("merged") is True
+
+
+def _comment_mentions_bot(payload: dict[str, Any], bot_login: str | None) -> bool:
+    if not bot_login:
+        return False
+    comment = payload.get("comment")
+    review = payload.get("review")
+    body = None
+    if isinstance(comment, dict):
+        body = comment.get("body")
+    elif isinstance(review, dict):
+        body = review.get("body")
+    if not isinstance(body, str):
+        return False
+    return f"@{bot_login.lower()}" in body.lower()
 
 
 def _optional_str(value: Any) -> str | None:
