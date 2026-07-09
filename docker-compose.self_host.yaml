@@ -15,12 +15,12 @@ services:
     restart: unless-stopped
 
   openhands:
-    image: ${OPENHANDS_IMAGE:-docker.all-hands.dev/all-hands-ai/openhands:latest}
+    image: ${OPENHANDS_IMAGE:-docker.openhands.dev/openhands/openhands:1.8}
     environment:
       SANDBOX_RUNTIME_CONTAINER_IMAGE: ${SANDBOX_RUNTIME_CONTAINER_IMAGE:-docker.all-hands.dev/all-hands-ai/runtime:latest}
       LOG_ALL_EVENTS: ${OPENHANDS_LOG_ALL_EVENTS:-false}
     ports:
-      - "${OPENHANDS_PORT:-3000}:3000"
+      - "127.0.0.1:${OPENHANDS_PORT:-3000}:3000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - openhands_state:/.openhands-state
@@ -44,8 +44,8 @@ services:
       WORKSPACE_ROOT: /var/lib/review-orchestrator/workspaces
       GIT_CACHE_ROOT: /var/lib/review-orchestrator/git-cache
       OPENHANDS_BASE_URL: http://openhands:3000
-    ports:
-      - "${PORT:-8000}:8000"
+    expose:
+      - "8000"
     volumes:
       - review_orchestrator_data:/var/lib/review-orchestrator
     depends_on:
@@ -65,6 +65,33 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
+    environment:
+      REVIEW_PROXY_TOKEN: ${REVIEW_PROXY_TOKEN:?REVIEW_PROXY_TOKEN must be set}
+    ports:
+      - "${REVIEW_PROXY_PORT:-18080}:8080"
+    volumes:
+      - ./deploy/nginx/review-orchestrator.conf.template:/etc/nginx/templates/review-orchestrator.conf.template:ro
+    depends_on:
+      review-orchestrator:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "-q",
+          "-O",
+          "-",
+          "http://127.0.0.1:8080/health",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
 
 volumes:
