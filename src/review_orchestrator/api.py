@@ -59,7 +59,11 @@ async def accept_webhook(
             request.app.state.settings.github_webhook_secret,
         )
         payload = parse_json_body(raw_body)
-        normalized_event = normalize_github_event(provider_event, payload)
+        normalized_event = normalize_github_event(
+            provider_event,
+            payload,
+            bot_login=request.app.state.settings.review_bot_login,
+        )
     except GitHubWebhookError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 

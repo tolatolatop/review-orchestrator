@@ -18,6 +18,7 @@ def make_signed_client(tmp_path: Path, secret: str = "secret") -> TestClient:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
         github_webhook_secret=secret,
+        review_bot_login="review-agent",
     )
     return TestClient(create_app(settings))
 
@@ -233,6 +234,33 @@ def test_duplicate_github_delivery_is_idempotent(tmp_path: Path) -> None:
     )
 
 
+def test_synchronize_supersedes_older_queued_review_run(tmp_path: Path) -> None:
+    opened_payload = pull_request_payload(action="opened", head_sha="b" * 40)
+    opened_body = json_body(opened_payload)
+    sync_payload = pull_request_payload(action="synchronize", head_sha="c" * 40)
+    sync_body = json_body(sync_payload)
+
+    with make_signed_client(tmp_path) as client:
+        opened_response = client.post(
+            "/api/v1/webhooks/github",
+            content=opened_body,
+            headers=github_headers(opened_body, delivery_id="delivery-opened"),
+        )
+        opened_run_id = opened_response.json()["review_run_id"]
+
+        sync_response = client.post(
+            "/api/v1/webhooks/github",
+            content=sync_body,
+            headers=github_headers(sync_body, delivery_id="delivery-sync"),
+        )
+        old_run = client.get(f"/api/v1/review-runs/{opened_run_id}").json()
+
+    assert sync_response.status_code == 200
+    assert sync_response.json()["review_run_id"] != opened_run_id
+    assert old_run["status"] == "superseded"
+    assert old_run["failure_code"] == "superseded_by_new_head"
+
+
 def test_rejects_invalid_github_signature(tmp_path: Path) -> None:
     payload = pull_request_payload()
     body = json_body(payload)
@@ -266,6 +294,35 @@ def test_closed_pull_request_is_processed_without_review_run(tmp_path: Path) -> 
     assert response.json()["review_run_id"] is None
 
 
+def test_closed_pull_request_cancels_existing_queued_review_run(tmp_path: Path) -> None:
+    opened_payload = pull_request_payload(action="opened", head_sha="b" * 40)
+    opened_body = json_body(opened_payload)
+    closed_payload = pull_request_payload(
+        action="closed", merged=True, head_sha="b" * 40
+    )
+    closed_body = json_body(closed_payload)
+
+    with make_signed_client(tmp_path) as client:
+        opened_response = client.post(
+            "/api/v1/webhooks/github",
+            content=opened_body,
+            headers=github_headers(opened_body, delivery_id="delivery-open"),
+        )
+        review_run_id = opened_response.json()["review_run_id"]
+
+        closed_response = client.post(
+            "/api/v1/webhooks/github",
+            content=closed_body,
+            headers=github_headers(closed_body, delivery_id="delivery-closed"),
+        )
+        review_run = client.get(f"/api/v1/review-runs/{review_run_id}").json()
+
+    assert closed_response.status_code == 200
+    assert closed_response.json()["internal_event"] == "pr_merged"
+    assert review_run["status"] == "cancelled"
+    assert review_run["failure_code"] == "pr_merged"
+
+
 def test_pr_issue_comment_is_context_only(tmp_path: Path) -> None:
     payload = {
         "action": "created",
@@ -286,3 +343,27 @@ def test_pr_issue_comment_is_context_only(tmp_path: Path) -> None:
     assert response.json()["internal_event"] == "pr_comment_context"
     assert response.json()["status"] == "processed"
     assert response.json()["review_run_id"] is None
+    assert response.json()["agent_task_id"] is None
+
+
+def test_pr_issue_comment_mention_creates_agent_task(tmp_path: Path) -> None:
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "example/repo"},
+        "issue": {"number": 42, "pull_request": {"url": "https://api.github/pr"}},
+        "comment": {"id": 123, "body": "@review-agent should I re-review this?"},
+    }
+    body = json_body(payload)
+
+    with make_signed_client(tmp_path) as client:
+        response = client.post(
+            "/api/v1/webhooks/github",
+            content=body,
+            headers=github_headers(body, event="issue_comment"),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["internal_event"] == "agent_mention"
+    assert response.json()["status"] == "queued"
+    assert response.json()["review_run_id"] is None
+    assert response.json()["agent_task_id"] is not None

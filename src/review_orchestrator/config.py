@@ -33,8 +33,10 @@ class Settings(BaseSettings):
     openhands_api_token: str | None = None
     openhands_review_skill: str = "code-review"
     openhands_review_profile: str = "default"
+    review_bot_login: str = "review-agent"
     workspace_root: str = "./.workspaces"
     review_run_timeout_seconds: int = 1800
+    review_run_soft_timeout_seconds: int = 900
     retry_max_attempts: int = 2
     retry_initial_delay_seconds: int = 60
 
