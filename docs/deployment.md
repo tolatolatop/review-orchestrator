@@ -36,7 +36,7 @@ runtime environment or secret manager.
 Copy the template and fill in local values:
 
 ```bash
-cp .env.template .env
+cp .env.example .env
 ```
 
 Review Orchestrator reads environment variables directly and also loads `.env`
@@ -94,7 +94,7 @@ Install dependencies, create the local environment file, and start the service:
 
 ```bash
 uv sync
-cp .env.template .env
+cp .env.example .env
 uv run uvicorn review_orchestrator.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -424,4 +424,3 @@ For rollback:
 4. Keep workspace storage intact unless the rollback plan explicitly requires a
    cleanup.
 5. Re-run `/health` and inspect recent review runs before re-enabling webhooks.
-

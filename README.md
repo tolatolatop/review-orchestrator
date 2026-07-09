@@ -19,7 +19,7 @@ sessions.
 
 ```bash
 uv sync
-cp .env.template .env
+cp .env.example .env
 uv run uvicorn review_orchestrator.main:app --reload
 uv run ruff check .
 uv run pytest
@@ -102,7 +102,7 @@ Duplicate delivery IDs are idempotent and return the original event status.
 ## Runtime Configuration
 
 Infrastructure and secret values are read from environment variables. Use
-`.env.template` as the local starting point. Repository-level review behavior is
+`.env.example` as the local starting point. Repository-level review behavior is
 stored in the database with conservative defaults:
 
 - `review_enabled = true`
