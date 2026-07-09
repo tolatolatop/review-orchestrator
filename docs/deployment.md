@@ -61,6 +61,7 @@ passwords.
 | `GITLAB_API_BASE_URL` | `https://gitlab.com/api/v4` | no | GitLab API base URL. Override for self-managed GitLab. |
 | `GITLAB_API_TOKEN` | empty | for GitLab MR lookup and notes | Token used by the worker for MR details, changes, and summary note publishing. |
 | `OPENHANDS_BASE_URL` | `http://localhost:3000` | yes | Base URL for OpenHands App Server. |
+| `OPENHANDS_FRONTEND_PORT` | `3000` | no | Local-only host port for the OpenHands UI/API in `docker-compose.self_host.yaml`; bound to `127.0.0.1`. |
 | `OPENHANDS_API_TOKEN` | empty | if OpenHands requires auth | Bearer token sent to OpenHands. |
 | `OPENHANDS_REVIEW_SKILL` | `code-review` | no | Review skill name stored with repository review defaults. |
 | `OPENHANDS_REVIEW_PROFILE` | `default` | no | Review profile stored with repository review defaults. |
@@ -170,7 +171,18 @@ for local testing.
 The self-host compose file runs separate `review-orchestrator` API and
 `review-orchestrator-worker` services. It publishes Nginx as the public Review
 Orchestrator entrypoint and keeps the FastAPI service on the private Docker
-network. Requests
+network. OpenHands is also published only on the host loopback interface for
+local inspection:
+
+```bash
+open http://127.0.0.1:${OPENHANDS_FRONTEND_PORT:-3000}
+```
+
+Use `OPENHANDS_FRONTEND_PORT` to move this local-only OpenHands UI/API port.
+The legacy `OPENHANDS_PORT` variable is still accepted as a fallback when
+`OPENHANDS_FRONTEND_PORT` is not set.
+
+Requests
 outside `/health` and `/api/v1/webhooks/github` must include the fixed token:
 
 ```bash

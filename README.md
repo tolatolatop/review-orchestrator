@@ -130,6 +130,7 @@ Workspace storage defaults:
 OpenHands App Server integration:
 
 - `OPENHANDS_BASE_URL=http://localhost:3000`
+- self-host OpenHands UI: `http://127.0.0.1:${OPENHANDS_FRONTEND_PORT:-3000}`
 - `OPENHANDS_API_TOKEN=optional-service-token`
 - `OPENHANDS_TIMEOUT_SECONDS=30`
 
