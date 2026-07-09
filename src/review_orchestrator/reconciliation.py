@@ -26,10 +26,17 @@ async def persist_and_reconcile_findings(
     previous_by_fingerprint = {
         finding.fingerprint: finding for finding in previous_findings
     }
+    current_by_fingerprint = await _current_run_findings(session, review_run)
     seen_fingerprints: set[str] = set()
     stats = {"new": 0, "existing": 0, "resolved": 0, "stale": 0}
 
     for publishable in parsed_result.findings:
+        current = current_by_fingerprint.get(publishable.fingerprint)
+        if current is not None:
+            if current.state in stats:
+                stats[current.state] += 1
+            seen_fingerprints.add(publishable.fingerprint)
+            continue
         finding_payload = publishable.finding
         previous = previous_by_fingerprint.get(publishable.fingerprint)
         state = "existing" if previous else "new"
@@ -131,6 +138,16 @@ async def _previous_active_findings(
         )
     )
     return list(findings.scalars().all())
+
+
+async def _current_run_findings(
+    session: AsyncSession,
+    review_run: ReviewRun,
+) -> dict[str, Finding]:
+    result = await session.execute(
+        select(Finding).where(Finding.review_run_id == review_run.id)
+    )
+    return {finding.fingerprint: finding for finding in result.scalars().all()}
 
 
 def _severity_counts(parsed_result: ParsedReviewResult) -> dict[str, int]:

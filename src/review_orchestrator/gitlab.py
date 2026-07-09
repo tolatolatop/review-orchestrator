@@ -1,0 +1,310 @@
+from __future__ import annotations
+
+import json
+from typing import Any
+from urllib.parse import quote
+
+import httpx
+from pydantic import BaseModel, ConfigDict
+
+from review_orchestrator.github import parse_commentable_lines
+from review_orchestrator.providers import (
+    ParsedProviderWebhook,
+    ProviderPayloadError,
+    ProviderSignatureError,
+    ProviderWebhookEvent,
+    lower_headers,
+)
+from review_orchestrator.review_results import ChangedFile
+
+
+class GitLabClientError(RuntimeError):
+    pass
+
+
+class GitLabNote(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: int | str
+    body: str | None = None
+
+
+class GitLabClient:
+    def __init__(
+        self,
+        *,
+        api_base_url: str = "https://gitlab.com/api/v4",
+        token: str | None = None,
+        timeout: float = 30.0,
+    ) -> None:
+        self.api_base_url = api_base_url.rstrip("/")
+        self.token = token
+        self.timeout = timeout
+
+    async def get_merge_request(
+        self,
+        project_path: str,
+        merge_request_iid: int,
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "GET",
+            f"/projects/{_quoted(project_path)}/merge_requests/{merge_request_iid}",
+        )
+        if not isinstance(response, dict):
+            raise GitLabClientError("GitLab merge request response is not an object.")
+        return response
+
+    async def get_merge_request_changes(
+        self,
+        project_path: str,
+        merge_request_iid: int,
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "GET",
+            f"/projects/{_quoted(project_path)}/merge_requests/{merge_request_iid}/changes",
+        )
+        if not isinstance(response, dict):
+            raise GitLabClientError("GitLab changes response is not an object.")
+        return response
+
+    async def list_merge_request_notes(
+        self,
+        project_path: str,
+        merge_request_iid: int,
+    ) -> list[GitLabNote]:
+        items = await self._paginate(
+            f"/projects/{_quoted(project_path)}/merge_requests/{merge_request_iid}/notes"
+        )
+        return [GitLabNote.model_validate(item) for item in items]
+
+    async def create_merge_request_note(
+        self,
+        project_path: str,
+        merge_request_iid: int,
+        body: str,
+    ) -> str:
+        response = await self._request(
+            "POST",
+            f"/projects/{_quoted(project_path)}/merge_requests/{merge_request_iid}/notes",
+            json={"body": body},
+        )
+        return str(response["id"])
+
+    async def update_merge_request_note(
+        self,
+        project_path: str,
+        merge_request_iid: int,
+        note_id: str,
+        body: str,
+    ) -> str:
+        response = await self._request(
+            "PUT",
+            f"/projects/{_quoted(project_path)}/merge_requests/{merge_request_iid}/notes/{note_id}",
+            json={"body": body},
+        )
+        return str(response["id"])
+
+    async def _paginate(self, path: str) -> list[dict[str, Any]]:
+        page = 1
+        items: list[dict[str, Any]] = []
+        while True:
+            response = await self._request(
+                "GET", path, params={"per_page": 100, "page": page}
+            )
+            if not isinstance(response, list):
+                raise GitLabClientError(f"GitLab response for {path} is not a list.")
+            items.extend(response)
+            if len(response) < 100:
+                return items
+            page += 1
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["PRIVATE-TOKEN"] = self.token
+        try:
+            async with httpx.AsyncClient(
+                base_url=self.api_base_url,
+                timeout=self.timeout,
+                headers=headers,
+            ) as client:
+                response = await client.request(method, path, json=json, params=params)
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise GitLabClientError(
+                f"GitLab request failed ({exc.response.status_code} {method} {path}): "
+                f"{exc.response.text[:500]}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise GitLabClientError(
+                f"GitLab request failed ({method} {path}): {exc}"
+            ) from exc
+        return response.json() if response.content else {}
+
+
+async def fetch_gitlab_changed_files(
+    client: GitLabClient,
+    *,
+    project_path: str,
+    merge_request_iid: int,
+) -> list[ChangedFile]:
+    response = await client.get_merge_request_changes(project_path, merge_request_iid)
+    changes = response.get("changes")
+    if not isinstance(changes, list):
+        return []
+    changed_files: list[ChangedFile] = []
+    for item in changes:
+        if not isinstance(item, dict):
+            continue
+        path = item.get("new_path") or item.get("old_path")
+        if not isinstance(path, str) or not path:
+            continue
+        changed_files.append(
+            ChangedFile(
+                path=path,
+                commentable_lines=parse_commentable_lines(item.get("diff")),
+            )
+        )
+    return changed_files
+
+
+class GitLabAdapter:
+    provider = "gitlab"
+
+    def parse_webhook(
+        self,
+        *,
+        headers: dict[str, str],
+        raw_body: bytes,
+        settings: Any,
+    ) -> ParsedProviderWebhook:
+        normalized_headers = lower_headers(headers)
+        delivery_id = (
+            normalized_headers.get("x-gitlab-event-uuid")
+            or normalized_headers.get("x-request-id")
+        )
+        event_name = normalized_headers.get("x-gitlab-event")
+        if not delivery_id:
+            raise ProviderPayloadError("Missing X-Gitlab-Event-UUID header.")
+        if not event_name:
+            raise ProviderPayloadError("Missing X-Gitlab-Event header.")
+
+        secret = getattr(settings, "gitlab_webhook_secret", None)
+        token = normalized_headers.get("x-gitlab-token")
+        if secret and token != secret:
+            raise ProviderSignatureError("Invalid GitLab webhook token.")
+
+        payload = _parse_json_body(raw_body)
+        event = normalize_gitlab_event(event_name, payload)
+        return ParsedProviderWebhook(
+            delivery_id=delivery_id,
+            provider_event=event,
+            payload=payload,
+            raw_body=raw_body,
+        )
+
+
+def normalize_gitlab_event(
+    event_name: str,
+    payload: dict[str, Any],
+) -> ProviderWebhookEvent:
+    if event_name != "Merge Request Hook":
+        return ProviderWebhookEvent(
+            provider="gitlab",
+            provider_event=event_name,
+            provider_action=_optional_str(payload.get("object_kind")),
+            internal_event=None,
+            repository=_project_path(payload),
+            pull_request_number=None,
+            head_sha=None,
+            should_update_context=False,
+            should_create_review_run=False,
+            should_create_agent_task=False,
+            status="ignored",
+        )
+
+    attrs = payload.get("object_attributes")
+    if not isinstance(attrs, dict):
+        raise ProviderPayloadError(
+            "GitLab merge request payload is missing attributes."
+        )
+    action = _optional_str(attrs.get("action")) or _optional_str(attrs.get("state"))
+    source_changed = _source_commit_changed(attrs)
+    internal_event = {
+        "open": "pr_opened",
+        "opened": "pr_opened",
+        "reopen": "pr_reopened",
+        "reopened": "pr_reopened",
+        "merge": "pr_merged",
+        "merged": "pr_merged",
+        "close": "pr_closed",
+        "closed": "pr_closed",
+    }.get(action or "")
+    if (action or "") in {"update", "updated"} and source_changed:
+        internal_event = "pr_updated"
+    elif (action or "") in {"update", "updated"}:
+        internal_event = "pr_metadata_changed"
+    review_actions = {"open", "opened", "reopen", "reopened"}
+    should_review = (action or "") in review_actions or internal_event == "pr_updated"
+    return ProviderWebhookEvent(
+        provider="gitlab",
+        provider_event=event_name,
+        provider_action=action,
+        internal_event=internal_event,
+        repository=_project_path(payload),
+        pull_request_number=_int_or_none(attrs.get("iid")),
+        head_sha=_optional_str(attrs.get("last_commit", {}).get("id"))
+        if isinstance(attrs.get("last_commit"), dict)
+        else _optional_str(attrs.get("last_commit_id")),
+        should_update_context=internal_event is not None,
+        should_create_review_run=should_review,
+        should_create_agent_task=False,
+        status="received" if internal_event else "ignored",
+    )
+
+
+def _parse_json_body(body: bytes) -> dict[str, Any]:
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ProviderPayloadError("GitLab webhook payload is not valid JSON.") from exc
+    if not isinstance(payload, dict):
+        raise ProviderPayloadError("GitLab webhook payload must be a JSON object.")
+    return payload
+
+
+def _project_path(payload: dict[str, Any]) -> str | None:
+    project = payload.get("project")
+    if not isinstance(project, dict):
+        return None
+    return _optional_str(project.get("path_with_namespace"))
+
+
+def _optional_str(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) else None
+
+
+def _quoted(value: str) -> str:
+    return quote(value, safe="")
+
+
+def _source_commit_changed(attrs: dict[str, Any]) -> bool:
+    changes = attrs.get("changes")
+    if not isinstance(changes, dict):
+        return False
+    for key in ("last_commit", "source_branch_sha"):
+        value = changes.get(key)
+        if isinstance(value, dict) and value.get("previous") != value.get("current"):
+            return True
+    return False

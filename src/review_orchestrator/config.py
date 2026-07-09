@@ -40,12 +40,32 @@ class Settings(BaseSettings):
     )
     github_app_id: str | None = None
     github_private_key_path: str | None = None
+    github_installation_token: str | None = Field(
+        default=None,
+        description=(
+            "GitHub installation or fine-grained token used by the worker for "
+            "PR file lookup and comment publishing."
+        ),
+    )
     github_api_base_url: str = "https://api.github.com"
     review_bot_login: str = "review-agent"
+    gitlab_webhook_secret: str | None = Field(
+        default=None,
+        description=(
+            "GitLab webhook shared token. If unset, token verification is skipped."
+        ),
+    )
+    gitlab_api_base_url: str = "https://gitlab.com/api/v4"
+    gitlab_api_token: str | None = Field(
+        default=None,
+        description="GitLab API token used by the worker for MR lookup and notes.",
+    )
     workspace_root: str = "./.workspaces"
     git_cache_root: str = "./.git-cache"
     review_run_timeout_seconds: int = 1800
     review_run_soft_timeout_seconds: int = 900
+    worker_poll_interval_seconds: float = Field(default=5.0, gt=0)
+    worker_lock_seconds: int = Field(default=300, gt=0)
     retry_max_attempts: int = 2
     retry_initial_delay_seconds: int = 60
 

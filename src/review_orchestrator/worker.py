@@ -1,13 +1,46 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from review_orchestrator.models import ProviderEventInbox, ReviewRun, utc_now
+from review_orchestrator.comments import (
+    publish_github_line_comments,
+    publish_github_summary_comment,
+    publish_gitlab_summary_comment,
+)
+from review_orchestrator.config import Settings
+from review_orchestrator.github import (
+    GitHubClient,
+    GitHubClientError,
+    fetch_changed_files,
+)
+from review_orchestrator.gitlab import (
+    GitLabClient,
+    GitLabClientError,
+    fetch_gitlab_changed_files,
+)
+from review_orchestrator.models import (
+    AgentTask,
+    ProviderEventInbox,
+    PullRequestContext,
+    ReviewRun,
+    utc_now,
+)
+from review_orchestrator.openhands import OpenHandsClient
+from review_orchestrator.schemas import ReviewRunCreate, WorkspacePrepareRequest
+from review_orchestrator.services import (
+    collect_review_result,
+    create_review_run,
+    get_or_create_review_config,
+    start_review_session,
+    sync_review_session,
+)
+from review_orchestrator.workspaces import prepare_workspace
 
 WORKER_ACTIVE_STATUSES = {"queued", "running"}
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "superseded"}
@@ -28,17 +61,25 @@ async def acquire_next_review_run(
     result = await session.execute(
         select(ReviewRun)
         .where(
-            ReviewRun.status == "queued",
+            or_(
+                ReviewRun.status == "queued",
+                ReviewRun.status == "running",
+            ),
+            or_(
+                ReviewRun.locked_until.is_(None),
+                ReviewRun.locked_until < now,
+            ),
         )
-        .order_by(ReviewRun.created_at)
+        .order_by(ReviewRun.status == "running", ReviewRun.created_at)
         .limit(1)
     )
     review_run = result.scalar_one_or_none()
     if review_run is None:
         return None
 
-    review_run.status = "running"
-    review_run.stage = "start"
+    if review_run.status == "queued":
+        review_run.status = "running"
+        review_run.stage = "start"
     review_run.lock_owner = worker_id
     review_run.locked_until = now + timedelta(seconds=lock_seconds)
     review_run.started_at = review_run.started_at or now
@@ -46,6 +87,202 @@ async def acquire_next_review_run(
     await session.commit()
     await session.refresh(review_run)
     return review_run
+
+
+async def acquire_next_agent_task(
+    session: AsyncSession,
+    *,
+    worker_id: str,
+) -> AgentTask | None:
+    result = await session.execute(
+        select(AgentTask)
+        .where(AgentTask.status == "queued")
+        .order_by(AgentTask.created_at)
+        .limit(1)
+    )
+    task = result.scalar_one_or_none()
+    if task is None:
+        return None
+    task.status = "running"
+    task.result_json = {"worker_id": worker_id}
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+async def process_next_agent_task(
+    session: AsyncSession,
+    *,
+    worker_id: str,
+    github_client: GitHubClient | None = None,
+    gitlab_client: GitLabClient | None = None,
+) -> AgentTask | None:
+    task = await acquire_next_agent_task(session, worker_id=worker_id)
+    if task is None:
+        return None
+
+    context = await _task_context(session, task)
+    if context is None:
+        context = await _hydrate_task_context(
+            session,
+            task,
+            github_client=github_client,
+            gitlab_client=gitlab_client,
+        )
+    if context is None:
+        task.status = "failed"
+        task.error_message = "Pull request context was not found for mention task."
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        return task
+
+    review_run = await create_review_run(
+        session,
+        ReviewRunCreate(
+            provider=context.provider,
+            repo_full_name=context.repo_full_name,
+            pull_request_number=context.pull_request_number,
+            base_sha=context.base_sha,
+            head_sha=context.head_sha,
+            force=True,
+        ),
+        trigger_type="mention",
+        trigger_event_id=task.provider_event_id,
+    )
+    task.status = "completed"
+    task.result_json = {"review_run_id": review_run.id, "status": review_run.status}
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+async def process_next_review_run(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    openhands_client: OpenHandsClient,
+    worker_id: str,
+    github_client: GitHubClient | None = None,
+    gitlab_client: GitLabClient | None = None,
+) -> ReviewRun | None:
+    review_run = await acquire_next_review_run(
+        session,
+        worker_id=worker_id,
+        lock_seconds=settings.worker_lock_seconds,
+    )
+    if review_run is None:
+        return None
+
+    release_lock = True
+    try:
+        context = await _review_run_context(session, review_run)
+        if context is None:
+            review_run.status = "failed"
+            review_run.failure_code = "missing_pr_context"
+            review_run.error = (
+                "Pull request context is required for automatic execution."
+            )
+            session.add(review_run)
+            await session.commit()
+            await session.refresh(review_run)
+            return review_run
+
+        if not review_run.workspace_path:
+            workspace = await prepare_workspace(
+                session,
+                settings,
+                _workspace_request_from_context(context),
+            )
+            if workspace.status == "failed":
+                review_run.status = "failed"
+                review_run.failure_code = workspace.failure_code or "workspace_failed"
+                review_run.error = workspace.failure_message
+                session.add(review_run)
+                await session.commit()
+                await session.refresh(review_run)
+                return review_run
+            review_run.workspace_path = workspace.workspace_path
+            session.add(review_run)
+            await session.commit()
+            await session.refresh(review_run)
+
+        if (
+            not review_run.openhands_start_task_id
+            and not review_run.openhands_conversation_id
+        ):
+            review_run = await start_review_session(
+                session,
+                review_run,
+                openhands_client=openhands_client,
+                workspace_path=review_run.workspace_path,
+            )
+        review_run = await sync_review_session(
+            session,
+            review_run,
+            openhands_client=openhands_client,
+        )
+        raw_result = await _extract_openhands_json_result(
+            openhands_client,
+            review_run.openhands_conversation_id,
+        )
+        if raw_result is None:
+            review_run.stage = "waiting_for_result"
+            review_run.lock_owner = None
+            review_run.locked_until = utc_now() + timedelta(
+                seconds=settings.worker_poll_interval_seconds
+            )
+            session.add(review_run)
+            await session.commit()
+            await session.refresh(review_run)
+            release_lock = False
+            return review_run
+
+        changed_files = await _fetch_changed_files(
+            review_run,
+            github_client=github_client,
+            gitlab_client=gitlab_client,
+        )
+        await collect_review_result(
+            session,
+            review_run,
+            raw_output=raw_result,
+            changed_files=changed_files,
+        )
+        config = await get_or_create_review_config(
+            session,
+            provider=review_run.provider,
+            repo_full_name=review_run.repo_full_name,
+        )
+        if github_client is not None and review_run.provider == "github":
+            await publish_github_summary_comment(
+                session,
+                review_run,
+                github_client=github_client,
+                status_text="completed",
+                finding_stats=review_run.finding_count_by_severity,
+            )
+            if config.line_comments_enabled:
+                await publish_github_line_comments(
+                    session,
+                    review_run,
+                    github_client=github_client,
+                    changed_files=changed_files,
+                )
+        if gitlab_client is not None and review_run.provider == "gitlab":
+            await publish_gitlab_summary_comment(
+                session,
+                review_run,
+                gitlab_client=gitlab_client,
+                status_text="completed",
+                finding_stats=review_run.finding_count_by_severity,
+            )
+        return await session.get(ReviewRun, review_run.id)
+    finally:
+        if release_lock:
+            await release_review_run_lock(session, review_run.id)
 
 
 async def mark_review_run_stage(
@@ -161,3 +398,268 @@ async def _get_internal_event(
 
 def _digest(*parts: str) -> str:
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+async def _task_context(
+    session: AsyncSession,
+    task: AgentTask,
+) -> PullRequestContext | None:
+    if task.pull_request_context_id:
+        return await session.get(PullRequestContext, task.pull_request_context_id)
+    result = await session.execute(
+        select(PullRequestContext).where(
+            PullRequestContext.provider == task.provider,
+            PullRequestContext.repo_full_name == task.repo_full_name,
+            PullRequestContext.pull_request_number == task.pull_request_number,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def _review_run_context(
+    session: AsyncSession,
+    review_run: ReviewRun,
+) -> PullRequestContext | None:
+    if review_run.pull_request_context_id:
+        return await session.get(PullRequestContext, review_run.pull_request_context_id)
+    result = await session.execute(
+        select(PullRequestContext).where(
+            PullRequestContext.provider == review_run.provider,
+            PullRequestContext.repo_full_name == review_run.repo_full_name,
+            PullRequestContext.pull_request_number == review_run.pull_request_number,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+def _workspace_request_from_context(
+    context: PullRequestContext,
+) -> WorkspacePrepareRequest:
+    return WorkspacePrepareRequest.model_validate(
+        {
+            "provider": context.provider,
+            "repository": {
+                "full_name": context.repo_full_name,
+                "clone_url": _clone_url(context),
+            },
+            "pull_request": {
+                "number": context.pull_request_number,
+                "base_sha": context.base_sha,
+                "head_sha": context.head_sha,
+                "is_fork": context.is_fork,
+            },
+        }
+    )
+
+
+def _clone_url(context: PullRequestContext) -> str:
+    if context.provider == "github":
+        return f"https://github.com/{context.repo_full_name}.git"
+    if context.provider == "gitlab":
+        return f"https://gitlab.com/{context.repo_full_name}.git"
+    return context.html_url or context.repo_full_name
+
+
+async def _hydrate_task_context(
+    session: AsyncSession,
+    task: AgentTask,
+    *,
+    github_client: GitHubClient | None,
+    gitlab_client: GitLabClient | None,
+) -> PullRequestContext | None:
+    if task.provider == "github" and github_client is not None:
+        pull_request = await github_client.get_pull_request(
+            task.repo_full_name,
+            task.pull_request_number,
+        )
+        context = _context_from_github_pull_request(task, pull_request)
+    elif task.provider == "gitlab" and gitlab_client is not None:
+        merge_request = await gitlab_client.get_merge_request(
+            task.repo_full_name,
+            task.pull_request_number,
+        )
+        context = _context_from_gitlab_merge_request(task, merge_request)
+    else:
+        return None
+
+    session.add(context)
+    await session.commit()
+    await session.refresh(context)
+    task.pull_request_context_id = context.id
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return context
+
+
+def _context_from_github_pull_request(
+    task: AgentTask,
+    pull_request: dict[str, Any],
+) -> PullRequestContext:
+    base = pull_request.get("base") if isinstance(pull_request, dict) else None
+    head = pull_request.get("head") if isinstance(pull_request, dict) else None
+    base_repo = base.get("repo") if isinstance(base, dict) else None
+    head_repo = head.get("repo") if isinstance(head, dict) else None
+    head_repo_full_name = _repo_full_name(head_repo)
+    base_repo_full_name = _repo_full_name(base_repo)
+    return PullRequestContext(
+        provider=task.provider,
+        repo_full_name=task.repo_full_name,
+        pull_request_number=task.pull_request_number,
+        provider_pr_id=_id_to_str(pull_request.get("id")),
+        title=_str_or_none(pull_request.get("title")),
+        author_login=_login(pull_request.get("user")),
+        base_ref=_ref(base),
+        base_sha=_sha(base),
+        head_ref=_ref(head),
+        head_sha=_sha(head) or "",
+        head_repo_full_name=head_repo_full_name,
+        is_fork=bool(
+            head_repo_full_name and head_repo_full_name != base_repo_full_name
+        ),
+        status=_str_or_none(pull_request.get("state")) or "open",
+        html_url=_str_or_none(pull_request.get("html_url")),
+    )
+
+
+def _context_from_gitlab_merge_request(
+    task: AgentTask,
+    merge_request: dict[str, Any],
+) -> PullRequestContext:
+    return PullRequestContext(
+        provider=task.provider,
+        repo_full_name=task.repo_full_name,
+        pull_request_number=task.pull_request_number,
+        provider_pr_id=_id_to_str(merge_request.get("id")),
+        title=_str_or_none(merge_request.get("title")),
+        author_login=_gitlab_author(merge_request.get("author")),
+        base_ref=_str_or_none(merge_request.get("target_branch")),
+        base_sha=_str_or_none(merge_request.get("diff_refs", {}).get("base_sha"))
+        if isinstance(merge_request.get("diff_refs"), dict)
+        else None,
+        head_ref=_str_or_none(merge_request.get("source_branch")),
+        head_sha=_str_or_none(merge_request.get("sha")) or "",
+        head_repo_full_name=task.repo_full_name,
+        is_fork=False,
+        status=_str_or_none(merge_request.get("state")) or "opened",
+        html_url=_str_or_none(merge_request.get("web_url")),
+    )
+
+
+async def _fetch_changed_files(
+    review_run: ReviewRun,
+    *,
+    github_client: GitHubClient | None,
+    gitlab_client: GitLabClient | None,
+):
+    try:
+        if review_run.provider == "github" and github_client is not None:
+            return await fetch_changed_files(
+                github_client,
+                repo_full_name=review_run.repo_full_name,
+                pull_request_number=review_run.pull_request_number,
+            )
+        if review_run.provider == "gitlab" and gitlab_client is not None:
+            return await fetch_gitlab_changed_files(
+                gitlab_client,
+                project_path=review_run.repo_full_name,
+                merge_request_iid=review_run.pull_request_number,
+            )
+    except (GitHubClientError, GitLabClientError) as exc:
+        warnings = list(review_run.validation_warnings_json or [])
+        warnings.append(
+            {
+                "code": "changed_files_lookup_failed",
+                "message": f"Using summary-only fallback: {exc}",
+            }
+        )
+        review_run.validation_warnings_json = warnings
+    return []
+
+
+async def _extract_openhands_json_result(
+    openhands_client: OpenHandsClient,
+    conversation_id: str | None,
+) -> dict[str, Any] | None:
+    if not conversation_id:
+        return None
+    page = await openhands_client.list_events(conversation_id, limit=100)
+    for event in reversed(page.items):
+        candidate = _extract_text(event)
+        if not candidate:
+            continue
+        parsed = _try_json(candidate)
+        if isinstance(parsed, dict) and "summary" in parsed and "findings" in parsed:
+            return parsed
+    return None
+
+
+def _extract_text(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("text", "content", "message"):
+            text = _extract_text(value.get(key))
+            if text:
+                return text
+        return None
+    if isinstance(value, list):
+        parts = [_extract_text(item) for item in value]
+        joined = "\n".join(part for part in parts if part)
+        return joined or None
+    return None
+
+
+def _try_json(text: str) -> Any:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+
+def _str_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _id_to_str(value: Any) -> str | None:
+    if isinstance(value, int | str):
+        return str(value)
+    return None
+
+
+def _sha(ref_object: Any) -> str | None:
+    if not isinstance(ref_object, dict):
+        return None
+    return _str_or_none(ref_object.get("sha"))
+
+
+def _ref(ref_object: Any) -> str | None:
+    if not isinstance(ref_object, dict):
+        return None
+    return _str_or_none(ref_object.get("ref"))
+
+
+def _repo_full_name(repo: Any) -> str | None:
+    if not isinstance(repo, dict):
+        return None
+    return _str_or_none(repo.get("full_name"))
+
+
+def _login(user: Any) -> str | None:
+    if not isinstance(user, dict):
+        return None
+    return _str_or_none(user.get("login"))
+
+
+def _gitlab_author(author: Any) -> str | None:
+    if not isinstance(author, dict):
+        return None
+    return _str_or_none(author.get("username")) or _str_or_none(author.get("name"))
