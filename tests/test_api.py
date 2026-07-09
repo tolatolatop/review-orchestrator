@@ -2,11 +2,50 @@ import hashlib
 import hmac
 import json
 from pathlib import Path
+from typing import Any
 
 from fastapi.testclient import TestClient
 
 from review_orchestrator.config import Settings
 from review_orchestrator.main import create_app
+from review_orchestrator.openhands import (
+    OpenHandsConversation,
+    OpenHandsStartTask,
+    OpenHandsStartTaskStatus,
+)
+
+
+class FakeOpenHandsClient:
+    def __init__(self) -> None:
+        self.started_inputs: list[Any] = []
+        self.deleted_conversation_ids: list[str] = []
+        self.start_task = OpenHandsStartTask(
+            id="task-1",
+            status=OpenHandsStartTaskStatus.ready,
+            app_conversation_id="conversation-1",
+            sandbox_id="sandbox-1",
+            agent_server_url="http://agent-server",
+        )
+        self.conversation = OpenHandsConversation(
+            id="conversation-1",
+            sandbox_status="RUNNING",
+            execution_status="RUNNING",
+        )
+
+    async def start_conversation(self, review_input: Any) -> OpenHandsStartTask:
+        self.started_inputs.append(review_input)
+        return self.start_task
+
+    async def get_start_task(self, task_id: str) -> OpenHandsStartTask:
+        assert task_id == self.start_task.id
+        return self.start_task
+
+    async def get_conversation(self, conversation_id: str) -> OpenHandsConversation:
+        assert conversation_id == self.conversation.id
+        return self.conversation
+
+    async def delete_conversation(self, conversation_id: str) -> None:
+        self.deleted_conversation_ids.append(conversation_id)
 
 
 def make_client(tmp_path: Path) -> TestClient:
@@ -216,3 +255,154 @@ def test_pr_issue_comment_is_context_only(tmp_path: Path) -> None:
     assert response.json()["internal_event"] == "pr_comment_context"
     assert response.json()["status"] == "processed"
     assert response.json()["review_run_id"] is None
+
+
+def test_start_review_session_records_openhands_identifiers(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repository": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+    fake_openhands = FakeOpenHandsClient()
+
+    with make_client(tmp_path) as client:
+        client.app.state.openhands_client = fake_openhands
+        create_response = client.post("/api/v1/review-runs", json=payload)
+        review_run = create_response.json()
+
+        start_response = client.post(
+            f"/api/v1/review-runs/{review_run['id']}/session/start",
+            json={"workspace_path": "/workspaces/example-repo/pr-42/bbbbbbb"},
+        )
+
+    assert start_response.status_code == 200
+    data = start_response.json()
+    assert data["status"] == "running"
+    assert data["workspace_path"] == "/workspaces/example-repo/pr-42/bbbbbbb"
+    assert data["openhands_start_task_id"] == "task-1"
+    assert data["openhands_conversation_id"] == "conversation-1"
+    assert data["openhands_sandbox_id"] == "sandbox-1"
+    assert fake_openhands.started_inputs[0].repo_full_name == "example/repo"
+    assert fake_openhands.started_inputs[0].base_sha == "a" * 40
+
+
+def test_start_review_session_requires_workspace_path(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repository": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+
+    with make_client(tmp_path) as client:
+        client.app.state.openhands_client = FakeOpenHandsClient()
+        create_response = client.post("/api/v1/review-runs", json=payload)
+        review_run = create_response.json()
+        start_response = client.post(
+            f"/api/v1/review-runs/{review_run['id']}/session/start",
+            json={},
+        )
+
+    assert start_response.status_code == 409
+    assert "workspace_path" in start_response.json()["detail"]
+
+
+def test_sync_review_session_marks_openhands_failure(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repository": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+    fake_openhands = FakeOpenHandsClient()
+    fake_openhands.conversation = OpenHandsConversation(
+        id="conversation-1",
+        sandbox_status="RUNNING",
+        execution_status="ERROR",
+    )
+
+    with make_client(tmp_path) as client:
+        client.app.state.openhands_client = fake_openhands
+        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        started = client.post(
+            f"/api/v1/review-runs/{review_run['id']}/session/start",
+            json={"workspace_path": "/workspaces/example-repo/pr-42/bbbbbbb"},
+        ).json()
+        sync_response = client.post(
+            f"/api/v1/review-runs/{started['id']}/session/sync",
+        )
+
+    assert sync_response.status_code == 200
+    assert sync_response.json()["status"] == "failed"
+    assert "ERROR" in sync_response.json()["error"]
+
+
+def test_collect_review_result_completes_review_run(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repository": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+    raw_output = {
+        "summary": "One issue found.",
+        "findings": [
+            {
+                "file": "src/app.py",
+                "line": 12,
+                "severity": "high",
+                "message": "Auth check is skipped.",
+                "confidence": 0.9,
+            }
+        ],
+    }
+
+    with make_client(tmp_path) as client:
+        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        collect_response = client.post(
+            f"/api/v1/review-runs/{review_run['id']}/result",
+            json={
+                "raw_output": raw_output,
+                "changed_files": [
+                    {"path": "src/app.py", "commentable_lines": [12, 13]}
+                ],
+            },
+        )
+
+    assert collect_response.status_code == 200
+    data = collect_response.json()
+    assert data["review_run"]["status"] == "completed"
+    assert data["review_run"]["result_summary"] == "One issue found."
+    assert data["parsed"]["findings"][0]["publish_as_line_comment"] is True
+
+
+def test_cancel_review_session_deletes_openhands_conversation(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repository": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+    fake_openhands = FakeOpenHandsClient()
+
+    with make_client(tmp_path) as client:
+        client.app.state.openhands_client = fake_openhands
+        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        started = client.post(
+            f"/api/v1/review-runs/{review_run['id']}/session/start",
+            json={"workspace_path": "/workspaces/example-repo/pr-42/bbbbbbb"},
+        ).json()
+        cancel_response = client.post(
+            f"/api/v1/review-runs/{started['id']}/session/cancel",
+            json={"reason": "superseded by new head"},
+        )
+
+    assert cancel_response.status_code == 200
+    assert cancel_response.json()["status"] == "cancelled"
+    assert fake_openhands.deleted_conversation_ids == ["conversation-1"]

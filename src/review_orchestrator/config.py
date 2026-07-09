@@ -23,6 +23,19 @@ class Settings(BaseSettings):
             "skipped for local development."
         ),
     )
+    openhands_base_url: str | None = Field(
+        default=None,
+        description="Base URL for the OpenHands App Server API.",
+    )
+    openhands_api_key: str | None = Field(
+        default=None,
+        description="Optional bearer token for OpenHands App Server requests.",
+    )
+    openhands_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        description="HTTP timeout for OpenHands App Server requests.",
+    )
 
 
 @lru_cache

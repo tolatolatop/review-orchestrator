@@ -117,6 +117,15 @@ class ReviewRun(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
     summary_comment_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     workspace_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    openhands_start_task_id: Mapped[str | None] = mapped_column(
+        String(80), nullable=True
+    )
+    openhands_conversation_id: Mapped[str | None] = mapped_column(
+        String(80), nullable=True
+    )
+    openhands_sandbox_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    openhands_agent_server_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False

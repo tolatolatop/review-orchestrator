@@ -14,7 +14,29 @@ from review_orchestrator.models import (
     ReviewRun,
     utc_now,
 )
+from review_orchestrator.openhands import (
+    OpenHandsClient,
+    OpenHandsClientError,
+    OpenHandsStartTaskStatus,
+)
+from review_orchestrator.review_results import (
+    ChangedFile,
+    ParsedReviewResult,
+    ReviewResultError,
+    ReviewSkillInput,
+    parse_review_result,
+)
 from review_orchestrator.schemas import ReviewRunCreate, WebhookAccepted
+
+TERMINAL_SUCCESS_STATUSES = {"FINISHED", "COMPLETED", "STOPPED"}
+TERMINAL_FAILURE_STATUSES = {"ERROR", "STUCK", "FAILED"}
+
+
+class ReviewRunTransitionError(ValueError):
+    def __init__(self, message: str, *, status_code: int = 409) -> None:
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
 
 
 async def create_review_run(
@@ -43,6 +65,172 @@ async def get_review_run(
     review_run_id: str,
 ) -> ReviewRun | None:
     return await session.get(ReviewRun, review_run_id)
+
+
+async def start_review_session(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    openhands_client: OpenHandsClient,
+    workspace_path: str | None = None,
+) -> ReviewRun:
+    if review_run.status in {"cancelled", "superseded", "completed"}:
+        raise ReviewRunTransitionError(
+            f"Review run {review_run.id} cannot be started from {review_run.status}."
+        )
+
+    resolved_workspace_path = workspace_path or review_run.workspace_path
+    if not resolved_workspace_path:
+        raise ReviewRunTransitionError("workspace_path is required to start review.")
+    if not review_run.base_sha:
+        raise ReviewRunTransitionError("base_sha is required to start review.")
+
+    review_input = ReviewSkillInput(
+        provider=review_run.provider,
+        repo_full_name=review_run.repository,
+        pr_number=review_run.pull_request_number,
+        base_sha=review_run.base_sha,
+        head_sha=review_run.head_sha,
+        workspace_path=resolved_workspace_path,
+    )
+    try:
+        task = await openhands_client.start_conversation(review_input)
+    except OpenHandsClientError as exc:
+        review_run.status = "failed"
+        review_run.error = str(exc)
+        await session.commit()
+        await session.refresh(review_run)
+        return review_run
+
+    review_run.status = "running"
+    review_run.workspace_path = resolved_workspace_path
+    review_run.openhands_start_task_id = task.id
+    review_run.openhands_conversation_id = task.app_conversation_id
+    review_run.openhands_sandbox_id = task.sandbox_id
+    review_run.openhands_agent_server_url = task.agent_server_url
+    review_run.error = None
+    await session.commit()
+    await session.refresh(review_run)
+    return review_run
+
+
+async def sync_review_session(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    openhands_client: OpenHandsClient,
+) -> ReviewRun:
+    if review_run.status in {"cancelled", "superseded", "completed", "failed"}:
+        return review_run
+
+    if review_run.openhands_start_task_id and not review_run.openhands_conversation_id:
+        try:
+            task = await openhands_client.get_start_task(
+                review_run.openhands_start_task_id
+            )
+        except OpenHandsClientError as exc:
+            return await _mark_failed(session, review_run, str(exc))
+        if task.status == OpenHandsStartTaskStatus.error:
+            return await _mark_failed(
+                session,
+                review_run,
+                task.detail or "OpenHands start task failed.",
+            )
+        if task.status == OpenHandsStartTaskStatus.ready:
+            review_run.openhands_conversation_id = task.app_conversation_id
+            review_run.openhands_sandbox_id = task.sandbox_id
+            review_run.openhands_agent_server_url = task.agent_server_url
+            review_run.status = "running"
+
+    if review_run.openhands_conversation_id:
+        try:
+            conversation = await openhands_client.get_conversation(
+                review_run.openhands_conversation_id
+            )
+        except OpenHandsClientError as exc:
+            return await _mark_failed(session, review_run, str(exc))
+
+        if conversation.sandbox_status in {"ERROR", "MISSING"}:
+            return await _mark_failed(
+                session,
+                review_run,
+                f"OpenHands sandbox is {conversation.sandbox_status}.",
+            )
+        execution_status = (conversation.execution_status or "").upper()
+        if execution_status in TERMINAL_FAILURE_STATUSES:
+            return await _mark_failed(
+                session,
+                review_run,
+                f"OpenHands conversation ended with {execution_status}.",
+            )
+        if execution_status in TERMINAL_SUCCESS_STATUSES:
+            review_run.status = "running"
+
+    await session.commit()
+    await session.refresh(review_run)
+    return review_run
+
+
+async def cancel_review_session(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    openhands_client: OpenHandsClient,
+    reason: str,
+) -> ReviewRun:
+    if review_run.status in {"completed", "cancelled", "superseded"}:
+        return review_run
+
+    if review_run.openhands_conversation_id:
+        try:
+            await openhands_client.delete_conversation(
+                review_run.openhands_conversation_id
+            )
+        except OpenHandsClientError as exc:
+            review_run.error = f"Cancel requested; OpenHands cleanup failed: {exc}"
+        else:
+            review_run.error = reason
+    else:
+        review_run.error = reason
+
+    review_run.status = "cancelled"
+    await session.commit()
+    await session.refresh(review_run)
+    return review_run
+
+
+async def collect_review_result(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    raw_output: str | dict[str, Any],
+    changed_files: list[ChangedFile] | None = None,
+) -> ParsedReviewResult:
+    if not review_run.base_sha:
+        raise ReviewRunTransitionError("base_sha is required to collect review result.")
+
+    try:
+        parsed = parse_review_result(
+            raw_output,
+            changed_files=changed_files,
+            provider=review_run.provider,
+            repo_full_name=review_run.repository,
+            pr_number=review_run.pull_request_number,
+            base_sha=review_run.base_sha,
+            head_sha=review_run.head_sha,
+        )
+    except ReviewResultError as exc:
+        review_run.status = "failed"
+        review_run.error = f"{exc.code}: {exc.message}"
+        await session.commit()
+        raise
+
+    review_run.status = "completed"
+    review_run.result_summary = parsed.result.summary
+    review_run.error = None
+    await session.commit()
+    await session.refresh(review_run)
+    return parsed
 
 
 async def get_review_run_by_head(
@@ -257,6 +445,18 @@ def _repo_full_name(repo: Any) -> str | None:
     if not isinstance(repo, dict):
         return None
     return _str_or_none(repo.get("full_name"))
+
+
+async def _mark_failed(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    error: str,
+) -> ReviewRun:
+    review_run.status = "failed"
+    review_run.error = error
+    await session.commit()
+    await session.refresh(review_run)
+    return review_run
 
 
 def _login(user: Any) -> str | None:
