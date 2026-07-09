@@ -1,0 +1,36 @@
+{
+  "action": "synchronize",
+  "repository": {
+    "id": 1001,
+    "full_name": "example/repo",
+    "clone_url": "__CLONE_URL__",
+    "default_branch": "main"
+  },
+  "pull_request": {
+    "id": 2002,
+    "number": 42,
+    "title": "Improve authentication flow",
+    "state": "open",
+    "merged": false,
+    "html_url": "https://github.com/example/repo/pull/42",
+    "user": {
+      "login": "alice"
+    },
+    "base": {
+      "ref": "main",
+      "sha": "__BASE_SHA__",
+      "repo": {
+        "full_name": "example/repo"
+      }
+    },
+    "head": {
+      "ref": "feature/auth-review",
+      "sha": "__HEAD_SHA__",
+      "repo": {
+        "full_name": "example/repo"
+      }
+    },
+    "closed_at": null,
+    "merged_at": null
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "summary": "Authentication review completed with one blocking issue and one summary-only observation.",
+  "findings": [
+    {
+      "file": "src/auth.py",
+      "line": 2,
+      "severity": "high",
+      "category": "security",
+      "message": "Token validation accepts the placeholder demo token.",
+      "suggestion": "Reject placeholder tokens before returning success.",
+      "confidence": 0.91
+    },
+    {
+      "file": "src/config.py",
+      "line": 99,
+      "severity": "medium",
+      "category": "maintainability",
+      "message": "Configuration defaults are not documented in the PR diff.",
+      "confidence": 0.72
+    }
+  ]
+}
