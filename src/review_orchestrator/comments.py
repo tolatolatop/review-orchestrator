@@ -49,6 +49,9 @@ async def publish_github_summary_comment(
         status_text=status_text,
         finding_stats=finding_stats,
     )
+    existing_ref = await _existing_summary_ref_with_body(session, review_run, body)
+    if existing_ref is not None:
+        return existing_ref
     try:
         provider_comment_id = await _upsert_github_issue_comment(
             github_client,
@@ -141,6 +144,9 @@ async def publish_gitlab_summary_comment(
         status_text=status_text,
         finding_stats=finding_stats,
     )
+    existing_ref = await _existing_summary_ref_with_body(session, review_run, body)
+    if existing_ref is not None:
+        return existing_ref
     try:
         provider_comment_id = await _upsert_gitlab_note(
             gitlab_client,
@@ -235,6 +241,23 @@ async def ensure_line_comment_ref(
 
 def body_hash(body: str) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+async def _existing_summary_ref_with_body(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    body: str,
+) -> ReviewCommentRef | None:
+    result = await session.execute(
+        select(ReviewCommentRef).where(
+            ReviewCommentRef.provider == review_run.provider,
+            ReviewCommentRef.repo_full_name == review_run.repo_full_name,
+            ReviewCommentRef.pull_request_number == review_run.pull_request_number,
+            ReviewCommentRef.comment_type == "summary",
+            ReviewCommentRef.last_published_body_hash == body_hash(body),
+        )
+    )
+    return result.scalar_one_or_none()
 
 
 def _safe_error_text(error: str, *, max_length: int = 500) -> str:

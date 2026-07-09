@@ -122,41 +122,161 @@ async def process_next_agent_task(
     if task is None:
         return None
 
-    context = await _task_context(session, task)
-    if context is None:
-        context = await _hydrate_task_context(
+    try:
+        context = await _task_context(session, task)
+        if context is None:
+            try:
+                context = await _hydrate_task_context(
+                    session,
+                    task,
+                    github_client=github_client,
+                    gitlab_client=gitlab_client,
+                )
+            except (GitHubClientError, GitLabClientError) as exc:
+                return await _fail_agent_task(
+                    session,
+                    task,
+                    failure_code="provider_context_lookup_failed",
+                    error=str(exc),
+                    github_client=github_client,
+                    gitlab_client=gitlab_client,
+                )
+        if context is None:
+            return await _fail_agent_task(
+                session,
+                task,
+                failure_code="missing_pr_context",
+                error="Pull request context was not found for mention task.",
+                github_client=github_client,
+                gitlab_client=gitlab_client,
+            )
+
+        review_run = await create_review_run(
             session,
-            task,
-            github_client=github_client,
-            gitlab_client=gitlab_client,
+            ReviewRunCreate(
+                provider=context.provider,
+                repo_full_name=context.repo_full_name,
+                pull_request_number=context.pull_request_number,
+                base_sha=context.base_sha,
+                head_sha=context.head_sha,
+                force=True,
+            ),
+            trigger_type="mention",
+            trigger_event_id=task.provider_event_id,
         )
-    if context is None:
-        task.status = "failed"
-        task.error_message = "Pull request context was not found for mention task."
+        task.status = "completed"
+        task.result_json = {"review_run_id": review_run.id, "status": review_run.status}
         session.add(task)
         await session.commit()
         await session.refresh(task)
         return task
+    except Exception as exc:
+        return await _fail_agent_task(
+            session,
+            task,
+            failure_code="agent_task_failed",
+            error=str(exc),
+            github_client=github_client,
+            gitlab_client=gitlab_client,
+        )
 
+
+async def _fail_agent_task(
+    session: AsyncSession,
+    task: AgentTask,
+    *,
+    failure_code: str,
+    error: str,
+    github_client: GitHubClient | None,
+    gitlab_client: GitLabClient | None,
+) -> AgentTask:
+    task.status = "failed"
+    task.error_message = error
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    try:
+        review_run = await _review_run_for_failed_agent_task(
+            session,
+            task,
+            failure_code=failure_code,
+            error=error,
+        )
+        await publish_review_run_status_comment(
+            session,
+            review_run,
+            github_client=github_client,
+            gitlab_client=gitlab_client,
+            status_text="failed",
+        )
+    except Exception as exc:
+        task.result_json = {
+            **(task.result_json or {}),
+            "summary_publish_error": str(exc),
+        }
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+    return task
+
+
+async def _review_run_for_failed_agent_task(
+    session: AsyncSession,
+    task: AgentTask,
+    *,
+    failure_code: str,
+    error: str,
+) -> ReviewRun:
+    context = await _task_context(session, task)
     review_run = await create_review_run(
         session,
         ReviewRunCreate(
-            provider=context.provider,
-            repo_full_name=context.repo_full_name,
-            pull_request_number=context.pull_request_number,
-            base_sha=context.base_sha,
-            head_sha=context.head_sha,
+            provider=task.provider,
+            repo_full_name=task.repo_full_name,
+            pull_request_number=task.pull_request_number,
+            base_sha=context.base_sha if context else None,
+            head_sha=(context.head_sha if context else _task_head_sha(task)),
             force=True,
         ),
         trigger_type="mention",
         trigger_event_id=task.provider_event_id,
     )
-    task.status = "completed"
-    task.result_json = {"review_run_id": review_run.id, "status": review_run.status}
-    session.add(task)
+    review_run.status = "failed"
+    review_run.failure_code = failure_code
+    review_run.error = error
+    review_run.completed_at = utc_now()
+    session.add(review_run)
     await session.commit()
-    await session.refresh(task)
-    return task
+    await session.refresh(review_run)
+    return review_run
+
+
+def _task_head_sha(task: AgentTask) -> str:
+    payload = (task.input_json or {}).get("payload")
+    if isinstance(payload, dict):
+        head_sha = _head_sha_from_payload(payload)
+        if head_sha:
+            return head_sha
+    return "unknown"
+
+
+def _head_sha_from_payload(payload: dict[str, Any]) -> str | None:
+    pull_request = payload.get("pull_request")
+    if isinstance(pull_request, dict):
+        head = pull_request.get("head")
+        if isinstance(head, dict):
+            return _str_or_none(head.get("sha"))
+    merge_request = payload.get("merge_request") or payload.get("object_attributes")
+    if isinstance(merge_request, dict):
+        last_commit = merge_request.get("last_commit")
+        last_commit_sha = (
+            _str_or_none(last_commit.get("id"))
+            if isinstance(last_commit, dict)
+            else None
+        )
+        return _str_or_none(merge_request.get("sha")) or last_commit_sha
+    return None
 
 
 async def process_next_review_run(
@@ -178,13 +298,14 @@ async def process_next_review_run(
 
     release_lock = True
     try:
-        await publish_review_run_status_comment(
-            session,
-            review_run,
-            github_client=github_client,
-            gitlab_client=gitlab_client,
-            status_text="reviewing",
-        )
+        if _should_publish_reviewing(review_run):
+            await publish_review_run_status_comment(
+                session,
+                review_run,
+                github_client=github_client,
+                gitlab_client=gitlab_client,
+                status_text="reviewing",
+            )
         context = await _review_run_context(session, review_run)
         if context is None:
             review_run.status = "failed"
@@ -307,8 +428,16 @@ async def process_next_review_run(
                 raw_output=raw_result,
                 changed_files=changed_files,
             )
-        except Exception:
+        except Exception as exc:
             await session.refresh(review_run)
+            if review_run.status != "failed":
+                review_run.status = "failed"
+                review_run.failure_code = "worker_exception"
+                review_run.error = str(exc)
+                review_run.completed_at = utc_now()
+                session.add(review_run)
+                await session.commit()
+                await session.refresh(review_run)
             await publish_review_run_status_comment(
                 session,
                 review_run,
@@ -365,6 +494,14 @@ async def process_next_review_run(
     finally:
         if release_lock:
             await release_review_run_lock(session, review_run.id)
+
+
+def _should_publish_reviewing(review_run: ReviewRun) -> bool:
+    return (
+        review_run.summary_comment_id is None
+        and review_run.soft_timeout_emitted_at is None
+        and review_run.stage in {None, "start"}
+    )
 
 
 async def process_review_run_timeouts(
