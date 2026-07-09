@@ -6,12 +6,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="REVIEW_",
         env_file=".env",
         extra="ignore",
     )
 
     app_name: str = "Review Orchestrator"
+    app_env: str = "local"
+    log_level: str = "INFO"
+    host: str = "0.0.0.0"
+    port: int = 8000
     database_url: str = Field(
         default="sqlite+aiosqlite:///./review_orchestrator.db",
         description="SQLAlchemy async database URL for SQLite or PostgreSQL.",
@@ -23,6 +26,17 @@ class Settings(BaseSettings):
             "skipped for local development."
         ),
     )
+    github_app_id: str | None = None
+    github_private_key_path: str | None = None
+    github_api_base_url: str = "https://api.github.com"
+    openhands_base_url: str = "http://localhost:3000"
+    openhands_api_token: str | None = None
+    openhands_review_skill: str = "code-review"
+    openhands_review_profile: str = "default"
+    workspace_root: str = "./.workspaces"
+    review_run_timeout_seconds: int = 1800
+    retry_max_attempts: int = 2
+    retry_initial_delay_seconds: int = 60
 
 
 @lru_cache

@@ -19,6 +19,7 @@ sessions.
 
 ```bash
 uv sync
+cp .env.template .env
 uv run uvicorn review_orchestrator.main:app --reload
 uv run ruff check .
 uv run pytest
@@ -33,7 +34,7 @@ sqlite+aiosqlite:///./review_orchestrator.db
 PostgreSQL example:
 
 ```bash
-export REVIEW_DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/review
+export DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/review
 ```
 
 ## API Reference
@@ -45,129 +46,34 @@ locally:
 - ReDoc: `GET /redoc`
 - OpenAPI JSON: `GET /openapi.json`
 
-### Health Check
+### MVP Endpoints
 
-```http
-GET /health
-```
+- `GET /health`
+- `POST /api/v1/webhooks/{provider}`
+- `POST /api/v1/review-runs`
+- `GET /api/v1/review-runs/{review_run_id}`
+- `POST /api/v1/review-runs/{review_run_id}/retry`
+- `POST /api/v1/review-runs/{review_run_id}/cancel`
 
-Response:
+`POST /api/v1/review-runs` is idempotent for
+`provider + repo_full_name + pull_request_number + head_sha`. A repeated request
+returns the latest existing run unless `force=true` is supplied. Failed runs can
+be retried through the retry endpoint without `force=true`.
 
-```json
-{
-  "status": "ok"
-}
-```
+### GitHub Webhooks
 
-### Accept Provider Webhook
+`POST /api/v1/webhooks/github` verifies `X-Hub-Signature-256` when
+`GITHUB_WEBHOOK_SECRET` is configured, normalizes GitHub pull request and PR
+comment events, stores the delivery in the provider inbox, and creates review
+runs for review-triggering PR events.
 
-```http
-POST /api/v1/webhooks/{provider}
-Content-Type: application/json
-```
+Required headers:
 
-Path parameters:
+- `X-GitHub-Delivery`
+- `X-GitHub-Event`
+- `X-Hub-Signature-256` when a webhook secret is configured
 
-| Name | Type | Required | Description |
-| --- | --- | --- | --- |
-| `provider` | string | yes | Source provider name, for example `github`. |
-
-Request body:
-
-Any JSON object. In the MVP this endpoint acknowledges the payload and leaves
-provider authentication, event normalization, and enqueueing for the next
-implementation step.
-
-Example request:
-
-```json
-{
-  "action": "opened",
-  "pull_request": {
-    "number": 42
-  }
-}
-```
-
-Response `200 OK`:
-
-```json
-{
-  "accepted": true,
-  "provider": "github"
-}
-```
-
-### Create Review Run
-
-```http
-POST /api/v1/review-runs
-Content-Type: application/json
-```
-
-Creates a queued review run for a pull request commit range. The create operation
-is idempotent for the same `provider`, `repository`, `pull_request_number`, and
-`head_sha`; repeating the same request returns the existing run.
-
-Request body:
-
-| Field | Type | Required | Constraints | Description |
-| --- | --- | --- | --- | --- |
-| `provider` | string | yes | 1-64 chars | Provider name, for example `github`. |
-| `repository` | string | yes | 1-512 chars | Repository full name, for example `owner/repo`. |
-| `pull_request_number` | integer | yes | `> 0` | Pull request number. |
-| `base_sha` | string or null | no | max 80 chars | Base commit SHA. |
-| `head_sha` | string | yes | 7-80 chars | Head commit SHA to review. |
-
-Example request:
-
-```json
-{
-  "provider": "github",
-  "repository": "owner/repo",
-  "pull_request_number": 42,
-  "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-}
-```
-
-Response `201 Created`:
-
-```json
-{
-  "id": "6d41f5d2-0b65-4dc7-b02e-20ac8a68818e",
-  "provider": "github",
-  "repository": "owner/repo",
-  "pull_request_number": 42,
-  "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-  "status": "queued",
-  "summary_comment_id": null,
-  "workspace_path": null,
-  "error": null,
-  "created_at": "2026-07-09T10:00:00Z",
-  "updated_at": "2026-07-09T10:00:00Z"
-}
-```
-
-Validation failure response `422 Unprocessable Entity` uses FastAPI's standard
-validation error format.
-
-### Get Review Run
-
-```http
-GET /api/v1/review-runs/{review_run_id}
-```
-
-Path parameters:
-
-| Name | Type | Required | Description |
-| --- | --- | --- | --- |
-| `review_run_id` | string | yes | Review run UUID returned by create. |
-
-Response `200 OK` uses the same `ReviewRunRead` shape returned by create.
-
-Response `404 Not Found` is returned when the run ID does not exist.
+Duplicate delivery IDs are idempotent and return the original event status.
 
 ### Review Run Status Values
 
@@ -179,6 +85,23 @@ Response `404 Not Found` is returned when the run ID does not exist.
 - `failed`
 - `cancelled`
 - `superseded`
+
+## Runtime Configuration
+
+Infrastructure and secret values are read from environment variables. Use
+`.env.template` as the local starting point. Repository-level review behavior is
+stored in the database with conservative defaults:
+
+- `review_enabled = true`
+- `line_comments_enabled = false`
+- `min_severity_for_summary = info`
+- `max_findings_per_run = 50`
+- `large_pr_file_limit = 100`
+- `large_pr_patch_bytes_limit = 500000`
+- `auto_retry_invalid_agent_result = false`
+- `auto_retry_infra_failure = true`
+- `default_review_skill = code-review`
+- `default_review_profile = default`
 
 ## Review Skill Contract
 

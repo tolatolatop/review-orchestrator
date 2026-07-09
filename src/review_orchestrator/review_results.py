@@ -54,14 +54,17 @@ class FindingSeverity(StrEnum):
     high = "high"
     medium = "medium"
     low = "low"
+    info = "info"
 
 
 class ReviewFinding(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     file: str = Field(min_length=1, max_length=1024)
-    line: int = Field(gt=0)
+    line: int | None = Field(default=None, gt=0)
+    line_end: int | None = Field(default=None, gt=0)
     severity: FindingSeverity
+    category: str | None = Field(default=None, max_length=64)
     message: str = Field(min_length=1, max_length=1200)
     suggestion: str | None = Field(default=None, max_length=1200)
     confidence: float = Field(ge=0, le=1)
@@ -198,6 +201,8 @@ def _line_comment_blocker(
     finding: ReviewFinding,
     changed_files: dict[str, ChangedFile],
 ) -> str | None:
+    if finding.line is None:
+        return "line_not_provided"
     if not changed_files:
         return None
     changed_file = changed_files.get(finding.file)

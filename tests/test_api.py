@@ -94,7 +94,7 @@ def test_health(tmp_path: Path) -> None:
 def test_create_and_get_review_run(tmp_path: Path) -> None:
     payload = {
         "provider": "github",
-        "repository": "example/repo",
+        "repo_full_name": "example/repo",
         "pull_request_number": 42,
         "base_sha": "a" * 40,
         "head_sha": "b" * 40,
@@ -109,6 +109,76 @@ def test_create_and_get_review_run(tmp_path: Path) -> None:
 
     assert get_response.status_code == 200
     assert get_response.json()["head_sha"] == payload["head_sha"]
+    assert get_response.json()["attempt"] == 1
+
+
+def test_create_review_run_is_idempotent_without_force(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+
+    with make_client(tmp_path) as client:
+        first = client.post("/api/v1/review-runs", json=payload).json()
+        second = client.post("/api/v1/review-runs", json=payload).json()
+
+    assert second["id"] == first["id"]
+    assert second["attempt"] == 1
+
+
+def test_force_create_review_run_creates_new_attempt(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+
+    with make_client(tmp_path) as client:
+        first = client.post("/api/v1/review-runs", json=payload).json()
+        forced = client.post(
+            "/api/v1/review-runs", json={**payload, "force": True}
+        ).json()
+
+    assert forced["id"] != first["id"]
+    assert forced["attempt"] == 2
+
+
+def test_retry_rejects_non_failed_run(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+
+    with make_client(tmp_path) as client:
+        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        response = client.post(f"/api/v1/review-runs/{review_run['id']}/retry")
+
+    assert response.status_code == 409
+
+
+def test_cancel_review_run(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+
+    with make_client(tmp_path) as client:
+        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        response = client.post(f"/api/v1/review-runs/{review_run['id']}/cancel")
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "cancelled"
 
 
 def test_accept_github_pull_request_webhook_creates_review_run(

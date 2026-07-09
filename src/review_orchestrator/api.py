@@ -8,11 +8,18 @@ from review_orchestrator.github import (
     parse_json_body,
     verify_signature,
 )
-from review_orchestrator.schemas import ReviewRunCreate, ReviewRunRead, WebhookAccepted
+from review_orchestrator.schemas import (
+    ReviewRunActionResult,
+    ReviewRunCreate,
+    ReviewRunRead,
+    WebhookAccepted,
+)
 from review_orchestrator.services import (
     accept_github_webhook,
+    cancel_review_run,
     create_review_run,
     get_review_run,
+    retry_review_run,
 )
 
 router = APIRouter(prefix="/api/v1")
@@ -87,3 +94,44 @@ async def get_review_run_endpoint(
     if review_run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return review_run
+
+
+@router.post(
+    "/review-runs/{review_run_id}/retry",
+    response_model=ReviewRunActionResult,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_review_run_endpoint(
+    review_run_id: str,
+    session: AsyncSession = session_dependency,
+) -> ReviewRunActionResult:
+    review_run = await retry_review_run(session, review_run_id)
+    if review_run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    if review_run.id == review_run_id and review_run.status != "failed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only failed review runs can be retried without force.",
+        )
+    return ReviewRunActionResult(
+        review_run_id=review_run.id,
+        status=review_run.status,
+    )
+
+
+@router.post(
+    "/review-runs/{review_run_id}/cancel",
+    response_model=ReviewRunActionResult,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def cancel_review_run_endpoint(
+    review_run_id: str,
+    session: AsyncSession = session_dependency,
+) -> ReviewRunActionResult:
+    review_run = await cancel_review_run(session, review_run_id)
+    if review_run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return ReviewRunActionResult(
+        review_run_id=review_run.id,
+        status=review_run.status,
+    )

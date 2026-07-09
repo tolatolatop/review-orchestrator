@@ -1,6 +1,7 @@
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from review_orchestrator.github import (
@@ -11,28 +12,58 @@ from review_orchestrator.github import (
 from review_orchestrator.models import (
     ProviderEventInbox,
     PullRequestContext,
+    ReviewConfig,
     ReviewRun,
     utc_now,
 )
 from review_orchestrator.schemas import ReviewRunCreate, WebhookAccepted
 
+TERMINAL_STATUSES = {"completed", "failed", "cancelled", "superseded"}
+CANCELLABLE_STATUSES = {"queued", "running"}
+
 
 async def create_review_run(
     session: AsyncSession,
     payload: ReviewRunCreate,
+    *,
+    trigger_type: str = "manual",
+    trigger_event_id: str | None = None,
 ) -> ReviewRun:
-    existing = await get_review_run_by_head(
+    latest = await get_latest_review_run_by_head(
         session,
         provider=payload.provider,
-        repository=payload.repository,
+        repo_full_name=payload.repo_full_name,
         pull_request_number=payload.pull_request_number,
         head_sha=payload.head_sha,
     )
-    if existing:
-        return existing
+    if latest and not payload.force:
+        return latest
 
-    review_run = ReviewRun(**payload.model_dump(), status="queued")
+    next_attempt = 1 if latest is None else latest.attempt + 1
+
+    values = payload.model_dump(exclude={"force"})
+    review_run = ReviewRun(
+        **values,
+        status="queued",
+        trigger_type=trigger_type,
+        trigger_event_id=trigger_event_id,
+        attempt=next_attempt,
+    )
     session.add(review_run)
+    try:
+        await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        existing = await get_latest_review_run_by_head(
+            session,
+            provider=payload.provider,
+            repo_full_name=payload.repo_full_name,
+            pull_request_number=payload.pull_request_number,
+            head_sha=payload.head_sha,
+        )
+        if existing is None:
+            raise
+        return existing
     await session.commit()
     await session.refresh(review_run)
     return review_run
@@ -49,19 +80,79 @@ async def get_review_run_by_head(
     session: AsyncSession,
     *,
     provider: str,
-    repository: str,
+    repo_full_name: str,
     pull_request_number: int,
     head_sha: str,
+    attempt: int,
 ) -> ReviewRun | None:
     result = await session.execute(
         select(ReviewRun).where(
             ReviewRun.provider == provider,
-            ReviewRun.repository == repository,
+            ReviewRun.repo_full_name == repo_full_name,
             ReviewRun.pull_request_number == pull_request_number,
             ReviewRun.head_sha == head_sha,
+            ReviewRun.attempt == attempt,
         )
     )
     return result.scalar_one_or_none()
+
+
+async def get_latest_review_run_by_head(
+    session: AsyncSession,
+    *,
+    provider: str,
+    repo_full_name: str,
+    pull_request_number: int,
+    head_sha: str,
+) -> ReviewRun | None:
+    result = await session.execute(
+        select(ReviewRun)
+        .where(
+            ReviewRun.provider == provider,
+            ReviewRun.repo_full_name == repo_full_name,
+            ReviewRun.pull_request_number == pull_request_number,
+            ReviewRun.head_sha == head_sha,
+        )
+        .order_by(ReviewRun.attempt.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def retry_review_run(
+    session: AsyncSession,
+    review_run_id: str,
+) -> ReviewRun | None:
+    review_run = await get_review_run(session, review_run_id)
+    if review_run is None:
+        return None
+    if review_run.status != "failed":
+        return review_run
+    payload = ReviewRunCreate(
+        provider=review_run.provider,
+        repo_full_name=review_run.repo_full_name,
+        pull_request_number=review_run.pull_request_number,
+        base_sha=review_run.base_sha,
+        head_sha=review_run.head_sha,
+        force=True,
+    )
+    return await create_review_run(session, payload, trigger_type="retry")
+
+
+async def cancel_review_run(
+    session: AsyncSession,
+    review_run_id: str,
+) -> ReviewRun | None:
+    review_run = await get_review_run(session, review_run_id)
+    if review_run is None:
+        return None
+    if review_run.status in CANCELLABLE_STATUSES:
+        review_run.status = "cancelled"
+        review_run.failure_code = "cancelled"
+        session.add(review_run)
+        await session.commit()
+        await session.refresh(review_run)
+    return review_run
 
 
 async def accept_github_webhook(
@@ -90,9 +181,16 @@ async def accept_github_webhook(
         provider_event=provider_event,
         provider_action=normalized_event.provider_action,
         internal_event=normalized_event.internal_event,
-        repository=normalized_event.repository,
+        repo_full_name=normalized_event.repository,
         pull_request_number=normalized_event.pull_request_number,
         head_sha=normalized_event.head_sha,
+        dedupe_key=f"github:{delivery_id}",
+        coalesce_key=_build_coalesce_key(
+            "github",
+            normalized_event.repository,
+            normalized_event.pull_request_number,
+            normalized_event.head_sha,
+        ),
         payload_digest=payload_digest(raw_body),
         payload=payload,
         status=normalized_event.status,
@@ -101,14 +199,21 @@ async def accept_github_webhook(
     await session.flush()
 
     review_run_id: str | None = None
+    context: PullRequestContext | None = None
     if normalized_event.should_update_context:
-        await upsert_pull_request_context(session, event, payload)
+        context = await upsert_pull_request_context(session, event, payload)
 
     if normalized_event.should_create_review_run:
-        review_run = await create_review_run_from_github_payload(session, payload)
+        review_run = await create_review_run_from_github_payload(
+            session,
+            payload,
+            trigger_event_id=event.id,
+        )
         review_run_id = review_run.id
         event.review_run_id = review_run_id
         event.status = "queued"
+        if context is not None:
+            context.latest_review_run_id = review_run_id
 
     if event.status == "received":
         event.status = "processed"
@@ -156,7 +261,7 @@ async def upsert_pull_request_context(
     result = await session.execute(
         select(PullRequestContext).where(
             PullRequestContext.provider == "github",
-            PullRequestContext.repository == repository_name,
+            PullRequestContext.repo_full_name == repository_name,
             PullRequestContext.pull_request_number == pull_request_number,
         )
     )
@@ -164,7 +269,7 @@ async def upsert_pull_request_context(
     if context is None:
         context = PullRequestContext(
             provider="github",
-            repository=repository_name,
+            repo_full_name=repository_name,
             pull_request_number=pull_request_number,
             head_sha=_head_sha(pull_request) or "",
         )
@@ -200,6 +305,8 @@ async def upsert_pull_request_context(
 async def create_review_run_from_github_payload(
     session: AsyncSession,
     payload: dict[str, Any],
+    *,
+    trigger_event_id: str | None = None,
 ) -> ReviewRun:
     pull_request = payload.get("pull_request")
     repository = payload.get("repository")
@@ -216,12 +323,50 @@ async def create_review_run_from_github_payload(
         session,
         ReviewRunCreate(
             provider="github",
-            repository=repository_name,
+            repo_full_name=repository_name,
             pull_request_number=pull_request_number,
             base_sha=_base_sha(pull_request),
             head_sha=head_sha,
         ),
+        trigger_type="webhook",
+        trigger_event_id=trigger_event_id,
     )
+
+
+async def get_or_create_review_config(
+    session: AsyncSession,
+    *,
+    provider: str,
+    repo_full_name: str,
+) -> ReviewConfig:
+    result = await session.execute(
+        select(ReviewConfig).where(
+            ReviewConfig.provider == provider,
+            ReviewConfig.repo_full_name == repo_full_name,
+        )
+    )
+    config = result.scalar_one_or_none()
+    if config is not None:
+        return config
+
+    config = ReviewConfig(provider=provider, repo_full_name=repo_full_name)
+    session.add(config)
+    await session.commit()
+    await session.refresh(config)
+    return config
+
+
+def _build_coalesce_key(
+    provider: str,
+    repo_full_name: str | None,
+    pull_request_number: int | None,
+    head_sha: str | None,
+) -> str | None:
+    if repo_full_name is None or pull_request_number is None:
+        return None
+    if head_sha:
+        return f"{provider}:{repo_full_name}:{pull_request_number}:{head_sha}:review"
+    return f"{provider}:{repo_full_name}:{pull_request_number}:lifecycle"
 
 
 def _pull_request_status(pull_request: dict[str, Any]) -> str:
