@@ -98,6 +98,15 @@ cp .env.example .env
 uv run uvicorn review_orchestrator.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+Or run the local Docker Compose profile, which builds Review Orchestrator, keeps
+SQLite/workspace data in a named volume, and connects to an OpenHands App Server
+on the host by default:
+
+```bash
+cp .env.example .env
+docker compose -f docker-compose.yaml up --build
+```
+
 Health check:
 
 ```bash
@@ -131,6 +140,19 @@ One direct command is:
 ```bash
 uv run uvicorn review_orchestrator.main:app --host "${HOST:-0.0.0.0}" --port "${PORT:-8000}"
 ```
+
+For a single-host deployment with PostgreSQL and OpenHands, use:
+
+```bash
+cp .env.example .env
+docker compose -f docker-compose.self_host.yaml up --build -d
+```
+
+Before starting the self-host stack, edit `.env` and set production secrets such
+as `GITHUB_WEBHOOK_SECRET`, `GITHUB_INSTALLATION_TOKEN`, and
+`OPENHANDS_API_TOKEN` when your OpenHands deployment requires one. Override
+`POSTGRES_PASSWORD` in `.env` or the shell; the compose default is only suitable
+for local testing.
 
 Recommended production settings:
 

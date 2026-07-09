@@ -1,0 +1,38 @@
+services:
+  review-orchestrator:
+    build:
+      context: .
+    image: review-orchestrator:local
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:////var/lib/review-orchestrator/review_orchestrator.db}
+      HOST: 0.0.0.0
+      PORT: 8000
+      WORKSPACE_ROOT: /var/lib/review-orchestrator/workspaces
+      GIT_CACHE_ROOT: /var/lib/review-orchestrator/git-cache
+      OPENHANDS_BASE_URL: ${OPENHANDS_BASE_URL:-http://host.docker.internal:3000}
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      - review_orchestrator_data:/var/lib/review-orchestrator
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  review_orchestrator_data:

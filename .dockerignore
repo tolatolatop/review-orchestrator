@@ -1,0 +1,15 @@
+.git
+.git-cache
+.pytest_cache
+.ruff_cache
+.venv
+.workspaces
+__pycache__
+*.py[cod]
+*.db
+.env
+.env.*
+!.env.example
+dist
+build
+
