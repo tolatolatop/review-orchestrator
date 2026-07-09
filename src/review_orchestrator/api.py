@@ -8,12 +8,18 @@ from review_orchestrator.github import (
     parse_json_body,
     verify_signature,
 )
+from review_orchestrator.openhands import OpenHandsClient
+from review_orchestrator.review_results import ReviewResultError
 from review_orchestrator.schemas import (
     CleanupSummary,
     PullRequestWorkspaceCleanupRequest,
+    ReviewResultCollect,
+    ReviewResultCollectResponse,
     ReviewRunActionResult,
     ReviewRunCreate,
     ReviewRunRead,
+    ReviewSessionCancel,
+    ReviewSessionStart,
     WebhookAccepted,
     WorkspaceCleanupRequest,
     WorkspaceLeaseRead,
@@ -23,11 +29,16 @@ from review_orchestrator.schemas import (
     WorkspaceRead,
 )
 from review_orchestrator.services import (
+    ReviewRunTransitionError,
     accept_github_webhook,
     cancel_review_run,
+    cancel_review_session,
+    collect_review_result,
     create_review_run,
     get_review_run,
     retry_review_run,
+    start_review_session,
+    sync_review_session,
 )
 from review_orchestrator.workspaces import (
     cleanup_expired_workspaces,
@@ -41,6 +52,27 @@ from review_orchestrator.workspaces import (
 
 router = APIRouter(prefix="/api/v1")
 session_dependency = Depends(get_session)
+
+
+def get_openhands_client(request: Request) -> OpenHandsClient:
+    injected = getattr(request.app.state, "openhands_client", None)
+    if injected is not None:
+        return injected
+
+    settings = request.app.state.settings
+    if not settings.openhands_base_url:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OpenHands base URL is not configured.",
+        )
+    return OpenHandsClient(
+        base_url=settings.openhands_base_url,
+        api_key=settings.openhands_api_token,
+        timeout=settings.openhands_timeout_seconds,
+    )
+
+
+openhands_client_dependency = Depends(get_openhands_client)
 
 
 @router.post("/webhooks/{provider}", response_model=WebhookAccepted)
@@ -115,6 +147,92 @@ async def get_review_run_endpoint(
     if review_run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return review_run
+
+@router.post("/review-runs/{review_run_id}/session/start", response_model=ReviewRunRead)
+async def start_review_session_endpoint(
+    review_run_id: str,
+    payload: ReviewSessionStart,
+    session: AsyncSession = session_dependency,
+    openhands_client: OpenHandsClient = openhands_client_dependency,
+) -> ReviewRunRead:
+    review_run = await get_review_run(session, review_run_id)
+    if review_run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    try:
+        return await start_review_session(
+            session,
+            review_run,
+            openhands_client=openhands_client,
+            workspace_path=payload.workspace_path,
+        )
+    except ReviewRunTransitionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
+
+@router.post("/review-runs/{review_run_id}/session/sync", response_model=ReviewRunRead)
+async def sync_review_session_endpoint(
+    review_run_id: str,
+    session: AsyncSession = session_dependency,
+    openhands_client: OpenHandsClient = openhands_client_dependency,
+) -> ReviewRunRead:
+    review_run = await get_review_run(session, review_run_id)
+    if review_run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return await sync_review_session(
+        session,
+        review_run,
+        openhands_client=openhands_client,
+    )
+
+
+@router.post(
+    "/review-runs/{review_run_id}/session/cancel",
+    response_model=ReviewRunRead,
+)
+async def cancel_review_session_endpoint(
+    review_run_id: str,
+    payload: ReviewSessionCancel,
+    session: AsyncSession = session_dependency,
+    openhands_client: OpenHandsClient = openhands_client_dependency,
+) -> ReviewRunRead:
+    review_run = await get_review_run(session, review_run_id)
+    if review_run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return await cancel_review_session(
+        session,
+        review_run,
+        openhands_client=openhands_client,
+        reason=payload.reason,
+    )
+
+
+@router.post(
+    "/review-runs/{review_run_id}/result",
+    response_model=ReviewResultCollectResponse,
+)
+async def collect_review_result_endpoint(
+    review_run_id: str,
+    payload: ReviewResultCollect,
+    session: AsyncSession = session_dependency,
+) -> ReviewResultCollectResponse:
+    review_run = await get_review_run(session, review_run_id)
+    if review_run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    try:
+        parsed = await collect_review_result(
+            session,
+            review_run,
+            raw_output=payload.raw_output,
+            changed_files=payload.changed_files,
+        )
+    except ReviewRunTransitionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    except ReviewResultError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=exc.to_dict(),
+        ) from exc
+    return ReviewResultCollectResponse(review_run=review_run, parsed=parsed)
 
 
 @router.post(

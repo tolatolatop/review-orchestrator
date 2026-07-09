@@ -139,6 +139,14 @@ class ReviewRun(Base):
     stage: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     summary_comment_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     workspace_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    openhands_start_task_id: Mapped[str | None] = mapped_column(
+        String(80), nullable=True
+    )
+    openhands_conversation_id: Mapped[str | None] = mapped_column(
+        String(80), nullable=True, index=True
+    )
+    openhands_sandbox_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    openhands_agent_server_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     review_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     review_conclusion: Mapped[str | None] = mapped_column(String(32), nullable=True)
     risk_level: Mapped[str | None] = mapped_column(String(32), nullable=True)

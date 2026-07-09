@@ -52,6 +52,10 @@ locally:
 - `POST /api/v1/webhooks/{provider}`
 - `POST /api/v1/review-runs`
 - `GET /api/v1/review-runs/{review_run_id}`
+- `POST /api/v1/review-runs/{review_run_id}/session/start`
+- `POST /api/v1/review-runs/{review_run_id}/session/sync`
+- `POST /api/v1/review-runs/{review_run_id}/session/cancel`
+- `POST /api/v1/review-runs/{review_run_id}/result`
 - `POST /api/v1/review-runs/{review_run_id}/retry`
 - `POST /api/v1/review-runs/{review_run_id}/cancel`
 
@@ -107,6 +111,28 @@ Workspace storage defaults:
 
 - `WORKSPACE_ROOT=./.workspaces`
 - `GIT_CACHE_ROOT=./.git-cache`
+
+OpenHands App Server integration:
+
+- `OPENHANDS_BASE_URL=http://localhost:3000`
+- `OPENHANDS_API_TOKEN=optional-service-token`
+- `OPENHANDS_TIMEOUT_SECONDS=30`
+
+### OpenHands Integration
+
+The Review Orchestrator owns `review_run` state. OpenHands is treated as the
+execution backend for a single review session:
+
+1. `session/start` converts an existing `review_run` plus a workspace path into a
+   small `ReviewSkillInput` commit-range reference and creates an OpenHands app
+   conversation.
+2. `session/sync` polls OpenHands start-task/conversation state and maps hard
+   failures back to the review run.
+3. `session/cancel` marks the run cancelled and best-effort deletes the
+   OpenHands conversation.
+4. `result` accepts the final OpenHands JSON output, validates it with
+   `review_orchestrator.review_results`, stores the summary, and marks the run
+   completed.
 
 ### Workspace MVP Contract
 

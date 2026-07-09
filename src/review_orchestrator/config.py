@@ -26,13 +26,21 @@ class Settings(BaseSettings):
             "skipped for local development."
         ),
     )
-    github_app_id: str | None = None
-    github_private_key_path: str | None = None
-    github_api_base_url: str = "https://api.github.com"
-    openhands_base_url: str = "http://localhost:3000"
+    openhands_base_url: str | None = Field(
+        default="http://localhost:3000",
+        description="Base URL for the OpenHands App Server API.",
+    )
     openhands_api_token: str | None = None
     openhands_review_skill: str = "code-review"
     openhands_review_profile: str = "default"
+    openhands_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        description="HTTP timeout for OpenHands App Server requests.",
+    )
+    github_app_id: str | None = None
+    github_private_key_path: str | None = None
+    github_api_base_url: str = "https://api.github.com"
     review_bot_login: str = "review-agent"
     workspace_root: str = "./.workspaces"
     git_cache_root: str = "./.git-cache"
