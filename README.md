@@ -103,6 +103,72 @@ stored in the database with conservative defaults:
 - `default_review_skill = code-review`
 - `default_review_profile = default`
 
+Workspace storage defaults:
+
+- `WORKSPACE_ROOT=./.workspaces`
+- `GIT_CACHE_ROOT=./.git-cache`
+
+### Workspace MVP Contract
+
+The Workspace module only prepares local Git working directories and manages
+their lifecycle. It does not generate diff schemas, publish PR checks, cache
+review results, or manage dependency/build caches.
+
+Workspace endpoints:
+
+- `POST /api/v1/workspaces/prepare`
+- `GET /api/v1/workspaces/{workspace_id}`
+- `POST /api/v1/workspaces/{workspace_id}/lease`
+- `POST /api/v1/workspace-leases/{lease_id}/release`
+- `POST /api/v1/workspaces/{workspace_id}/cleanup`
+- `POST /api/v1/workspaces/cleanup/pr`
+- `POST /api/v1/workspaces/cleanup/expired`
+
+Prepare a workspace:
+
+```json
+{
+  "provider": "github",
+  "repository": {
+    "full_name": "owner/repo",
+    "clone_url": "https://github.com/owner/repo.git"
+  },
+  "pull_request": {
+    "number": 123,
+    "base_sha": "abc1234",
+    "head_sha": "def5678",
+    "is_fork": false
+  },
+  "auth": {
+    "token_ref": "GITHUB_INSTALLATION_TOKEN"
+  },
+  "options": {
+    "use_git_cache": true,
+    "force_refresh": false,
+    "enable_submodules": false,
+    "enable_lfs": false
+  }
+}
+```
+
+The response returns `workspace_path`, `base_sha`, and `head_sha`. Callers can run
+their own diff commands from that path:
+
+```bash
+git diff {base_sha}...{head_sha}
+git diff --name-status {base_sha}...{head_sha}
+```
+
+Workspace paths are isolated by provider, repository hash, PR number, and head
+SHA. If `use_git_cache` is enabled, Workspace maintains a repo-level bare mirror
+under `GIT_CACHE_ROOT` to speed up repeated prepare calls.
+
+`workspace_id` is path-safe and uses the repository hash:
+
+```text
+github:{repo_hash}:pr:{pr_number}:head:{head_sha}
+```
+
 ## Review Skill Contract
 
 The OpenHands review skill receives only a small commit-range reference:
