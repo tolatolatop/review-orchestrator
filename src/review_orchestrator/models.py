@@ -1,7 +1,15 @@
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from review_orchestrator.db import Base
@@ -123,4 +131,79 @@ class ReviewRun(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class Workspace(Base):
+    __tablename__ = "workspace"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "repository",
+            "pull_request_number",
+            "head_sha",
+            name="uq_workspace_head",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid4()),
+    )
+    workspace_id: Mapped[str] = mapped_column(
+        String(768),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    repository: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    repository_clone_url: Mapped[str] = mapped_column(Text, nullable=False)
+    repo_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    pull_request_number: Mapped[int] = mapped_column(nullable=False, index=True)
+    base_sha: Mapped[str] = mapped_column(String(80), nullable=False)
+    head_sha: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    workspace_path: Mapped[str] = mapped_column(Text, nullable=False)
+    cache_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="preparing")
+    failure_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    failure_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    ready_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class WorkspaceLease(Base):
+    __tablename__ = "workspace_lease"
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid4()),
+    )
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspace.workspace_id"),
+        nullable=False,
+        index=True,
+    )
+    review_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    leased_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    released_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )

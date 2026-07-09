@@ -8,11 +8,32 @@ from review_orchestrator.github import (
     parse_json_body,
     verify_signature,
 )
-from review_orchestrator.schemas import ReviewRunCreate, ReviewRunRead, WebhookAccepted
+from review_orchestrator.schemas import (
+    CleanupSummary,
+    PullRequestWorkspaceCleanupRequest,
+    ReviewRunCreate,
+    ReviewRunRead,
+    WebhookAccepted,
+    WorkspaceCleanupRequest,
+    WorkspaceLeaseRead,
+    WorkspaceLeaseRequest,
+    WorkspacePrepareRequest,
+    WorkspacePrepareResponse,
+    WorkspaceRead,
+)
 from review_orchestrator.services import (
     accept_github_webhook,
     create_review_run,
     get_review_run,
+)
+from review_orchestrator.workspaces import (
+    cleanup_expired_workspaces,
+    cleanup_pull_request_workspaces,
+    cleanup_workspace,
+    get_workspace,
+    lease_workspace,
+    prepare_workspace,
+    release_workspace,
 )
 
 router = APIRouter(prefix="/api/v1")
@@ -87,3 +108,96 @@ async def get_review_run_endpoint(
     if review_run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return review_run
+
+
+@router.post("/workspaces/prepare", response_model=WorkspacePrepareResponse)
+async def prepare_workspace_endpoint(
+    payload: WorkspacePrepareRequest,
+    request: Request,
+    session: AsyncSession = session_dependency,
+) -> WorkspacePrepareResponse:
+    return await prepare_workspace(session, request.app.state.settings, payload)
+
+
+@router.get("/workspaces/{workspace_id}", response_model=WorkspaceRead)
+async def get_workspace_endpoint(
+    workspace_id: str,
+    session: AsyncSession = session_dependency,
+) -> WorkspaceRead:
+    workspace = await get_workspace(session, workspace_id)
+    if workspace is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return workspace
+
+
+@router.post("/workspaces/{workspace_id}/lease", response_model=WorkspaceLeaseRead)
+async def lease_workspace_endpoint(
+    workspace_id: str,
+    payload: WorkspaceLeaseRequest,
+    session: AsyncSession = session_dependency,
+) -> WorkspaceLeaseRead:
+    try:
+        lease, workspace = await lease_workspace(
+            session,
+            workspace_id,
+            review_run_id=payload.review_run_id,
+            session_id=payload.session_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from exc
+    return WorkspaceLeaseRead(
+        lease_id=lease.id,
+        workspace_id=workspace.workspace_id,
+        workspace_path=workspace.workspace_path,
+        status=workspace.status,
+    )
+
+
+@router.post("/workspace-leases/{lease_id}/release", response_model=WorkspaceRead)
+async def release_workspace_endpoint(
+    lease_id: str,
+    session: AsyncSession = session_dependency,
+) -> WorkspaceRead:
+    workspace = await release_workspace(session, lease_id)
+    if workspace is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return workspace
+
+
+@router.post("/workspaces/{workspace_id}/cleanup", response_model=WorkspaceRead)
+async def cleanup_workspace_endpoint(
+    workspace_id: str,
+    payload: WorkspaceCleanupRequest,
+    session: AsyncSession = session_dependency,
+) -> WorkspaceRead:
+    result = await cleanup_workspace(session, workspace_id, force=payload.force)
+    workspace = await get_workspace(session, workspace_id)
+    if workspace is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    if result == "workspace_locked":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Workspace has an active lease.",
+        )
+    return workspace
+
+
+@router.post("/workspaces/cleanup/pr", response_model=CleanupSummary)
+async def cleanup_pull_request_workspaces_endpoint(
+    payload: PullRequestWorkspaceCleanupRequest,
+    session: AsyncSession = session_dependency,
+) -> CleanupSummary:
+    return await cleanup_pull_request_workspaces(
+        session,
+        provider=payload.provider,
+        repository=payload.repository,
+        pull_request_number=payload.pull_request_number,
+        force=payload.force,
+    )
+
+
+@router.post("/workspaces/cleanup/expired", response_model=CleanupSummary)
+async def cleanup_expired_workspaces_endpoint(
+    session: AsyncSession = session_dependency,
+) -> CleanupSummary:
+    return await cleanup_expired_workspaces(session)

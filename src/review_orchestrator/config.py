@@ -23,6 +23,14 @@ class Settings(BaseSettings):
             "skipped for local development."
         ),
     )
+    workspace_root: str = Field(
+        default="./data/workspaces",
+        description="Root directory for prepared PR workspaces.",
+    )
+    git_cache_root: str = Field(
+        default="./data/git-cache",
+        description="Root directory for bare Git mirror caches.",
+    )
 
 
 @lru_cache
