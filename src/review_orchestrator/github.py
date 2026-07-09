@@ -131,6 +131,19 @@ class GitHubClient:
             f"/repos/{repo_full_name}/pulls/{pull_request_number}/files"
         )
 
+    async def get_pull_request(
+        self,
+        repo_full_name: str,
+        pull_request_number: int,
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "GET",
+            f"/repos/{repo_full_name}/pulls/{pull_request_number}",
+        )
+        if not isinstance(response, dict):
+            raise GitHubClientError("GitHub pull request response is not an object.")
+        return response
+
     async def list_issue_comments(
         self,
         repo_full_name: str,

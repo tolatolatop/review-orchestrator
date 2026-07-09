@@ -386,7 +386,7 @@ async def accept_provider_webhook(
         repo_full_name=normalized_event.repository,
         pull_request_number=normalized_event.pull_request_number,
         head_sha=normalized_event.head_sha,
-        dedupe_key=f"github:{delivery_id}",
+        dedupe_key=f"{provider}:{delivery_id}",
         coalesce_key=_build_coalesce_key(
             provider,
             normalized_event.repository,

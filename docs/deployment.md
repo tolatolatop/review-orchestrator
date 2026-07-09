@@ -55,8 +55,11 @@ passwords.
 | `GITHUB_APP_ID` | empty | when using a GitHub App | GitHub App ID used by deployment tooling or provider integrations. |
 | `GITHUB_PRIVATE_KEY_PATH` | empty | when using a GitHub App | Filesystem path to the GitHub App private key. Keep the key outside the repository. |
 | `GITHUB_API_BASE_URL` | `https://api.github.com` | no | GitHub API base URL. Override for GitHub Enterprise. |
-| `GITHUB_INSTALLATION_TOKEN` | empty | for private workspace checkout | Token name commonly referenced by workspace prepare requests via `auth.token_ref`. |
+| `GITHUB_INSTALLATION_TOKEN` | empty | for private workspace checkout and comment publishing | Token used by the worker for PR lookup, changed files, summary comments, and line comments. It may also be referenced by workspace prepare requests via `auth.token_ref`. |
 | `REVIEW_BOT_LOGIN` | `review-agent` | no | Bot login recognized in PR comments such as `@review-agent`. |
+| `GITLAB_WEBHOOK_SECRET` | empty | production yes for GitLab | Shared token checked against `X-Gitlab-Token`. |
+| `GITLAB_API_BASE_URL` | `https://gitlab.com/api/v4` | no | GitLab API base URL. Override for self-managed GitLab. |
+| `GITLAB_API_TOKEN` | empty | for GitLab MR lookup and notes | Token used by the worker for MR details, changes, and summary note publishing. |
 | `OPENHANDS_BASE_URL` | `http://localhost:3000` | yes | Base URL for OpenHands App Server. |
 | `OPENHANDS_API_TOKEN` | empty | if OpenHands requires auth | Bearer token sent to OpenHands. |
 | `OPENHANDS_REVIEW_SKILL` | `code-review` | no | Review skill name stored with repository review defaults. |
@@ -66,6 +69,8 @@ passwords.
 | `GIT_CACHE_ROOT` | `./.git-cache` | no | Root directory for bare mirror caches when `use_git_cache` is enabled. |
 | `REVIEW_RUN_TIMEOUT_SECONDS` | `1800` | no | Hard timeout used by worker timeout logic. |
 | `REVIEW_RUN_SOFT_TIMEOUT_SECONDS` | `900` | no | Soft timeout used by worker timeout logic. |
+| `WORKER_POLL_INTERVAL_SECONDS` | `5` | no | Delay between idle worker polling passes. |
+| `WORKER_LOCK_SECONDS` | `300` | no | Per-pass task lock lease. Expired running locks can be reacquired. |
 | `RETRY_MAX_ATTEMPTS` | `2` | no | Retry budget for failed review runs. |
 | `RETRY_INITIAL_DELAY_SECONDS` | `60` | no | Initial retry delay in seconds. |
 
@@ -135,10 +140,18 @@ https://<tunnel-host>/api/v1/webhooks/github
 ## Production Deployment
 
 Run the app with an ASGI server under a process manager or container platform.
-One direct command is:
+One direct API command is:
 
 ```bash
 uv run uvicorn review_orchestrator.main:app --host "${HOST:-0.0.0.0}" --port "${PORT:-8000}"
+```
+
+Run at least one worker process alongside the API; webhooks only enqueue work,
+while the worker prepares workspaces, starts OpenHands, polls for results, and
+publishes provider comments:
+
+```bash
+uv run review-orchestrator-worker
 ```
 
 For a single-host deployment with PostgreSQL and OpenHands, use:
@@ -154,8 +167,10 @@ and `OPENHANDS_API_TOKEN` when your OpenHands deployment requires one. Override
 `POSTGRES_PASSWORD` in `.env` or the shell; the compose default is only suitable
 for local testing.
 
-The self-host compose file publishes Nginx as the public Review Orchestrator
-entrypoint and keeps the FastAPI service on the private Docker network. Requests
+The self-host compose file runs separate `review-orchestrator` API and
+`review-orchestrator-worker` services. It publishes Nginx as the public Review
+Orchestrator entrypoint and keeps the FastAPI service on the private Docker
+network. Requests
 outside `/health` and `/api/v1/webhooks/github` must include the fixed token:
 
 ```bash

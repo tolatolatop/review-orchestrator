@@ -16,7 +16,10 @@ def make_client(tmp_path: Path) -> TestClient:
     return TestClient(create_app(settings))
 
 
-def gitlab_payload(action: str = "open") -> dict:
+def gitlab_payload(action: str = "open", *, source_changed: bool = False) -> dict:
+    changes = {}
+    if source_changed:
+        changes = {"last_commit": {"previous": "a" * 40, "current": "b" * 40}}
     return {
         "object_kind": "merge_request",
         "event_type": "merge_request",
@@ -32,6 +35,7 @@ def gitlab_payload(action: str = "open") -> dict:
             "source_branch": "feature",
             "target_branch_sha": "a" * 40,
             "last_commit": {"id": "b" * 40},
+            "changes": changes,
             "url": "https://gitlab.com/example/repo/-/merge_requests/42",
         },
     }
@@ -39,12 +43,20 @@ def gitlab_payload(action: str = "open") -> dict:
 
 def test_gitlab_adapter_normalizes_merge_request_actions() -> None:
     opened = normalize_gitlab_event("Merge Request Hook", gitlab_payload("open"))
-    updated = normalize_gitlab_event("Merge Request Hook", gitlab_payload("update"))
+    metadata_updated = normalize_gitlab_event(
+        "Merge Request Hook", gitlab_payload("update")
+    )
+    source_updated = normalize_gitlab_event(
+        "Merge Request Hook", gitlab_payload("update", source_changed=True)
+    )
     merged = normalize_gitlab_event("Merge Request Hook", gitlab_payload("merge"))
 
     assert opened.internal_event == "pr_opened"
     assert opened.should_create_review_run is True
-    assert updated.internal_event == "pr_updated"
+    assert metadata_updated.internal_event == "pr_metadata_changed"
+    assert metadata_updated.should_create_review_run is False
+    assert source_updated.internal_event == "pr_updated"
+    assert source_updated.should_create_review_run is True
     assert merged.internal_event == "pr_merged"
     assert merged.should_create_review_run is False
 

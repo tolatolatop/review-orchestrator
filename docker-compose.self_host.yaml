@@ -44,6 +44,9 @@ services:
       WORKSPACE_ROOT: /var/lib/review-orchestrator/workspaces
       GIT_CACHE_ROOT: /var/lib/review-orchestrator/git-cache
       OPENHANDS_BASE_URL: http://openhands:3000
+      GITHUB_INSTALLATION_TOKEN: ${GITHUB_INSTALLATION_TOKEN:-}
+      GITLAB_API_BASE_URL: ${GITLAB_API_BASE_URL:-https://gitlab.com/api/v4}
+      GITLAB_API_TOKEN: ${GITLAB_API_TOKEN:-}
     expose:
       - "8000"
     volumes:
@@ -67,6 +70,35 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  review-orchestrator-worker:
+    build:
+      context: .
+    image: review-orchestrator:self-host
+    command: ["review-orchestrator-worker"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      APP_ENV: ${APP_ENV:-self_host}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-review}:${POSTGRES_PASSWORD:-review}@postgres:5432/${POSTGRES_DB:-review_orchestrator}
+      WORKSPACE_ROOT: /var/lib/review-orchestrator/workspaces
+      GIT_CACHE_ROOT: /var/lib/review-orchestrator/git-cache
+      OPENHANDS_BASE_URL: http://openhands:3000
+      GITHUB_API_BASE_URL: ${GITHUB_API_BASE_URL:-https://api.github.com}
+      GITHUB_INSTALLATION_TOKEN: ${GITHUB_INSTALLATION_TOKEN:-}
+      GITLAB_API_BASE_URL: ${GITLAB_API_BASE_URL:-https://gitlab.com/api/v4}
+      GITLAB_API_TOKEN: ${GITLAB_API_TOKEN:-}
+      WORKER_POLL_INTERVAL_SECONDS: ${WORKER_POLL_INTERVAL_SECONDS:-5}
+      WORKER_LOCK_SECONDS: ${WORKER_LOCK_SECONDS:-300}
+    volumes:
+      - review_orchestrator_data:/var/lib/review-orchestrator
+    depends_on:
+      postgres:
+        condition: service_healthy
+      openhands:
+        condition: service_started
+    restart: unless-stopped
+
   nginx:
     image: nginx:1.27-alpine
     environment:
@@ -78,6 +110,8 @@ services:
     depends_on:
       review-orchestrator:
         condition: service_healthy
+      review-orchestrator-worker:
+        condition: service_started
     healthcheck:
       test:
         [

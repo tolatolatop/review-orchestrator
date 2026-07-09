@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from review_orchestrator.github import GitHubClient, GitHubClientError
+from review_orchestrator.gitlab import GitLabClient, GitLabClientError
 from review_orchestrator.models import Finding, ReviewCommentRef, ReviewRun
 from review_orchestrator.review_results import ChangedFile
 
@@ -121,6 +122,39 @@ async def publish_github_line_comments(
     return stats
 
 
+async def publish_gitlab_summary_comment(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    gitlab_client: GitLabClient,
+    status_text: str,
+    finding_stats: dict[str, int] | None = None,
+) -> ReviewCommentRef | None:
+    body = build_summary_comment_body(
+        review_run,
+        status_text=status_text,
+        finding_stats=finding_stats,
+    )
+    try:
+        provider_comment_id = await _upsert_gitlab_note(
+            gitlab_client,
+            review_run,
+            body,
+        )
+    except GitLabClientError as exc:
+        review_run.failure_code = "provider_permission_denied"
+        review_run.error = str(exc)
+        session.add(review_run)
+        await session.commit()
+        return None
+    return await upsert_summary_comment_ref(
+        session,
+        review_run,
+        provider_comment_id=provider_comment_id,
+        body=body,
+    )
+
+
 async def upsert_summary_comment_ref(
     session: AsyncSession,
     review_run: ReviewRun,
@@ -220,6 +254,37 @@ async def _upsert_github_issue_comment(
                 body,
             )
     return await github_client.create_issue_comment(
+        review_run.repo_full_name,
+        review_run.pull_request_number,
+        body,
+    )
+
+
+async def _upsert_gitlab_note(
+    gitlab_client: GitLabClient,
+    review_run: ReviewRun,
+    body: str,
+) -> str:
+    if review_run.summary_comment_id:
+        return await gitlab_client.update_merge_request_note(
+            review_run.repo_full_name,
+            review_run.pull_request_number,
+            review_run.summary_comment_id,
+            body,
+        )
+
+    for note in await gitlab_client.list_merge_request_notes(
+        review_run.repo_full_name,
+        review_run.pull_request_number,
+    ):
+        if note.body and SUMMARY_MARKER in note.body:
+            return await gitlab_client.update_merge_request_note(
+                review_run.repo_full_name,
+                review_run.pull_request_number,
+                str(note.id),
+                body,
+            )
+    return await gitlab_client.create_merge_request_note(
         review_run.repo_full_name,
         review_run.pull_request_number,
         body,
