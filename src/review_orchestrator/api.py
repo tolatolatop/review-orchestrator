@@ -10,6 +10,8 @@ from review_orchestrator.openhands import OpenHandsClient
 from review_orchestrator.providers import ProviderRegistry, ProviderWebhookError
 from review_orchestrator.review_results import ReviewResultError
 from review_orchestrator.schemas import (
+    AgentTaskDetail,
+    AgentTaskListResponse,
     CleanupSummary,
     OpenHandsSessionDiagnostics,
     ProviderEventInboxDetail,
@@ -19,6 +21,8 @@ from review_orchestrator.schemas import (
     ReviewResultCollectResponse,
     ReviewRunActionResult,
     ReviewRunCreate,
+    ReviewRunDetail,
+    ReviewRunListResponse,
     ReviewRunRead,
     ReviewSessionCancel,
     ReviewSessionStart,
@@ -37,11 +41,15 @@ from review_orchestrator.services import (
     cancel_review_session,
     collect_review_result,
     create_review_run,
+    get_agent_task_detail,
     get_openhands_session_diagnostics_for_conversation,
     get_openhands_session_diagnostics_for_review_run,
     get_provider_event_inbox_detail,
     get_review_run,
+    get_review_run_detail,
+    list_agent_tasks,
     list_provider_event_inbox,
+    list_review_runs,
     retry_review_run,
     start_review_session,
     sync_review_session,
@@ -185,6 +193,49 @@ async def get_provider_event_endpoint(
     return event
 
 
+@router.get("/agent-tasks", response_model=AgentTaskListResponse)
+async def list_agent_tasks_endpoint(
+    status_filter: str | None = Query(
+        default=None,
+        alias="status",
+        min_length=1,
+        max_length=32,
+    ),
+    provider: str | None = Query(default=None, min_length=1, max_length=64),
+    repo_full_name: str | None = Query(default=None, min_length=1, max_length=512),
+    pull_request_number: int | None = Query(default=None, gt=0),
+    task_type: str | None = Query(default=None, min_length=1, max_length=64),
+    created_from: datetime | None = None,
+    created_to: datetime | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = session_dependency,
+) -> AgentTaskListResponse:
+    return await list_agent_tasks(
+        session,
+        status=status_filter,
+        provider=provider,
+        repo_full_name=repo_full_name,
+        pull_request_number=pull_request_number,
+        task_type=task_type,
+        created_from=created_from,
+        created_to=created_to,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/agent-tasks/{task_id}", response_model=AgentTaskDetail)
+async def get_agent_task_endpoint(
+    task_id: str,
+    session: AsyncSession = session_dependency,
+) -> AgentTaskDetail:
+    task = await get_agent_task_detail(session, task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return task
+
+
 @router.post(
     "/review-runs",
     response_model=ReviewRunRead,
@@ -197,12 +248,51 @@ async def create_review_run_endpoint(
     return await create_review_run(session, payload)
 
 
-@router.get("/review-runs/{review_run_id}", response_model=ReviewRunRead)
+@router.get("/review-runs", response_model=ReviewRunListResponse)
+async def list_review_runs_endpoint(
+    provider: str | None = Query(default=None, min_length=1, max_length=64),
+    repo_full_name: str | None = Query(default=None, min_length=1, max_length=512),
+    pull_request_number: int | None = Query(default=None, gt=0),
+    merge_request_number: int | None = Query(default=None, gt=0),
+    status_filter: str | None = Query(
+        default=None,
+        alias="status",
+        min_length=1,
+        max_length=32,
+    ),
+    stage: str | None = Query(default=None, min_length=1, max_length=64),
+    head_sha: str | None = Query(default=None, min_length=7, max_length=80),
+    trigger_type: str | None = Query(default=None, min_length=1, max_length=32),
+    lock_state: str | None = Query(
+        default=None,
+        pattern="^(locked|unlocked|expired)$",
+    ),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = session_dependency,
+) -> ReviewRunListResponse:
+    return await list_review_runs(
+        session,
+        provider=provider,
+        repo_full_name=repo_full_name,
+        pull_request_number=pull_request_number,
+        merge_request_number=merge_request_number,
+        status=status_filter,
+        stage=stage,
+        head_sha=head_sha,
+        trigger_type=trigger_type,
+        lock_state=lock_state,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/review-runs/{review_run_id}", response_model=ReviewRunDetail)
 async def get_review_run_endpoint(
     review_run_id: str,
     session: AsyncSession = session_dependency,
-) -> ReviewRunRead:
-    review_run = await get_review_run(session, review_run_id)
+) -> ReviewRunDetail:
+    review_run = await get_review_run_detail(session, review_run_id)
     if review_run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return review_run
