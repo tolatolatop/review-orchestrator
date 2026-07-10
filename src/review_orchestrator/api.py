@@ -10,6 +10,8 @@ from review_orchestrator.openhands import OpenHandsClient
 from review_orchestrator.providers import ProviderRegistry, ProviderWebhookError
 from review_orchestrator.review_results import ReviewResultError
 from review_orchestrator.schemas import (
+    AgentTaskDetail,
+    AgentTaskListResponse,
     CleanupSummary,
     ProviderEventInboxDetail,
     ProviderEventInboxListResponse,
@@ -36,8 +38,10 @@ from review_orchestrator.services import (
     cancel_review_session,
     collect_review_result,
     create_review_run,
+    get_agent_task_detail,
     get_provider_event_inbox_detail,
     get_review_run,
+    list_agent_tasks,
     list_provider_event_inbox,
     retry_review_run,
     start_review_session,
@@ -160,6 +164,49 @@ async def get_provider_event_endpoint(
     if event is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return event
+
+
+@router.get("/agent-tasks", response_model=AgentTaskListResponse)
+async def list_agent_tasks_endpoint(
+    status_filter: str | None = Query(
+        default=None,
+        alias="status",
+        min_length=1,
+        max_length=32,
+    ),
+    provider: str | None = Query(default=None, min_length=1, max_length=64),
+    repo_full_name: str | None = Query(default=None, min_length=1, max_length=512),
+    pull_request_number: int | None = Query(default=None, gt=0),
+    task_type: str | None = Query(default=None, min_length=1, max_length=64),
+    created_from: datetime | None = None,
+    created_to: datetime | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = session_dependency,
+) -> AgentTaskListResponse:
+    return await list_agent_tasks(
+        session,
+        status=status_filter,
+        provider=provider,
+        repo_full_name=repo_full_name,
+        pull_request_number=pull_request_number,
+        task_type=task_type,
+        created_from=created_from,
+        created_to=created_to,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/agent-tasks/{task_id}", response_model=AgentTaskDetail)
+async def get_agent_task_endpoint(
+    task_id: str,
+    session: AsyncSession = session_dependency,
+) -> AgentTaskDetail:
+    task = await get_agent_task_detail(session, task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return task
 
 
 @router.post(

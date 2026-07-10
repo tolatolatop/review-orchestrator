@@ -124,6 +124,42 @@ class ProviderEventInboxDetail(ProviderEventInboxSummary):
     payload: dict | None = None
 
 
+class AgentTaskQueueHealth(BaseModel):
+    queued: int = 0
+    running: int = 0
+    completed: int = 0
+    failed: int = 0
+    oldest_queued_age_seconds: int | None = None
+
+
+class AgentTaskSummary(BaseModel):
+    id: str
+    provider: str
+    repo_full_name: str
+    pull_request_number: int
+    task_type: str
+    status: str
+    provider_event_id: str | None
+    provider_event_link: str | None
+    pull_request_context_link: str | None
+    error_message: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class AgentTaskListResponse(BaseModel):
+    items: list[AgentTaskSummary]
+    total: int
+    limit: int
+    offset: int
+    queue: AgentTaskQueueHealth
+
+
+class AgentTaskDetail(AgentTaskSummary):
+    input_metadata: dict | None
+    result_json: dict | None
+
+
 class ReviewRunActionResult(BaseModel):
     review_run_id: str
     status: ReviewRunStatus
