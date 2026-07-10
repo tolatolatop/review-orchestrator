@@ -17,6 +17,7 @@ from review_orchestrator.models import (
     ReviewRun,
     utc_now,
 )
+from review_orchestrator.observability import DEFAULT_OBSERVABILITY_SORT, redact_value
 from review_orchestrator.openhands import (
     OpenHandsClient,
     OpenHandsClientError,
@@ -43,19 +44,6 @@ OPENHANDS_TERMINAL_SUCCESS_STATUSES = {"FINISHED", "COMPLETED", "STOPPED"}
 OPENHANDS_TERMINAL_FAILURE_STATUSES = {"ERROR", "STUCK", "FAILED"}
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "superseded"}
 CANCELLABLE_STATUSES = {"queued", "running"}
-SENSITIVE_PAYLOAD_KEYS = {
-    "access_token",
-    "authorization",
-    "client_secret",
-    "hook",
-    "installation",
-    "private_key",
-    "secret",
-    "signature",
-    "token",
-}
-
-
 class ReviewRunTransitionError(ValueError):
     def __init__(self, message: str, *, status_code: int = 409) -> None:
         super().__init__(message)
@@ -552,6 +540,7 @@ async def list_provider_event_inbox(
         total=total,
         limit=limit,
         offset=offset,
+        sort=DEFAULT_OBSERVABILITY_SORT,
     )
 
 
@@ -568,7 +557,7 @@ async def get_provider_event_inbox_detail(
     return ProviderEventInboxDetail(
         **_provider_event_summary(event, agent_task_id).model_dump(),
         dedupe_key=event.dedupe_key,
-        payload=_redact_payload(event.payload) if include_payload else None,
+        payload=redact_value(event.payload) if include_payload else None,
     )
 
 
@@ -759,21 +748,6 @@ def _safe_error_message(error_message: str | None) -> str | None:
     if len(first_line) > 1000:
         return f"{first_line[:1000]}..."
     return first_line
-
-
-def _redact_payload(value: Any) -> Any:
-    if isinstance(value, dict):
-        redacted: dict[str, Any] = {}
-        for key, item in value.items():
-            lowered = str(key).lower()
-            if any(sensitive in lowered for sensitive in SENSITIVE_PAYLOAD_KEYS):
-                redacted[str(key)] = "[redacted]"
-            else:
-                redacted[str(key)] = _redact_payload(item)
-        return redacted
-    if isinstance(value, list):
-        return [_redact_payload(item) for item in value]
-    return value
 
 
 async def cancel_active_review_runs_for_pr(

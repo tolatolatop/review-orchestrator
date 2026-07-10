@@ -3,6 +3,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from review_orchestrator.observability import ObservabilityListEnvelope
 from review_orchestrator.review_results import ChangedFile, ParsedReviewResult
 
 
@@ -112,11 +113,8 @@ class ProviderEventInboxSummary(BaseModel):
     processed_at: datetime | None
 
 
-class ProviderEventInboxListResponse(BaseModel):
+class ProviderEventInboxListResponse(ObservabilityListEnvelope):
     items: list[ProviderEventInboxSummary]
-    total: int
-    limit: int
-    offset: int
 
 
 class ProviderEventInboxDetail(ProviderEventInboxSummary):
