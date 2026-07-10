@@ -127,6 +127,34 @@ class ReviewRunActionResult(BaseModel):
     status: ReviewRunStatus
 
 
+class OpenHandsPassthroughStatus(BaseModel):
+    enabled: bool
+    conversation_url: str | None = None
+    reason: str | None = None
+
+
+class OpenHandsSessionDiagnostics(BaseModel):
+    review_run_id: str | None = None
+    agent_task_ids: list[str] = Field(default_factory=list)
+    provider: str | None = None
+    repo_full_name: str | None = None
+    pull_request_number: int | None = None
+    status: ReviewRunStatus | None = None
+    stage: str | None = None
+    openhands_start_task_id: str | None = None
+    openhands_conversation_id: str | None = None
+    openhands_sandbox_id: str | None = None
+    openhands_agent_server_url: str | None = None
+    execution_status: str | None = None
+    sandbox_status: str | None = None
+    session_available: bool = False
+    live_status_available: bool = False
+    live_status_error: str | None = None
+    passthrough: OpenHandsPassthroughStatus
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 class WorkspaceStatus(StrEnum):
     preparing = "preparing"
     ready = "ready"

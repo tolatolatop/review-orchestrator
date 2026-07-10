@@ -30,6 +30,14 @@ class Settings(BaseSettings):
         default="http://localhost:3000",
         description="Base URL for the OpenHands App Server API.",
     )
+    openhands_ui_base_url: str | None = Field(
+        default=None,
+        description=(
+            "Operator-facing OpenHands UI base URL used to build safe "
+            "conversation links. If unset, observability responses make that "
+            "disabled state explicit."
+        ),
+    )
     openhands_api_token: str | None = None
     openhands_review_skill: str = "code-review"
     openhands_review_profile: str = "default"

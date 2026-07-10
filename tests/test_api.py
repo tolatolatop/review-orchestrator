@@ -53,6 +53,14 @@ def make_client(tmp_path: Path) -> TestClient:
     return TestClient(create_app(settings))
 
 
+def make_client_with_settings(tmp_path: Path, **overrides: Any) -> TestClient:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+        **overrides,
+    )
+    return TestClient(create_app(settings))
+
+
 def make_signed_client(tmp_path: Path, secret: str = "secret") -> TestClient:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
@@ -572,6 +580,103 @@ def test_sync_review_session_marks_openhands_failure(tmp_path: Path) -> None:
     assert sync_response.status_code == 200
     assert sync_response.json()["status"] == "failed"
     assert "ERROR" in sync_response.json()["error"]
+
+
+def test_observability_openhands_session_returns_safe_metadata(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+    fake_openhands = FakeOpenHandsClient()
+
+    with make_client_with_settings(
+        tmp_path,
+        openhands_ui_base_url="https://openhands.example.test",
+    ) as client:
+        client.app.state.openhands_client = fake_openhands
+        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        started = client.post(
+            f"/api/v1/review-runs/{review_run['id']}/session/start",
+            json={"workspace_path": "/workspaces/example-repo/pr-42/bbbbbbb"},
+        ).json()
+
+        by_run = client.get(
+            "/api/v1/observability/review-runs/"
+            f"{started['id']}/openhands-session"
+        )
+        by_conversation = client.get(
+            "/api/v1/observability/openhands-sessions/conversation-1"
+        )
+
+    assert by_run.status_code == 200
+    data = by_run.json()
+    assert data["review_run_id"] == started["id"]
+    assert data["openhands_start_task_id"] == "task-1"
+    assert data["openhands_conversation_id"] == "conversation-1"
+    assert data["openhands_sandbox_id"] == "sandbox-1"
+    assert data["openhands_agent_server_url"] == "http://agent-server"
+    assert data["execution_status"] == "RUNNING"
+    assert data["sandbox_status"] == "RUNNING"
+    assert data["session_available"] is True
+    assert data["live_status_available"] is True
+    assert data["live_status_error"] is None
+    assert data["passthrough"] == {
+        "enabled": True,
+        "conversation_url": "https://openhands.example.test/conversations/conversation-1",
+        "reason": None,
+    }
+    assert by_conversation.status_code == 200
+    assert by_conversation.json()["review_run_id"] == started["id"]
+
+
+def test_observability_openhands_session_reports_disabled_configuration(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+
+    with make_client_with_settings(
+        tmp_path,
+        openhands_base_url=None,
+        openhands_ui_base_url=None,
+    ) as client:
+        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        response = client.get(
+            "/api/v1/observability/review-runs/"
+            f"{review_run['id']}/openhands-session"
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["session_available"] is False
+    assert data["live_status_available"] is False
+    assert data["live_status_error"] == "OpenHands base URL is not configured."
+    assert data["passthrough"] == {
+        "enabled": False,
+        "conversation_url": None,
+        "reason": "OpenHands conversation id is not recorded for this review run.",
+    }
+
+
+def test_observability_openhands_session_returns_404_for_unknown_conversation(
+    tmp_path: Path,
+) -> None:
+    with make_client(tmp_path) as client:
+        response = client.get(
+            "/api/v1/observability/openhands-sessions/missing-conversation"
+        )
+
+    assert response.status_code == 404
 
 
 def test_collect_review_result_completes_review_run(tmp_path: Path) -> None:

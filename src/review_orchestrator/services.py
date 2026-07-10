@@ -33,6 +33,8 @@ from review_orchestrator.review_results import (
     parse_review_result,
 )
 from review_orchestrator.schemas import (
+    OpenHandsPassthroughStatus,
+    OpenHandsSessionDiagnostics,
     ProviderEventInboxDetail,
     ProviderEventInboxListResponse,
     ProviderEventInboxSummary,
@@ -103,6 +105,130 @@ async def get_review_run(
     review_run_id: str,
 ) -> ReviewRun | None:
     return await session.get(ReviewRun, review_run_id)
+
+
+async def get_openhands_session_diagnostics_for_review_run(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    openhands_client: OpenHandsClient | None = None,
+    openhands_live_status_disabled_reason: str | None = None,
+    openhands_ui_base_url: str | None = None,
+) -> OpenHandsSessionDiagnostics:
+    agent_task_ids = await _get_agent_task_ids_for_review_run(session, review_run)
+    execution_status: str | None = None
+    sandbox_status: str | None = None
+    live_status_error = openhands_live_status_disabled_reason
+
+    if review_run.openhands_conversation_id and openhands_client is not None:
+        try:
+            conversation = await openhands_client.get_conversation(
+                review_run.openhands_conversation_id
+            )
+        except OpenHandsClientError as exc:
+            live_status_error = str(exc)
+        else:
+            execution_status = conversation.execution_status
+            sandbox_status = conversation.sandbox_status
+            live_status_error = None
+
+    return OpenHandsSessionDiagnostics(
+        review_run_id=review_run.id,
+        agent_task_ids=agent_task_ids,
+        provider=review_run.provider,
+        repo_full_name=review_run.repo_full_name,
+        pull_request_number=review_run.pull_request_number,
+        status=review_run.status,
+        stage=review_run.stage,
+        openhands_start_task_id=review_run.openhands_start_task_id,
+        openhands_conversation_id=review_run.openhands_conversation_id,
+        openhands_sandbox_id=review_run.openhands_sandbox_id,
+        openhands_agent_server_url=review_run.openhands_agent_server_url,
+        execution_status=execution_status,
+        sandbox_status=sandbox_status,
+        session_available=bool(review_run.openhands_conversation_id),
+        live_status_available=(
+            execution_status is not None or sandbox_status is not None
+        ),
+        live_status_error=live_status_error,
+        passthrough=_build_openhands_passthrough_status(
+            conversation_id=review_run.openhands_conversation_id,
+            openhands_ui_base_url=openhands_ui_base_url,
+        ),
+        created_at=review_run.created_at,
+        updated_at=review_run.updated_at,
+    )
+
+
+async def get_openhands_session_diagnostics_for_conversation(
+    session: AsyncSession,
+    conversation_id: str,
+    *,
+    openhands_client: OpenHandsClient | None = None,
+    openhands_live_status_disabled_reason: str | None = None,
+    openhands_ui_base_url: str | None = None,
+) -> OpenHandsSessionDiagnostics | None:
+    result = await session.execute(
+        select(ReviewRun)
+        .where(ReviewRun.openhands_conversation_id == conversation_id)
+        .order_by(ReviewRun.created_at.desc(), ReviewRun.id.desc())
+        .limit(1)
+    )
+    review_run = result.scalar_one_or_none()
+    if review_run is None:
+        return None
+    return await get_openhands_session_diagnostics_for_review_run(
+        session,
+        review_run,
+        openhands_client=openhands_client,
+        openhands_live_status_disabled_reason=openhands_live_status_disabled_reason,
+        openhands_ui_base_url=openhands_ui_base_url,
+    )
+
+
+async def _get_agent_task_ids_for_review_run(
+    session: AsyncSession,
+    review_run: ReviewRun,
+) -> list[str]:
+    result = await session.execute(
+        select(AgentTask).where(
+            AgentTask.provider == review_run.provider,
+            AgentTask.repo_full_name == review_run.repo_full_name,
+            AgentTask.pull_request_number == review_run.pull_request_number,
+        )
+    )
+    task_ids: list[str] = []
+    for task in result.scalars():
+        result_json = task.result_json or {}
+        if (
+            task.provider_event_id == review_run.trigger_event_id
+            or result_json.get("review_run_id") == review_run.id
+        ):
+            task_ids.append(task.id)
+    return task_ids
+
+
+def _build_openhands_passthrough_status(
+    *,
+    conversation_id: str | None,
+    openhands_ui_base_url: str | None,
+) -> OpenHandsPassthroughStatus:
+    if not conversation_id:
+        return OpenHandsPassthroughStatus(
+            enabled=False,
+            reason="OpenHands conversation id is not recorded for this review run.",
+        )
+    if not openhands_ui_base_url:
+        return OpenHandsPassthroughStatus(
+            enabled=False,
+            reason="OPENHANDS_UI_BASE_URL is not configured.",
+        )
+    return OpenHandsPassthroughStatus(
+        enabled=True,
+        conversation_url=(
+            f"{openhands_ui_base_url.rstrip('/')}/conversations/{conversation_id}"
+        ),
+    )
 
 
 async def start_review_session(

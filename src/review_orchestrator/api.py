@@ -11,6 +11,7 @@ from review_orchestrator.providers import ProviderRegistry, ProviderWebhookError
 from review_orchestrator.review_results import ReviewResultError
 from review_orchestrator.schemas import (
     CleanupSummary,
+    OpenHandsSessionDiagnostics,
     ProviderEventInboxDetail,
     ProviderEventInboxListResponse,
     PullRequestWorkspaceCleanupRequest,
@@ -36,6 +37,8 @@ from review_orchestrator.services import (
     cancel_review_session,
     collect_review_result,
     create_review_run,
+    get_openhands_session_diagnostics_for_conversation,
+    get_openhands_session_diagnostics_for_review_run,
     get_provider_event_inbox_detail,
     get_review_run,
     list_provider_event_inbox,
@@ -77,6 +80,26 @@ def get_openhands_client(request: Request) -> OpenHandsClient:
 
 
 openhands_client_dependency = Depends(get_openhands_client)
+
+
+def get_optional_openhands_client(
+    request: Request,
+) -> tuple[OpenHandsClient | None, str | None]:
+    injected = getattr(request.app.state, "openhands_client", None)
+    if injected is not None:
+        return injected, None
+
+    settings = request.app.state.settings
+    if not settings.openhands_base_url:
+        return None, "OpenHands base URL is not configured."
+    return (
+        OpenHandsClient(
+            base_url=settings.openhands_base_url,
+            api_key=settings.openhands_api_token,
+            timeout=settings.openhands_timeout_seconds,
+        ),
+        None,
+    )
 
 
 @router.post("/webhooks/{provider}", response_model=WebhookAccepted)
@@ -183,6 +206,51 @@ async def get_review_run_endpoint(
     if review_run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return review_run
+
+
+@router.get(
+    "/observability/review-runs/{review_run_id}/openhands-session",
+    response_model=OpenHandsSessionDiagnostics,
+)
+async def get_review_run_openhands_session_endpoint(
+    review_run_id: str,
+    request: Request,
+    session: AsyncSession = session_dependency,
+) -> OpenHandsSessionDiagnostics:
+    review_run = await get_review_run(session, review_run_id)
+    if review_run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    openhands_client, disabled_reason = get_optional_openhands_client(request)
+    return await get_openhands_session_diagnostics_for_review_run(
+        session,
+        review_run,
+        openhands_client=openhands_client,
+        openhands_live_status_disabled_reason=disabled_reason,
+        openhands_ui_base_url=request.app.state.settings.openhands_ui_base_url,
+    )
+
+
+@router.get(
+    "/observability/openhands-sessions/{conversation_id}",
+    response_model=OpenHandsSessionDiagnostics,
+)
+async def get_openhands_session_endpoint(
+    conversation_id: str,
+    request: Request,
+    session: AsyncSession = session_dependency,
+) -> OpenHandsSessionDiagnostics:
+    openhands_client, disabled_reason = get_optional_openhands_client(request)
+    diagnostics = await get_openhands_session_diagnostics_for_conversation(
+        session,
+        conversation_id,
+        openhands_client=openhands_client,
+        openhands_live_status_disabled_reason=disabled_reason,
+        openhands_ui_base_url=request.app.state.settings.openhands_ui_base_url,
+    )
+    if diagnostics is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return diagnostics
+
 
 @router.post("/review-runs/{review_run_id}/session/start", response_model=ReviewRunRead)
 async def start_review_session_endpoint(
