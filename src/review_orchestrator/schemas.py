@@ -3,6 +3,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from review_orchestrator.observability import ObservabilityListEnvelope
 from review_orchestrator.review_results import ChangedFile, ParsedReviewResult
 
 
@@ -62,6 +63,114 @@ class ReviewRunRead(BaseModel):
     updated_at: datetime
 
 
+class ReviewRunOperationalState(BaseModel):
+    lock_state: str
+    timeout_state: str
+    worker_state: str
+
+
+class ReviewRunProviderPublishing(BaseModel):
+    summary_comment_id: str | None = None
+    summary_comment_ref_id: str | None = None
+    summary_comment_status: str | None = None
+    summary_published: bool = False
+    line_comment_count: int = 0
+    line_comment_status_counts: dict[str, int] = Field(default_factory=dict)
+
+
+class ReviewRunListItem(ReviewRunRead):
+    operational_state: ReviewRunOperationalState
+    provider_publishing: ReviewRunProviderPublishing
+
+
+class ReviewRunListResponse(BaseModel):
+    items: list[ReviewRunListItem]
+    total: int
+    limit: int
+    offset: int
+
+
+class ReviewRunPullRequestContext(BaseModel):
+    id: str | None = None
+    title: str | None = None
+    author_login: str | None = None
+    base_ref: str | None = None
+    base_sha: str | None = None
+    head_ref: str | None = None
+    head_sha: str | None = None
+    head_repo_full_name: str | None = None
+    is_fork: bool | None = None
+    status: str | None = None
+    html_url: str | None = None
+    latest_event_id: str | None = None
+    closed_at: datetime | None = None
+    merged_at: datetime | None = None
+
+
+class ReviewRunWorkspaceSummary(BaseModel):
+    workspace_id: str | None = None
+    workspace_path: str | None = None
+    status: str | None = None
+    failure_code: str | None = None
+    failure_message: str | None = None
+    ready_at: datetime | None = None
+    last_used_at: datetime | None = None
+    expires_at: datetime | None = None
+
+
+class ReviewRunSessionSummary(BaseModel):
+    id: str
+    status: str
+    openhands_conversation_id: str | None
+    skill_name: str | None
+    profile_name: str | None
+    result_ref: str | None
+    error_message: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ReviewRunFindingsSummary(BaseModel):
+    total: int = 0
+    by_severity: dict[str, int] = Field(default_factory=dict)
+    by_state: dict[str, int] = Field(default_factory=dict)
+    by_status: dict[str, int] = Field(default_factory=dict)
+
+
+class ReviewRunLinkedEventSummary(BaseModel):
+    id: str
+    provider_event: str
+    provider_action: str | None
+    internal_event: str | None
+    delivery_id: str
+    status: str
+    error_code: str | None
+    error_message: str | None
+    created_at: datetime
+    processed_at: datetime | None
+
+
+class ReviewRunLinkedTaskSummary(BaseModel):
+    id: str
+    provider_event_id: str | None
+    task_type: str
+    status: str
+    error_message: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ReviewRunDetail(ReviewRunListItem):
+    pull_request_context: ReviewRunPullRequestContext | None = None
+    workspace: ReviewRunWorkspaceSummary | None = None
+    review_session: ReviewRunSessionSummary | None = None
+    findings_summary: ReviewRunFindingsSummary
+    validation_warnings: list = Field(default_factory=list)
+    validation_errors: list = Field(default_factory=list)
+    trigger_event: ReviewRunLinkedEventSummary | None = None
+    agent_task: ReviewRunLinkedTaskSummary | None = None
+
+
 class ReviewSessionStart(BaseModel):
     workspace_path: str | None = Field(default=None, min_length=1)
 
@@ -112,11 +221,8 @@ class ProviderEventInboxSummary(BaseModel):
     processed_at: datetime | None
 
 
-class ProviderEventInboxListResponse(BaseModel):
+class ProviderEventInboxListResponse(ObservabilityListEnvelope):
     items: list[ProviderEventInboxSummary]
-    total: int
-    limit: int
-    offset: int
 
 
 class ProviderEventInboxDetail(ProviderEventInboxSummary):

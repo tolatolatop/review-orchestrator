@@ -74,6 +74,9 @@ locally:
 - `POST /api/v1/review-runs/{review_run_id}/retry`
 - `POST /api/v1/review-runs/{review_run_id}/cancel`
 
+The operator observability API contract and shared redaction rules are defined
+in [`docs/observability-api.md`](docs/observability-api.md).
+
 `POST /api/v1/review-runs` is idempotent for
 `provider + repo_full_name + pull_request_number + head_sha`. A repeated request
 returns the latest existing run unless `force=true` is supplied. Failed runs can
