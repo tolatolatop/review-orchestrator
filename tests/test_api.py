@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,16 @@ from fastapi.testclient import TestClient
 
 from review_orchestrator.config import Settings
 from review_orchestrator.main import create_app
+from review_orchestrator.models import (
+    AgentTask,
+    Finding,
+    ProviderEventInbox,
+    PullRequestContext,
+    ReviewCommentRef,
+    ReviewRun,
+    ReviewSession,
+    Workspace,
+)
 from review_orchestrator.openhands import (
     OpenHandsConversation,
     OpenHandsStartTask,
@@ -186,6 +197,236 @@ def test_force_create_review_run_creates_new_attempt(tmp_path: Path) -> None:
 
     assert forced["id"] != first["id"]
     assert forced["attempt"] == 2
+
+
+def test_list_review_runs_filters_and_reports_worker_state(tmp_path: Path) -> None:
+    first_payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+    second_payload = {
+        **first_payload,
+        "head_sha": "c" * 40,
+    }
+
+    async def mark_second_running(client: TestClient, review_run_id: str) -> None:
+        async with client.app.state.session_factory() as session:
+            review_run = await session.get(ReviewRun, review_run_id)
+            assert review_run is not None
+            review_run.status = "running"
+            review_run.stage = "collecting_result"
+            review_run.trigger_type = "webhook"
+            review_run.lock_owner = "worker-1"
+            review_run.locked_until = datetime.now(UTC) + timedelta(minutes=5)
+            await session.commit()
+
+    with make_client(tmp_path) as client:
+        first = client.post("/api/v1/review-runs", json=first_payload).json()
+        second = client.post("/api/v1/review-runs", json=second_payload).json()
+        client.portal.call(mark_second_running, client, second["id"])
+
+        locked_response = client.get(
+            "/api/v1/review-runs",
+            params={
+                "provider": "github",
+                "repo_full_name": "example/repo",
+                "pull_request_number": 42,
+                "status": "running",
+                "stage": "collecting_result",
+                "head_sha": "c" * 40,
+                "trigger_type": "webhook",
+                "lock_state": "locked",
+            },
+        )
+        unlocked_response = client.get(
+            "/api/v1/review-runs",
+            params={"lock_state": "unlocked"},
+        )
+
+    assert locked_response.status_code == 200
+    locked = locked_response.json()
+    assert locked["total"] == 1
+    assert locked["items"][0]["id"] == second["id"]
+    assert locked["items"][0]["operational_state"] == {
+        "lock_state": "locked",
+        "timeout_state": "none",
+        "worker_state": "locked_by_worker",
+    }
+    assert unlocked_response.status_code == 200
+    assert unlocked_response.json()["total"] == 1
+    assert unlocked_response.json()["items"][0]["id"] == first["id"]
+
+
+def test_get_review_run_detail_exposes_operator_context(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+
+    async def seed_detail_context(client: TestClient, review_run_id: str) -> None:
+        async with client.app.state.session_factory() as session:
+            review_run = await session.get(ReviewRun, review_run_id)
+            assert review_run is not None
+
+            event = ProviderEventInbox(
+                provider="github",
+                delivery_id="delivery-detail",
+                provider_event="pull_request",
+                provider_action="synchronize",
+                internal_event="pr_synchronize",
+                repo_full_name="example/repo",
+                pull_request_number=42,
+                head_sha="b" * 40,
+                dedupe_key="github:delivery-detail",
+                coalesce_key="github:example/repo:42:bbbb:review",
+                payload_digest="digest",
+                payload={"installation": {"token": "secret"}},
+                status="failed",
+                error_code="dispatch_failed",
+                error_message="first line\nsecret stack",
+                review_run_id=review_run_id,
+                processed_at=datetime.now(UTC),
+            )
+            session.add(event)
+            await session.flush()
+
+            context = PullRequestContext(
+                provider="github",
+                repo_full_name="example/repo",
+                pull_request_number=42,
+                provider_repo_id="1001",
+                provider_pr_id="2002",
+                title="Improve review",
+                author_login="alice",
+                base_ref="main",
+                base_sha="a" * 40,
+                head_ref="feature",
+                head_sha="b" * 40,
+                head_repo_full_name="fork/repo",
+                is_fork=True,
+                status="open",
+                html_url="https://github.com/example/repo/pull/42",
+                latest_event_id=event.id,
+            )
+            session.add(context)
+            await session.flush()
+
+            review_run.pull_request_context_id = context.id
+            review_run.trigger_event_id = event.id
+            review_run.status = "failed"
+            review_run.stage = "publishing_summary"
+            review_run.workspace_path = "/workspaces/example-repo/pr-42/bbbbbbb"
+            review_run.openhands_conversation_id = "conversation-1"
+            review_run.failure_code = "invalid_result"
+            review_run.error = "invalid result\nraw provider payload"
+            review_run.hard_timeout_emitted_at = datetime.now(UTC)
+            review_run.validation_warnings_json = [{"code": "unknown_field"}]
+            review_run.validation_errors_json = [{"code": "missing_summary"}]
+            review_run.summary_comment_id = "summary-42"
+
+            session.add(
+                Workspace(
+                    workspace_id="github-example-repo-42-bbbbbbb",
+                    provider="github",
+                    repository="example/repo",
+                    repository_clone_url="https://github.com/example/repo.git",
+                    repo_hash="repohash",
+                    pull_request_number=42,
+                    base_sha="a" * 40,
+                    head_sha="b" * 40,
+                    workspace_path="/workspaces/example-repo/pr-42/bbbbbbb",
+                    status="failed",
+                    failure_code="checkout_failed",
+                    failure_message="missing head\nfull stderr",
+                )
+            )
+            session.add(
+                ReviewSession(
+                    review_run_id=review_run_id,
+                    openhands_conversation_id="conversation-1",
+                    status="failed",
+                    skill_name="code-review",
+                    profile_name="default",
+                    result_ref="s3://results/1",
+                    error_message="agent stopped\ntrace",
+                )
+            )
+            session.add(
+                AgentTask(
+                    provider_event_id=event.id,
+                    pull_request_context_id=context.id,
+                    provider="github",
+                    repo_full_name="example/repo",
+                    pull_request_number=42,
+                    task_type="mention",
+                    status="failed",
+                    error_message="task failed\ntrace",
+                )
+            )
+            session.add(
+                Finding(
+                    review_run_id=review_run_id,
+                    pull_request_context_id=context.id,
+                    fingerprint="fp-1",
+                    file_path="src/app.py",
+                    severity="high",
+                    message="Auth check is skipped.",
+                    status="active",
+                    state="new",
+                )
+            )
+            session.add(
+                ReviewCommentRef(
+                    provider="github",
+                    repo_full_name="example/repo",
+                    pull_request_number=42,
+                    review_run_id=review_run_id,
+                    comment_type="summary",
+                    provider_comment_id="summary-42",
+                    status="active",
+                )
+            )
+            session.add(
+                ReviewCommentRef(
+                    provider="github",
+                    repo_full_name="example/repo",
+                    pull_request_number=42,
+                    review_run_id=review_run_id,
+                    finding_id=None,
+                    comment_type="line",
+                    provider_comment_id="line-1",
+                    status="active",
+                )
+            )
+            await session.commit()
+
+    with make_client(tmp_path) as client:
+        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        client.portal.call(seed_detail_context, client, review_run["id"])
+        response = client.get(f"/api/v1/review-runs/{review_run['id']}")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["failure_code"] == "invalid_result"
+    assert data["error"] == "invalid result"
+    assert data["operational_state"]["timeout_state"] == "hard_timeout"
+    assert data["provider_publishing"]["summary_published"] is True
+    assert data["provider_publishing"]["summary_comment_id"] == "summary-42"
+    assert data["provider_publishing"]["line_comment_count"] == 1
+    assert data["pull_request_context"]["html_url"].endswith("/pull/42")
+    assert data["workspace"]["status"] == "failed"
+    assert data["workspace"]["failure_message"] == "missing head"
+    assert data["review_session"]["error_message"] == "agent stopped"
+    assert data["findings_summary"]["by_severity"] == {"high": 1}
+    assert data["validation_errors"] == [{"code": "missing_summary"}]
+    assert data["trigger_event"]["error_message"] == "first line"
+    assert data["agent_task"]["status"] == "failed"
 
 
 def test_retry_rejects_non_failed_run(tmp_path: Path) -> None:
