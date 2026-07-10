@@ -42,6 +42,7 @@ Future observability routes should use these paths:
 | `GET /api/v1/observability/agent-tasks/{agent_task_id}` | Agent task detail with redacted input and result. |
 | `GET /api/v1/observability/pull-requests/{provider}/{repo}/{number}` | PR context drill-down entry point. |
 | `GET /api/v1/observability/openhands-sessions/{conversation_id}` | OpenHands session status known to the orchestrator. |
+| `GET /api/v1/observability/review-runs/{review_run_id}/openhands-session` | OpenHands session diagnostics for one review run, including missing-session and disabled passthrough states. |
 | `GET /api/v1/observability/publishing` | Provider comment publishing and reconciliation state. |
 
 Path parameters use stored IDs, not provider display labels, except for the PR
@@ -169,6 +170,14 @@ Current shared models:
 - `ProviderEventInboxSummary`
 - `ProviderEventInboxListResponse`
 - `ProviderEventInboxDetail`
+
+OpenHands session diagnostics expose only safe metadata: review run and linked
+agent task identifiers, conversation/start-task/sandbox IDs, agent server URL,
+run status/stage, live execution and sandbox status when OpenHands is reachable,
+and a `passthrough` object. `passthrough.enabled=false` is returned with a
+human-readable reason when the review run has no conversation ID or
+`OPENHANDS_UI_BASE_URL` is not configured. The response never includes
+OpenHands API credentials, raw events, container internals, or logs.
 
 Future endpoint response models should add endpoint-specific item fields while
 reusing `ObservabilityListEnvelope` for list metadata. Do not return raw ORM
