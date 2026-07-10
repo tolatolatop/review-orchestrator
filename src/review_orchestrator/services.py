@@ -1,6 +1,6 @@
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,12 +31,29 @@ from review_orchestrator.review_results import (
     ReviewSkillInput,
     parse_review_result,
 )
-from review_orchestrator.schemas import ReviewRunCreate, WebhookAccepted
+from review_orchestrator.schemas import (
+    ProviderEventInboxDetail,
+    ProviderEventInboxListResponse,
+    ProviderEventInboxSummary,
+    ReviewRunCreate,
+    WebhookAccepted,
+)
 
 OPENHANDS_TERMINAL_SUCCESS_STATUSES = {"FINISHED", "COMPLETED", "STOPPED"}
 OPENHANDS_TERMINAL_FAILURE_STATUSES = {"ERROR", "STUCK", "FAILED"}
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "superseded"}
 CANCELLABLE_STATUSES = {"queued", "running"}
+SENSITIVE_PAYLOAD_KEYS = {
+    "access_token",
+    "authorization",
+    "client_secret",
+    "hook",
+    "installation",
+    "private_key",
+    "secret",
+    "signature",
+    "token",
+}
 
 
 class ReviewRunTransitionError(ValueError):
@@ -487,6 +504,74 @@ async def get_provider_event(
     return result.scalar_one_or_none()
 
 
+async def list_provider_event_inbox(
+    session: AsyncSession,
+    *,
+    provider: str | None = None,
+    repo_full_name: str | None = None,
+    pull_request_number: int | None = None,
+    internal_event: str | None = None,
+    status: str | None = None,
+    delivery_id: str | None = None,
+    created_from: Any | None = None,
+    created_to: Any | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> ProviderEventInboxListResponse:
+    filters = _provider_event_filters(
+        provider=provider,
+        repo_full_name=repo_full_name,
+        pull_request_number=pull_request_number,
+        internal_event=internal_event,
+        status=status,
+        delivery_id=delivery_id,
+        created_from=created_from,
+        created_to=created_to,
+    )
+    total_result = await session.execute(
+        select(func.count()).select_from(ProviderEventInbox).where(*filters)
+    )
+    total = int(total_result.scalar_one())
+
+    result = await session.execute(
+        select(ProviderEventInbox)
+        .where(*filters)
+        .order_by(ProviderEventInbox.created_at.desc(), ProviderEventInbox.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    events = list(result.scalars().all())
+    agent_task_ids = await _get_agent_task_ids_for_events(
+        session, [event.id for event in events]
+    )
+    return ProviderEventInboxListResponse(
+        items=[
+            _provider_event_summary(event, agent_task_ids.get(event.id))
+            for event in events
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+async def get_provider_event_inbox_detail(
+    session: AsyncSession,
+    event_id: str,
+    *,
+    include_payload: bool = False,
+) -> ProviderEventInboxDetail | None:
+    event = await session.get(ProviderEventInbox, event_id)
+    if event is None:
+        return None
+    agent_task_id = await _get_agent_task_id_for_event(session, event.id)
+    return ProviderEventInboxDetail(
+        **_provider_event_summary(event, agent_task_id).model_dump(),
+        dedupe_key=event.dedupe_key,
+        payload=_redact_payload(event.payload) if include_payload else None,
+    )
+
+
 async def upsert_pull_request_context(
     session: AsyncSession,
     event: ProviderEventInbox,
@@ -590,6 +675,105 @@ async def _get_agent_task_id_for_event(
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+async def _get_agent_task_ids_for_events(
+    session: AsyncSession,
+    provider_event_ids: list[str],
+) -> dict[str, str]:
+    if not provider_event_ids:
+        return {}
+    result = await session.execute(
+        select(AgentTask.provider_event_id, AgentTask.id)
+        .where(AgentTask.provider_event_id.in_(provider_event_ids))
+        .order_by(AgentTask.created_at.desc())
+    )
+    task_ids: dict[str, str] = {}
+    for provider_event_id, task_id in result.all():
+        if provider_event_id is not None and provider_event_id not in task_ids:
+            task_ids[provider_event_id] = task_id
+    return task_ids
+
+
+def _provider_event_filters(
+    *,
+    provider: str | None,
+    repo_full_name: str | None,
+    pull_request_number: int | None,
+    internal_event: str | None,
+    status: str | None,
+    delivery_id: str | None,
+    created_from: Any | None,
+    created_to: Any | None,
+) -> list[Any]:
+    filters: list[Any] = []
+    if provider:
+        filters.append(ProviderEventInbox.provider == provider)
+    if repo_full_name:
+        filters.append(ProviderEventInbox.repo_full_name == repo_full_name)
+    if pull_request_number is not None:
+        filters.append(ProviderEventInbox.pull_request_number == pull_request_number)
+    if internal_event:
+        filters.append(ProviderEventInbox.internal_event == internal_event)
+    if status:
+        filters.append(ProviderEventInbox.status == status)
+    if delivery_id:
+        filters.append(ProviderEventInbox.delivery_id == delivery_id)
+    if created_from is not None:
+        filters.append(ProviderEventInbox.created_at >= created_from)
+    if created_to is not None:
+        filters.append(ProviderEventInbox.created_at <= created_to)
+    return filters
+
+
+def _provider_event_summary(
+    event: ProviderEventInbox,
+    agent_task_id: str | None,
+) -> ProviderEventInboxSummary:
+    return ProviderEventInboxSummary(
+        id=event.id,
+        provider=event.provider,
+        delivery_id=event.delivery_id,
+        provider_event=event.provider_event,
+        provider_action=event.provider_action,
+        internal_event=event.internal_event,
+        status=event.status,
+        repo_full_name=event.repo_full_name,
+        pull_request_number=event.pull_request_number,
+        head_sha=event.head_sha,
+        payload_digest=event.payload_digest,
+        coalesce_key=event.coalesce_key,
+        review_run_id=event.review_run_id,
+        agent_task_id=agent_task_id,
+        error_code=event.error_code,
+        error_message=_safe_error_message(event.error_message),
+        created_at=event.created_at,
+        processed_at=event.processed_at,
+    )
+
+
+def _safe_error_message(error_message: str | None) -> str | None:
+    if error_message is None:
+        return None
+    first_line = error_message.splitlines()[0]
+    if len(first_line) > 1000:
+        return f"{first_line[:1000]}..."
+    return first_line
+
+
+def _redact_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if any(sensitive in lowered for sensitive in SENSITIVE_PAYLOAD_KEYS):
+                redacted[str(key)] = "[redacted]"
+            else:
+                redacted[str(key)] = _redact_payload(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_payload(item) for item in value]
+    return value
 
 
 async def cancel_active_review_runs_for_pr(

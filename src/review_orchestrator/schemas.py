@@ -91,6 +91,39 @@ class WebhookAccepted(BaseModel):
     duplicate: bool = False
 
 
+class ProviderEventInboxSummary(BaseModel):
+    id: str
+    provider: str
+    delivery_id: str
+    provider_event: str
+    provider_action: str | None
+    internal_event: str | None
+    status: str
+    repo_full_name: str | None
+    pull_request_number: int | None
+    head_sha: str | None
+    payload_digest: str
+    coalesce_key: str | None
+    review_run_id: str | None
+    agent_task_id: str | None
+    error_code: str | None
+    error_message: str | None
+    created_at: datetime
+    processed_at: datetime | None
+
+
+class ProviderEventInboxListResponse(BaseModel):
+    items: list[ProviderEventInboxSummary]
+    total: int
+    limit: int
+    offset: int
+
+
+class ProviderEventInboxDetail(ProviderEventInboxSummary):
+    dedupe_key: str
+    payload: dict | None = None
+
+
 class ReviewRunActionResult(BaseModel):
     review_run_id: str
     status: ReviewRunStatus
