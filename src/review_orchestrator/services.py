@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import func, select
@@ -38,6 +38,10 @@ from review_orchestrator.review_results import (
     parse_review_result,
 )
 from review_orchestrator.schemas import (
+    AgentTaskDetail,
+    AgentTaskListResponse,
+    AgentTaskQueueHealth,
+    AgentTaskSummary,
     ProviderEventInboxDetail,
     ProviderEventInboxListResponse,
     ProviderEventInboxSummary,
@@ -755,6 +759,74 @@ async def create_agent_task_from_event(
     return agent_task
 
 
+async def list_agent_tasks(
+    session: AsyncSession,
+    *,
+    status: str | None = None,
+    provider: str | None = None,
+    repo_full_name: str | None = None,
+    pull_request_number: int | None = None,
+    task_type: str | None = None,
+    created_from: Any | None = None,
+    created_to: Any | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> AgentTaskListResponse:
+    filters = _agent_task_filters(
+        status=status,
+        provider=provider,
+        repo_full_name=repo_full_name,
+        pull_request_number=pull_request_number,
+        task_type=task_type,
+        created_from=created_from,
+        created_to=created_to,
+    )
+    total_result = await session.execute(
+        select(func.count()).select_from(AgentTask).where(*filters)
+    )
+    total = int(total_result.scalar_one())
+
+    result = await session.execute(
+        select(AgentTask)
+        .where(*filters)
+        .order_by(AgentTask.created_at.desc(), AgentTask.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    tasks = list(result.scalars().all())
+
+    health_filters = _agent_task_filters(
+        status=None,
+        provider=provider,
+        repo_full_name=repo_full_name,
+        pull_request_number=pull_request_number,
+        task_type=task_type,
+        created_from=created_from,
+        created_to=created_to,
+    )
+    return AgentTaskListResponse(
+        items=[_agent_task_summary(task) for task in tasks],
+        total=total,
+        limit=limit,
+        offset=offset,
+        queue=await _agent_task_queue_health(session, health_filters),
+    )
+
+
+async def get_agent_task_detail(
+    session: AsyncSession,
+    task_id: str,
+) -> AgentTaskDetail | None:
+    task = await session.get(AgentTask, task_id)
+    if task is None:
+        return None
+    return AgentTaskDetail(
+        **_agent_task_summary(task).model_dump(),
+        input_metadata=redact_value(task.input_json),
+        result_json=task.result_json,
+    )
+
+
 async def _get_agent_task_id_for_event(
     session: AsyncSession,
     provider_event_id: str,
@@ -784,6 +856,93 @@ async def _get_agent_task_ids_for_events(
         if provider_event_id is not None and provider_event_id not in task_ids:
             task_ids[provider_event_id] = task_id
     return task_ids
+
+
+def _agent_task_filters(
+    *,
+    status: str | None,
+    provider: str | None,
+    repo_full_name: str | None,
+    pull_request_number: int | None,
+    task_type: str | None,
+    created_from: Any | None,
+    created_to: Any | None,
+) -> list[Any]:
+    filters: list[Any] = []
+    if status:
+        filters.append(AgentTask.status == status)
+    if provider:
+        filters.append(AgentTask.provider == provider)
+    if repo_full_name:
+        filters.append(AgentTask.repo_full_name == repo_full_name)
+    if pull_request_number is not None:
+        filters.append(AgentTask.pull_request_number == pull_request_number)
+    if task_type:
+        filters.append(AgentTask.task_type == task_type)
+    if created_from is not None:
+        filters.append(AgentTask.created_at >= created_from)
+    if created_to is not None:
+        filters.append(AgentTask.created_at <= created_to)
+    return filters
+
+
+async def _agent_task_queue_health(
+    session: AsyncSession,
+    filters: list[Any],
+) -> AgentTaskQueueHealth:
+    count_result = await session.execute(
+        select(AgentTask.status, func.count())
+        .where(*filters)
+        .group_by(AgentTask.status)
+    )
+    counts = {status: int(count) for status, count in count_result.all()}
+    oldest_result = await session.execute(
+        select(func.min(AgentTask.created_at)).where(
+            *filters,
+            AgentTask.status == "queued",
+        )
+    )
+    oldest_queued_at = oldest_result.scalar_one()
+    oldest_queued_age_seconds = None
+    if oldest_queued_at is not None:
+        if oldest_queued_at.tzinfo is None:
+            oldest_queued_at = oldest_queued_at.replace(tzinfo=UTC)
+        oldest_queued_age_seconds = max(
+            0,
+            int((utc_now() - oldest_queued_at).total_seconds()),
+        )
+    return AgentTaskQueueHealth(
+        queued=counts.get("queued", 0),
+        running=counts.get("running", 0),
+        completed=counts.get("completed", 0),
+        failed=counts.get("failed", 0),
+        oldest_queued_age_seconds=oldest_queued_age_seconds,
+    )
+
+
+def _agent_task_summary(task: AgentTask) -> AgentTaskSummary:
+    return AgentTaskSummary(
+        id=task.id,
+        provider=task.provider,
+        repo_full_name=task.repo_full_name,
+        pull_request_number=task.pull_request_number,
+        task_type=task.task_type,
+        status=task.status,
+        provider_event_id=task.provider_event_id,
+        provider_event_link=(
+            f"/api/v1/provider-events/{task.provider_event_id}"
+            if task.provider_event_id
+            else None
+        ),
+        pull_request_context_link=(
+            f"/api/v1/pull-request-contexts/{task.pull_request_context_id}"
+            if task.pull_request_context_id
+            else None
+        ),
+        error_message=_safe_error_message(task.error_message),
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+    )
 
 
 def _provider_event_filters(
