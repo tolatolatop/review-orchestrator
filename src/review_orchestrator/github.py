@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict
 
 from review_orchestrator.providers import (
     ParsedProviderWebhook,
+    ProviderCapabilityError,
     ProviderPayloadError,
     ProviderSignatureError,
     ProviderWebhookError,
@@ -65,6 +66,9 @@ class NormalizedGitHubEvent:
 class GitHubAdapter:
     provider = "github"
 
+    def __init__(self, client: GitHubClient | None = None) -> None:
+        self.client = client
+
     def parse_webhook(
         self,
         *,
@@ -96,6 +100,62 @@ class GitHubAdapter:
             provider_event=normalized_event.to_provider_event(),
             payload=payload,
             raw_body=raw_body,
+        )
+
+    async def get_pull_request_context(self, task) -> Any:
+        if self.client is None:
+            raise ProviderCapabilityError("GitHub client is not configured.")
+        pull_request = await self.client.get_pull_request(
+            task.repo_full_name,
+            task.pull_request_number,
+        )
+        return context_from_pull_request_task(task, pull_request)
+
+    async def list_changed_files(self, review_run) -> list[ChangedFile]:
+        if self.client is None:
+            raise ProviderCapabilityError("GitHub client is not configured.")
+        return await fetch_changed_files(
+            self.client,
+            repo_full_name=review_run.repo_full_name,
+            pull_request_number=review_run.pull_request_number,
+        )
+
+    async def publish_summary_comment(
+        self,
+        session,
+        review_run,
+        *,
+        status_text: str,
+        finding_stats: dict[str, int] | None = None,
+    ) -> Any:
+        if self.client is None:
+            raise ProviderCapabilityError("GitHub client is not configured.")
+        from review_orchestrator.comments import publish_github_summary_comment
+
+        return await publish_github_summary_comment(
+            session,
+            review_run,
+            github_client=self.client,
+            status_text=status_text,
+            finding_stats=finding_stats,
+        )
+
+    async def publish_line_comments(
+        self,
+        session,
+        review_run,
+        *,
+        changed_files: list[ChangedFile],
+    ) -> dict[str, int]:
+        if self.client is None:
+            raise ProviderCapabilityError("GitHub client is not configured.")
+        from review_orchestrator.comments import publish_github_line_comments
+
+        return await publish_github_line_comments(
+            session,
+            review_run,
+            github_client=self.client,
+            changed_files=changed_files,
         )
 
 
@@ -304,6 +364,65 @@ def _parse_hunk_new_start(header: str) -> int | None:
         return int(start)
     except ValueError:
         return None
+
+
+def context_from_pull_request_task(task: Any, pull_request: dict[str, Any]) -> Any:
+    from review_orchestrator.models import PullRequestContext
+
+    base = pull_request.get("base") if isinstance(pull_request, dict) else None
+    head = pull_request.get("head") if isinstance(pull_request, dict) else None
+    base_repo = base.get("repo") if isinstance(base, dict) else None
+    head_repo = head.get("repo") if isinstance(head, dict) else None
+    head_repo_full_name = _repo_full_name(head_repo)
+    base_repo_full_name = _repo_full_name(base_repo)
+    return PullRequestContext(
+        provider=task.provider,
+        repo_full_name=task.repo_full_name,
+        pull_request_number=task.pull_request_number,
+        provider_pr_id=_id_to_str(pull_request.get("id")),
+        title=_optional_str(pull_request.get("title")),
+        author_login=_login(pull_request.get("user")),
+        base_ref=_ref(base),
+        base_sha=_sha(base),
+        head_ref=_ref(head),
+        head_sha=_sha(head) or "",
+        head_repo_full_name=head_repo_full_name,
+        is_fork=bool(
+            head_repo_full_name and head_repo_full_name != base_repo_full_name
+        ),
+        status=_optional_str(pull_request.get("state")) or "open",
+        html_url=_optional_str(pull_request.get("html_url")),
+    )
+
+
+def _id_to_str(value: Any) -> str | None:
+    if isinstance(value, int | str):
+        return str(value)
+    return None
+
+
+def _sha(ref_object: Any) -> str | None:
+    if not isinstance(ref_object, dict):
+        return None
+    return _optional_str(ref_object.get("sha"))
+
+
+def _ref(ref_object: Any) -> str | None:
+    if not isinstance(ref_object, dict):
+        return None
+    return _optional_str(ref_object.get("ref"))
+
+
+def _repo_full_name(repo: Any) -> str | None:
+    if not isinstance(repo, dict):
+        return None
+    return _optional_str(repo.get("full_name"))
+
+
+def _login(user: Any) -> str | None:
+    if not isinstance(user, dict):
+        return None
+    return _optional_str(user.get("login"))
 
 
 PR_ACTIONS_TO_INTERNAL_EVENT = {

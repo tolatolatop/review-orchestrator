@@ -74,43 +74,49 @@ Orchestrator core 负责共享行为：
 
 ```python
 class ProviderAdapter(Protocol):
-    name: str
+    provider: str
 
-    async def parse_webhook(
+    def parse_webhook(
         self,
-        headers: Mapping[str, str],
-        body: bytes,
-    ) -> ProviderWebhookEvent: ...
+        *,
+        headers: dict[str, str],
+        raw_body: bytes,
+        settings: Any,
+    ) -> ParsedProviderWebhook: ...
 
     async def get_pull_request_context(
         self,
-        event: ProviderWebhookEvent,
-    ) -> ProviderPullRequestContext: ...
+        task: AgentTask,
+    ) -> PullRequestContext | None: ...
 
     async def list_changed_files(
         self,
-        context: ProviderPullRequestContext,
-    ) -> list[ProviderChangedFile]: ...
+        review_run: ReviewRun,
+    ) -> list[ChangedFile]: ...
 
-    async def upsert_summary_comment(
+    async def publish_summary_comment(
         self,
-        context: ProviderPullRequestContext,
-        body: str,
-        existing_provider_comment_id: str | None,
-    ) -> ProviderCommentRef: ...
+        session: AsyncSession,
+        review_run: ReviewRun,
+        *,
+        status_text: str,
+        finding_stats: dict[str, int] | None = None,
+    ) -> Any: ...
 
-    async def create_line_comment(
+    async def publish_line_comments(
         self,
-        context: ProviderPullRequestContext,
-        finding: PublishableFinding,
-        body: str,
-    ) -> ProviderCommentRef: ...
+        session: AsyncSession,
+        review_run: ReviewRun,
+        *,
+        changed_files: list[ChangedFile],
+    ) -> dict[str, int]: ...
 ```
 
-如果一个 provider 只需要排队 review run，`parse_webhook` 和
-`get_pull_request_context` 是必需能力。只有在启用 line comment 发布前，
-`list_changed_files` 才是必需能力。Summary 和 line comment 发布可以在
-`ReviewConfig.line_comments_enabled` 与 provider capability check 后逐步接入。
+`parse_webhook` 由 API registry 用于 webhook 接入。Worker 侧也通过同一个
+adapter 对象完成 PR context hydration、changed-file lookup、summary
+发布和 line comment 发布。暂不支持 line comment 的 provider 应让
+`publish_line_comments` 返回全零统计，并保持该 provider 的
+`ReviewConfig.line_comments_enabled` 关闭。
 
 无论外部平台使用什么术语，内部都使用这些数据形状：
 

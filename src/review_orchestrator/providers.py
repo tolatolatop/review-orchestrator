@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from review_orchestrator.models import AgentTask, PullRequestContext, ReviewRun
+    from review_orchestrator.review_results import ChangedFile
 
 
 class ProviderWebhookError(Exception):
@@ -20,6 +26,10 @@ class ProviderSignatureError(ProviderWebhookError):
 
 class ProviderPayloadError(ProviderWebhookError):
     error_code = "provider_payload_invalid"
+
+
+class ProviderCapabilityError(Exception):
+    pass
 
 
 @dataclass(frozen=True)
@@ -55,6 +65,37 @@ class ProviderAdapter(Protocol):
         raw_body: bytes,
         settings: Any,
     ) -> ParsedProviderWebhook:
+        ...
+
+    async def get_pull_request_context(
+        self,
+        task: AgentTask,
+    ) -> PullRequestContext | None:
+        ...
+
+    async def list_changed_files(
+        self,
+        review_run: ReviewRun,
+    ) -> list[ChangedFile]:
+        ...
+
+    async def publish_summary_comment(
+        self,
+        session: AsyncSession,
+        review_run: ReviewRun,
+        *,
+        status_text: str,
+        finding_stats: dict[str, int] | None = None,
+    ) -> Any:
+        ...
+
+    async def publish_line_comments(
+        self,
+        session: AsyncSession,
+        review_run: ReviewRun,
+        *,
+        changed_files: list[ChangedFile],
+    ) -> dict[str, int]:
         ...
 
 

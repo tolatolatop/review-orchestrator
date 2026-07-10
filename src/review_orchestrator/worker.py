@@ -9,21 +9,16 @@ from typing import Any, Literal
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from review_orchestrator.comments import (
-    publish_github_line_comments,
-    publish_github_summary_comment,
-    publish_gitlab_summary_comment,
-)
 from review_orchestrator.config import Settings
 from review_orchestrator.github import (
+    GitHubAdapter,
     GitHubClient,
     GitHubClientError,
-    fetch_changed_files,
 )
 from review_orchestrator.gitlab import (
+    GitLabAdapter,
     GitLabClient,
     GitLabClientError,
-    fetch_gitlab_changed_files,
 )
 from review_orchestrator.models import (
     AgentTask,
@@ -33,6 +28,7 @@ from review_orchestrator.models import (
     utc_now,
 )
 from review_orchestrator.openhands import OpenHandsClient, OpenHandsClientError
+from review_orchestrator.providers import ProviderCapabilityError, ProviderRegistry
 from review_orchestrator.schemas import ReviewRunCreate, WorkspacePrepareRequest
 from review_orchestrator.services import (
     collect_review_result,
@@ -49,6 +45,19 @@ TIMEOUT_EVENTS = {
     "soft": "review_run.soft_timeout",
     "hard": "review_run.hard_timeout",
 }
+
+
+def build_worker_provider_registry(
+    *,
+    github_client: GitHubClient | None = None,
+    gitlab_client: GitLabClient | None = None,
+) -> ProviderRegistry:
+    adapters = []
+    if github_client is not None:
+        adapters.append(GitHubAdapter(github_client))
+    if gitlab_client is not None:
+        adapters.append(GitLabAdapter(gitlab_client))
+    return ProviderRegistry(adapters)
 
 
 async def acquire_next_review_run(
@@ -118,10 +127,15 @@ async def process_next_agent_task(
     worker_id: str,
     github_client: GitHubClient | None = None,
     gitlab_client: GitLabClient | None = None,
+    provider_registry: ProviderRegistry | None = None,
 ) -> AgentTask | None:
     task = await acquire_next_agent_task(session, worker_id=worker_id)
     if task is None:
         return None
+    registry = provider_registry or build_worker_provider_registry(
+        github_client=github_client,
+        gitlab_client=gitlab_client,
+    )
 
     try:
         context = await _task_context(session, task)
@@ -130,8 +144,7 @@ async def process_next_agent_task(
                 context = await _hydrate_task_context(
                     session,
                     task,
-                    github_client=github_client,
-                    gitlab_client=gitlab_client,
+                    provider_registry=registry,
                 )
             except (GitHubClientError, GitLabClientError) as exc:
                 return await _fail_agent_task(
@@ -288,6 +301,7 @@ async def process_next_review_run(
     worker_id: str,
     github_client: GitHubClient | None = None,
     gitlab_client: GitLabClient | None = None,
+    provider_registry: ProviderRegistry | None = None,
 ) -> ReviewRun | None:
     review_run = await acquire_next_review_run(
         session,
@@ -296,6 +310,10 @@ async def process_next_review_run(
     )
     if review_run is None:
         return None
+    registry = provider_registry or build_worker_provider_registry(
+        github_client=github_client,
+        gitlab_client=gitlab_client,
+    )
 
     release_lock = True
     try:
@@ -305,6 +323,7 @@ async def process_next_review_run(
                 review_run,
                 github_client=github_client,
                 gitlab_client=gitlab_client,
+                provider_registry=registry,
                 status_text="reviewing",
             )
         context = await _review_run_context(session, review_run)
@@ -322,6 +341,7 @@ async def process_next_review_run(
                 review_run,
                 github_client=github_client,
                 gitlab_client=gitlab_client,
+                provider_registry=registry,
                 status_text="failed",
             )
             return review_run
@@ -345,6 +365,7 @@ async def process_next_review_run(
                     review_run,
                     github_client=github_client,
                     gitlab_client=gitlab_client,
+                    provider_registry=registry,
                     status_text="failed",
                 )
                 return review_run
@@ -360,6 +381,7 @@ async def process_next_review_run(
                     review_run,
                     github_client=github_client,
                     gitlab_client=gitlab_client,
+                    provider_registry=registry,
                     status_text="failed",
                 )
                 return review_run
@@ -384,6 +406,7 @@ async def process_next_review_run(
                     review_run,
                     github_client=github_client,
                     gitlab_client=gitlab_client,
+                    provider_registry=registry,
                     status_text="failed",
                 )
                 return review_run
@@ -398,6 +421,7 @@ async def process_next_review_run(
                 review_run,
                 github_client=github_client,
                 gitlab_client=gitlab_client,
+                provider_registry=registry,
                 status_text="failed",
             )
             return review_run
@@ -418,9 +442,9 @@ async def process_next_review_run(
             return review_run
 
         changed_files = await _fetch_changed_files(
+            session,
             review_run,
-            github_client=github_client,
-            gitlab_client=gitlab_client,
+            provider_registry=registry,
         )
         try:
             await collect_review_result(
@@ -444,6 +468,7 @@ async def process_next_review_run(
                 review_run,
                 github_client=github_client,
                 gitlab_client=gitlab_client,
+                provider_registry=registry,
                 status_text="failed",
             )
             return review_run
@@ -452,29 +477,20 @@ async def process_next_review_run(
             provider=review_run.provider,
             repo_full_name=review_run.repo_full_name,
         )
-        if github_client is not None and review_run.provider == "github":
-            await publish_github_summary_comment(
+        adapter = registry.get(review_run.provider)
+        if adapter is not None:
+            await adapter.publish_summary_comment(
                 session,
                 review_run,
-                github_client=github_client,
                 status_text="completed",
                 finding_stats=review_run.finding_count_by_severity,
             )
             if config.line_comments_enabled:
-                await publish_github_line_comments(
+                await adapter.publish_line_comments(
                     session,
                     review_run,
-                    github_client=github_client,
                     changed_files=changed_files,
                 )
-        if gitlab_client is not None and review_run.provider == "gitlab":
-            await publish_gitlab_summary_comment(
-                session,
-                review_run,
-                gitlab_client=gitlab_client,
-                status_text="completed",
-                finding_stats=review_run.finding_count_by_severity,
-            )
         return await session.get(ReviewRun, review_run.id)
     except Exception as exc:
         review_run.status = "failed"
@@ -489,6 +505,7 @@ async def process_next_review_run(
             review_run,
             github_client=github_client,
             gitlab_client=gitlab_client,
+            provider_registry=registry,
             status_text="failed",
         )
         return review_run
@@ -512,9 +529,14 @@ async def process_review_run_timeouts(
     openhands_client: OpenHandsClient,
     github_client: GitHubClient | None = None,
     gitlab_client: GitLabClient | None = None,
+    provider_registry: ProviderRegistry | None = None,
     now: datetime | None = None,
 ) -> list[ReviewRun]:
     now = now or utc_now()
+    registry = provider_registry or build_worker_provider_registry(
+        github_client=github_client,
+        gitlab_client=gitlab_client,
+    )
     result = await session.execute(
         select(ReviewRun).where(
             ReviewRun.status.in_(WORKER_ACTIVE_STATUSES),
@@ -547,6 +569,7 @@ async def process_review_run_timeouts(
                 refreshed,
                 github_client=github_client,
                 gitlab_client=gitlab_client,
+                provider_registry=registry,
                 status_text="failed",
             )
             touched.append(refreshed)
@@ -570,6 +593,7 @@ async def process_review_run_timeouts(
                 refreshed,
                 github_client=github_client,
                 gitlab_client=gitlab_client,
+                provider_registry=registry,
                 status_text="delayed",
             )
             touched.append(refreshed)
@@ -582,28 +606,24 @@ async def publish_review_run_status_comment(
     *,
     github_client: GitHubClient | None,
     gitlab_client: GitLabClient | None,
+    provider_registry: ProviderRegistry | None = None,
     status_text: str,
 ) -> None:
     original_failure_code = review_run.failure_code
     original_error = review_run.error
-    if github_client is not None and review_run.provider == "github":
-        await publish_github_summary_comment(
-            session,
-            review_run,
-            github_client=github_client,
-            status_text=status_text,
-            finding_stats=review_run.finding_count_by_severity,
-        )
-    elif gitlab_client is not None and review_run.provider == "gitlab":
-        await publish_gitlab_summary_comment(
-            session,
-            review_run,
-            gitlab_client=gitlab_client,
-            status_text=status_text,
-            finding_stats=review_run.finding_count_by_severity,
-        )
-    else:
+    registry = provider_registry or build_worker_provider_registry(
+        github_client=github_client,
+        gitlab_client=gitlab_client,
+    )
+    adapter = registry.get(review_run.provider)
+    if adapter is None:
         return
+    await adapter.publish_summary_comment(
+        session,
+        review_run,
+        status_text=status_text,
+        finding_stats=review_run.finding_count_by_severity,
+    )
 
     await session.refresh(review_run)
     if original_failure_code and review_run.failure_code != original_failure_code:
@@ -821,22 +841,13 @@ async def _hydrate_task_context(
     session: AsyncSession,
     task: AgentTask,
     *,
-    github_client: GitHubClient | None,
-    gitlab_client: GitLabClient | None,
+    provider_registry: ProviderRegistry,
 ) -> PullRequestContext | None:
-    if task.provider == "github" and github_client is not None:
-        pull_request = await github_client.get_pull_request(
-            task.repo_full_name,
-            task.pull_request_number,
-        )
-        context = _context_from_github_pull_request(task, pull_request)
-    elif task.provider == "gitlab" and gitlab_client is not None:
-        merge_request = await gitlab_client.get_merge_request(
-            task.repo_full_name,
-            task.pull_request_number,
-        )
-        context = _context_from_gitlab_merge_request(task, merge_request)
-    else:
+    adapter = provider_registry.get(task.provider)
+    if adapter is None:
+        return None
+    context = await adapter.get_pull_request_context(task)
+    if context is None:
         return None
 
     session.add(context)
@@ -848,81 +859,18 @@ async def _hydrate_task_context(
     await session.refresh(task)
     return context
 
-
-def _context_from_github_pull_request(
-    task: AgentTask,
-    pull_request: dict[str, Any],
-) -> PullRequestContext:
-    base = pull_request.get("base") if isinstance(pull_request, dict) else None
-    head = pull_request.get("head") if isinstance(pull_request, dict) else None
-    base_repo = base.get("repo") if isinstance(base, dict) else None
-    head_repo = head.get("repo") if isinstance(head, dict) else None
-    head_repo_full_name = _repo_full_name(head_repo)
-    base_repo_full_name = _repo_full_name(base_repo)
-    return PullRequestContext(
-        provider=task.provider,
-        repo_full_name=task.repo_full_name,
-        pull_request_number=task.pull_request_number,
-        provider_pr_id=_id_to_str(pull_request.get("id")),
-        title=_str_or_none(pull_request.get("title")),
-        author_login=_login(pull_request.get("user")),
-        base_ref=_ref(base),
-        base_sha=_sha(base),
-        head_ref=_ref(head),
-        head_sha=_sha(head) or "",
-        head_repo_full_name=head_repo_full_name,
-        is_fork=bool(
-            head_repo_full_name and head_repo_full_name != base_repo_full_name
-        ),
-        status=_str_or_none(pull_request.get("state")) or "open",
-        html_url=_str_or_none(pull_request.get("html_url")),
-    )
-
-
-def _context_from_gitlab_merge_request(
-    task: AgentTask,
-    merge_request: dict[str, Any],
-) -> PullRequestContext:
-    return PullRequestContext(
-        provider=task.provider,
-        repo_full_name=task.repo_full_name,
-        pull_request_number=task.pull_request_number,
-        provider_pr_id=_id_to_str(merge_request.get("id")),
-        title=_str_or_none(merge_request.get("title")),
-        author_login=_gitlab_author(merge_request.get("author")),
-        base_ref=_str_or_none(merge_request.get("target_branch")),
-        base_sha=_str_or_none(merge_request.get("diff_refs", {}).get("base_sha"))
-        if isinstance(merge_request.get("diff_refs"), dict)
-        else None,
-        head_ref=_str_or_none(merge_request.get("source_branch")),
-        head_sha=_str_or_none(merge_request.get("sha")) or "",
-        head_repo_full_name=task.repo_full_name,
-        is_fork=False,
-        status=_str_or_none(merge_request.get("state")) or "opened",
-        html_url=_str_or_none(merge_request.get("web_url")),
-    )
-
-
 async def _fetch_changed_files(
+    session: AsyncSession,
     review_run: ReviewRun,
     *,
-    github_client: GitHubClient | None,
-    gitlab_client: GitLabClient | None,
-):
+    provider_registry: ProviderRegistry,
+) -> list[Any]:
     try:
-        if review_run.provider == "github" and github_client is not None:
-            return await fetch_changed_files(
-                github_client,
-                repo_full_name=review_run.repo_full_name,
-                pull_request_number=review_run.pull_request_number,
-            )
-        if review_run.provider == "gitlab" and gitlab_client is not None:
-            return await fetch_gitlab_changed_files(
-                gitlab_client,
-                project_path=review_run.repo_full_name,
-                merge_request_iid=review_run.pull_request_number,
-            )
-    except (GitHubClientError, GitLabClientError) as exc:
+        adapter = provider_registry.get(review_run.provider)
+        if adapter is None:
+            return []
+        return await adapter.list_changed_files(review_run)
+    except (GitHubClientError, GitLabClientError, ProviderCapabilityError) as exc:
         warnings = list(review_run.validation_warnings_json or [])
         warnings.append(
             {
@@ -931,6 +879,9 @@ async def _fetch_changed_files(
             }
         )
         review_run.validation_warnings_json = warnings
+        session.add(review_run)
+        await session.commit()
+        await session.refresh(review_run)
     return []
 
 
@@ -1018,39 +969,3 @@ def _loads_json(text: str) -> Any:
 
 def _str_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
-
-
-def _id_to_str(value: Any) -> str | None:
-    if isinstance(value, int | str):
-        return str(value)
-    return None
-
-
-def _sha(ref_object: Any) -> str | None:
-    if not isinstance(ref_object, dict):
-        return None
-    return _str_or_none(ref_object.get("sha"))
-
-
-def _ref(ref_object: Any) -> str | None:
-    if not isinstance(ref_object, dict):
-        return None
-    return _str_or_none(ref_object.get("ref"))
-
-
-def _repo_full_name(repo: Any) -> str | None:
-    if not isinstance(repo, dict):
-        return None
-    return _str_or_none(repo.get("full_name"))
-
-
-def _login(user: Any) -> str | None:
-    if not isinstance(user, dict):
-        return None
-    return _str_or_none(user.get("login"))
-
-
-def _gitlab_author(author: Any) -> str | None:
-    if not isinstance(author, dict):
-        return None
-    return _str_or_none(author.get("username")) or _str_or_none(author.get("name"))

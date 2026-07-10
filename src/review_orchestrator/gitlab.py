@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict
 from review_orchestrator.github import parse_commentable_lines
 from review_orchestrator.providers import (
     ParsedProviderWebhook,
+    ProviderCapabilityError,
     ProviderPayloadError,
     ProviderSignatureError,
     ProviderWebhookEvent,
@@ -178,6 +179,9 @@ async def fetch_gitlab_changed_files(
 class GitLabAdapter:
     provider = "gitlab"
 
+    def __init__(self, client: GitLabClient | None = None) -> None:
+        self.client = client
+
     def parse_webhook(
         self,
         *,
@@ -209,6 +213,53 @@ class GitLabAdapter:
             payload=payload,
             raw_body=raw_body,
         )
+
+    async def get_pull_request_context(self, task) -> Any:
+        if self.client is None:
+            raise ProviderCapabilityError("GitLab client is not configured.")
+        merge_request = await self.client.get_merge_request(
+            task.repo_full_name,
+            task.pull_request_number,
+        )
+        return context_from_merge_request_task(task, merge_request)
+
+    async def list_changed_files(self, review_run) -> list[ChangedFile]:
+        if self.client is None:
+            raise ProviderCapabilityError("GitLab client is not configured.")
+        return await fetch_gitlab_changed_files(
+            self.client,
+            project_path=review_run.repo_full_name,
+            merge_request_iid=review_run.pull_request_number,
+        )
+
+    async def publish_summary_comment(
+        self,
+        session,
+        review_run,
+        *,
+        status_text: str,
+        finding_stats: dict[str, int] | None = None,
+    ) -> Any:
+        if self.client is None:
+            raise ProviderCapabilityError("GitLab client is not configured.")
+        from review_orchestrator.comments import publish_gitlab_summary_comment
+
+        return await publish_gitlab_summary_comment(
+            session,
+            review_run,
+            gitlab_client=self.client,
+            status_text=status_text,
+            finding_stats=finding_stats,
+        )
+
+    async def publish_line_comments(
+        self,
+        session,
+        review_run,
+        *,
+        changed_files: list[ChangedFile],
+    ) -> dict[str, int]:
+        return {"published": 0, "summary_only": 0, "deduped": 0, "failed": 0}
 
 
 def normalize_gitlab_event(
@@ -297,6 +348,41 @@ def _int_or_none(value: Any) -> int | None:
 
 def _quoted(value: str) -> str:
     return quote(value, safe="")
+
+
+def context_from_merge_request_task(task: Any, merge_request: dict[str, Any]) -> Any:
+    from review_orchestrator.models import PullRequestContext
+
+    return PullRequestContext(
+        provider=task.provider,
+        repo_full_name=task.repo_full_name,
+        pull_request_number=task.pull_request_number,
+        provider_pr_id=_id_to_str(merge_request.get("id")),
+        title=_optional_str(merge_request.get("title")),
+        author_login=_gitlab_author(merge_request.get("author")),
+        base_ref=_optional_str(merge_request.get("target_branch")),
+        base_sha=_optional_str(merge_request.get("diff_refs", {}).get("base_sha"))
+        if isinstance(merge_request.get("diff_refs"), dict)
+        else None,
+        head_ref=_optional_str(merge_request.get("source_branch")),
+        head_sha=_optional_str(merge_request.get("sha")) or "",
+        head_repo_full_name=task.repo_full_name,
+        is_fork=False,
+        status=_optional_str(merge_request.get("state")) or "opened",
+        html_url=_optional_str(merge_request.get("web_url")),
+    )
+
+
+def _id_to_str(value: Any) -> str | None:
+    if isinstance(value, int | str):
+        return str(value)
+    return None
+
+
+def _gitlab_author(author: Any) -> str | None:
+    if not isinstance(author, dict):
+        return None
+    return _optional_str(author.get("username")) or _optional_str(author.get("name"))
 
 
 def _source_commit_changed(attrs: dict[str, Any]) -> bool:

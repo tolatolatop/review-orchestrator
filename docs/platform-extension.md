@@ -80,44 +80,49 @@ The minimum adapter contract for a new review-triggering provider is:
 
 ```python
 class ProviderAdapter(Protocol):
-    name: str
+    provider: str
 
-    async def parse_webhook(
+    def parse_webhook(
         self,
-        headers: Mapping[str, str],
-        body: bytes,
-    ) -> ProviderWebhookEvent: ...
+        *,
+        headers: dict[str, str],
+        raw_body: bytes,
+        settings: Any,
+    ) -> ParsedProviderWebhook: ...
 
     async def get_pull_request_context(
         self,
-        event: ProviderWebhookEvent,
-    ) -> ProviderPullRequestContext: ...
+        task: AgentTask,
+    ) -> PullRequestContext | None: ...
 
     async def list_changed_files(
         self,
-        context: ProviderPullRequestContext,
-    ) -> list[ProviderChangedFile]: ...
+        review_run: ReviewRun,
+    ) -> list[ChangedFile]: ...
 
-    async def upsert_summary_comment(
+    async def publish_summary_comment(
         self,
-        context: ProviderPullRequestContext,
-        body: str,
-        existing_provider_comment_id: str | None,
-    ) -> ProviderCommentRef: ...
+        session: AsyncSession,
+        review_run: ReviewRun,
+        *,
+        status_text: str,
+        finding_stats: dict[str, int] | None = None,
+    ) -> Any: ...
 
-    async def create_line_comment(
+    async def publish_line_comments(
         self,
-        context: ProviderPullRequestContext,
-        finding: PublishableFinding,
-        body: str,
-    ) -> ProviderCommentRef: ...
+        session: AsyncSession,
+        review_run: ReviewRun,
+        *,
+        changed_files: list[ChangedFile],
+    ) -> dict[str, int]: ...
 ```
 
-Only `parse_webhook` and `get_pull_request_context` are required for a provider
-that can queue review runs. `list_changed_files` is required before line-comment
-publishing is enabled. Summary and line comment publishing can be added
-incrementally behind `ReviewConfig.line_comments_enabled` and provider capability
-checks.
+`parse_webhook` is used by the API registry for webhook intake. Worker-side
+flows use the same adapter object for PR context hydration, changed-file lookup,
+summary publishing, and line comment publishing. Providers that do not support
+line comments yet should return zeroed publish stats from `publish_line_comments`
+and keep `ReviewConfig.line_comments_enabled` disabled for that provider.
 
 Use these internal data shapes regardless of external provider vocabulary:
 
