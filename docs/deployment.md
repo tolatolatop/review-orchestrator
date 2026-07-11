@@ -197,6 +197,12 @@ browser history, proxy logs, and analytics systems. GitHub webhooks cannot send
 this custom header, so `/api/v1/webhooks/github` is allowed through Nginx and
 must be protected by setting `GITHUB_WEBHOOK_SECRET`.
 
+The observability endpoints contain private repository and execution metadata.
+Read the dedicated [secure observability deployment and verification guide](observability-deployment.md)
+before exposing an operator UI or API. It documents the current route set,
+edge-authentication boundary, raw-payload behavior, redaction limitations, and
+the API/UI/webhook regression checklist.
+
 Recommended production settings:
 
 - Set `APP_ENV=production`.
