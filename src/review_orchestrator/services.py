@@ -521,6 +521,7 @@ async def collect_review_result(
 
     await persist_and_reconcile_findings(session, review_run, parsed)
     review_run.status = "completed"
+    review_run.stage = "completed"
     review_run.review_summary = parsed.result.summary
     review_run.failure_code = None
     review_run.error = None

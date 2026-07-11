@@ -707,6 +707,7 @@ async def test_changed_files_failure_degrades_to_summary_only_collection(
 
     assert processed is not None
     assert processed.status == "completed"
+    assert processed.stage == "completed"
     assert processed.review_summary == "Done."
     assert (
         processed.validation_warnings_json[0]["code"]
