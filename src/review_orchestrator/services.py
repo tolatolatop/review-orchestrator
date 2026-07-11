@@ -402,7 +402,12 @@ async def sync_review_session(
                 review_run.openhands_start_task_id
             )
         except OpenHandsClientError as exc:
-            return await _mark_failed(session, review_run, str(exc))
+            return await _mark_failed(
+                session,
+                review_run,
+                str(exc),
+                failure_code="openhands_infrastructure_error",
+            )
         if task.status == OpenHandsStartTaskStatus.error:
             return await _mark_failed(
                 session,
@@ -426,7 +431,12 @@ async def sync_review_session(
                 review_run.openhands_conversation_id
             )
         except OpenHandsClientError as exc:
-            return await _mark_failed(session, review_run, str(exc))
+            return await _mark_failed(
+                session,
+                review_run,
+                str(exc),
+                failure_code="openhands_infrastructure_error",
+            )
 
         if conversation.sandbox_status in {"ERROR", "MISSING"}:
             return await _mark_failed(
@@ -1802,6 +1812,7 @@ def _is_openhands_infrastructure_error(detail: str | None) -> bool:
             "sandbox server not running",
             "failed to start container",
             "port is already allocated",
+            "openhands request failed",
         )
     )
 

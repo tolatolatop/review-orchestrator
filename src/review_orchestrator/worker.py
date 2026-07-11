@@ -977,6 +977,33 @@ async def _schedule_openhands_start_retry(
         return False
 
     warnings = list(review_run.validation_warnings_json or [])
+    if review_run.openhands_conversation_id:
+        if not any(
+            isinstance(warning, dict)
+            and warning.get("code") == "openhands_session_retry"
+            for warning in warnings
+        ):
+            warnings.append(
+                {
+                    "code": "openhands_session_retry",
+                    "message": review_run.error
+                    or "OpenHands session request temporarily failed.",
+                }
+            )
+        review_run.status = "running"
+        review_run.stage = "waiting_for_result"
+        review_run.failure_code = None
+        review_run.error = None
+        review_run.validation_warnings_json = warnings
+        review_run.lock_owner = None
+        review_run.locked_until = utc_now() + timedelta(
+            seconds=settings.worker_poll_interval_seconds
+        )
+        session.add(review_run)
+        await session.commit()
+        await session.refresh(review_run)
+        return True
+
     retry_count = sum(
         1
         for warning in warnings
