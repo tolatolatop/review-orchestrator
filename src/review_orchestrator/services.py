@@ -408,6 +408,11 @@ async def sync_review_session(
                 session,
                 review_run,
                 task.detail or "OpenHands start task failed.",
+                failure_code=(
+                    "openhands_infrastructure_error"
+                    if _is_openhands_infrastructure_error(task.detail)
+                    else "openhands_error"
+                ),
             )
         if task.status == OpenHandsStartTaskStatus.ready:
             review_run.openhands_conversation_id = task.app_conversation_id
@@ -1784,6 +1789,21 @@ async def _mark_failed(
     await session.commit()
     await session.refresh(review_run)
     return review_run
+
+
+def _is_openhands_infrastructure_error(detail: str | None) -> bool:
+    if not detail:
+        return False
+    normalized = detail.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "coroutine raised stopiteration",
+            "sandbox server not running",
+            "failed to start container",
+            "port is already allocated",
+        )
+    )
 
 
 def _finding_count_by_severity(findings: list[Any]) -> dict[str, int]:

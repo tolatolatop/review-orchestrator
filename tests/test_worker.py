@@ -141,6 +141,16 @@ class StartFailingOpenHandsClient(FakeOpenHandsClient):
         raise OpenHandsClientError("OpenHands token invalid")
 
 
+class InfrastructureFailingOpenHandsClient(FakeOpenHandsClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.start_task = OpenHandsStartTask(
+            id="task-infra-failure",
+            status=OpenHandsStartTaskStatus.error,
+            detail="coroutine raised StopIteration",
+        )
+
+
 class FakeGitHubClient:
     def __init__(self) -> None:
         self.issue_comments = []
@@ -821,6 +831,133 @@ async def test_review_worker_publishes_failed_summary_on_openhands_start_failure
     assert "Review status: failed" in github_client.issue_comments[0].body
     assert "Failure category: openhands_error" in github_client.issue_comments[0].body
     assert "token [redacted]" in github_client.issue_comments[0].body
+
+
+async def test_review_worker_retries_transient_openhands_start_failure(
+    session_factory,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+        workspace_root=str(tmp_path / "workspaces"),
+        git_cache_root=str(tmp_path / "git-cache"),
+        retry_max_attempts=2,
+        retry_initial_delay_seconds=1,
+    )
+    github_client = FakeGitHubClient()
+    async with session_factory() as session:
+        context = PullRequestContext(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="open",
+        )
+        session.add(context)
+        await session.commit()
+        review_run = await create_review_run(
+            session,
+            ReviewRunCreate(
+                provider="github",
+                repo_full_name="example/repo",
+                pull_request_number=42,
+                base_sha="a" * 40,
+                head_sha="b" * 40,
+            ),
+        )
+        review_run.pull_request_context_id = context.id
+        review_run.workspace_path = str(tmp_path / "existing-workspace")
+        session.add(review_run)
+        await session.commit()
+
+        processed = await process_next_review_run(
+            session,
+            settings=settings,
+            openhands_client=InfrastructureFailingOpenHandsClient(),
+            worker_id="worker-1",
+            github_client=github_client,
+        )
+
+    assert processed is not None
+    assert processed.status == "running"
+    assert processed.stage == "retrying_openhands_start"
+    assert processed.openhands_start_task_id is None
+    assert processed.failure_code is None
+    assert processed.lock_owner is None
+    assert processed.locked_until is not None
+    assert processed.validation_warnings_json == [
+        {
+            "code": "openhands_start_retry",
+            "message": "coroutine raised StopIteration",
+            "retry": 1,
+            "start_task_id": "task-infra-failure",
+        }
+    ]
+    assert len(github_client.issue_comments) == 1
+    assert "Review status: reviewing" in github_client.issue_comments[0].body
+
+
+async def test_review_worker_fails_after_openhands_start_retries_are_exhausted(
+    session_factory,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+        workspace_root=str(tmp_path / "workspaces"),
+        git_cache_root=str(tmp_path / "git-cache"),
+        retry_max_attempts=2,
+        retry_initial_delay_seconds=1,
+    )
+    github_client = FakeGitHubClient()
+    async with session_factory() as session:
+        context = PullRequestContext(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="open",
+        )
+        session.add(context)
+        await session.commit()
+        review_run = await create_review_run(
+            session,
+            ReviewRunCreate(
+                provider="github",
+                repo_full_name="example/repo",
+                pull_request_number=42,
+                base_sha="a" * 40,
+                head_sha="b" * 40,
+            ),
+        )
+        review_run.pull_request_context_id = context.id
+        review_run.workspace_path = str(tmp_path / "existing-workspace")
+        review_run.validation_warnings_json = [
+            {"code": "openhands_start_retry", "retry": 1},
+            {"code": "openhands_start_retry", "retry": 2},
+        ]
+        session.add(review_run)
+        await session.commit()
+
+        processed = await process_next_review_run(
+            session,
+            settings=settings,
+            openhands_client=InfrastructureFailingOpenHandsClient(),
+            worker_id="worker-1",
+            github_client=github_client,
+        )
+
+    assert processed is not None
+    assert processed.status == "failed"
+    assert processed.failure_code == "openhands_infrastructure_error"
+    assert processed.error == "coroutine raised StopIteration"
+    assert len(github_client.issue_comments) == 1
+    assert "Review status: failed" in github_client.issue_comments[0].body
+    assert (
+        "Failure category: openhands_infrastructure_error"
+        in github_client.issue_comments[0].body
+    )
 
 
 async def test_review_worker_publishes_failed_summary_on_invalid_result(

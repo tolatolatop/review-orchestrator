@@ -393,6 +393,13 @@ async def process_next_review_run(
             openhands_client=openhands_client,
         )
         if review_run.status == "failed":
+            if await _schedule_openhands_start_retry(
+                session,
+                review_run,
+                settings=settings,
+            ):
+                release_lock = False
+                return review_run
             await publish_review_run_status_comment(
                 session,
                 review_run,
@@ -958,6 +965,52 @@ async def _extract_openhands_json_result(
             if _is_review_result_payload(parsed):
                 return parsed
     return None
+
+
+async def _schedule_openhands_start_retry(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    settings: Settings,
+) -> bool:
+    if review_run.failure_code != "openhands_infrastructure_error":
+        return False
+
+    warnings = list(review_run.validation_warnings_json or [])
+    retry_count = sum(
+        1
+        for warning in warnings
+        if isinstance(warning, dict)
+        and warning.get("code") == "openhands_start_retry"
+    )
+    if retry_count >= settings.retry_max_attempts:
+        return False
+
+    retry_number = retry_count + 1
+    delay_seconds = settings.retry_initial_delay_seconds * (2**retry_count)
+    warnings.append(
+        {
+            "code": "openhands_start_retry",
+            "message": review_run.error or "OpenHands infrastructure start failure.",
+            "retry": retry_number,
+            "start_task_id": review_run.openhands_start_task_id,
+        }
+    )
+    review_run.status = "running"
+    review_run.stage = "retrying_openhands_start"
+    review_run.openhands_start_task_id = None
+    review_run.openhands_conversation_id = None
+    review_run.openhands_sandbox_id = None
+    review_run.openhands_agent_server_url = None
+    review_run.failure_code = None
+    review_run.error = None
+    review_run.validation_warnings_json = warnings
+    review_run.lock_owner = None
+    review_run.locked_until = utc_now() + timedelta(seconds=delay_seconds)
+    session.add(review_run)
+    await session.commit()
+    await session.refresh(review_run)
+    return True
 
 
 def _is_review_result_payload(value: Any) -> bool:
