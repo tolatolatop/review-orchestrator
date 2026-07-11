@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     openhands_review_skill: str = "code-review"
     openhands_review_profile: str = "default"
     openhands_timeout_seconds: float = Field(
-        default=30.0,
+        default=120.0,
         gt=0,
         description="HTTP timeout for OpenHands App Server requests.",
     )
