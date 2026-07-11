@@ -14,3 +14,7 @@ def test_openhands_state_uses_the_configured_file_store_path() -> None:
     ) in compose
     assert "OH_SANDBOX_KIND: DockerSandboxServiceInjector" in compose
     assert '"host.docker.internal":"172.17.0.1"' in compose
+    assert (
+        '"172.17.0.1:${OPENHANDS_FRONTEND_PORT:-${OPENHANDS_PORT:-3000}}:3000"'
+        in compose
+    )

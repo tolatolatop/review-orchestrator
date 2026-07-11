@@ -29,6 +29,7 @@ services:
       OH_WEB_URL: ${OH_WEB_URL:-http://host.docker.internal:${OPENHANDS_FRONTEND_PORT:-${OPENHANDS_PORT:-3000}}}
     ports:
       - "127.0.0.1:${OPENHANDS_FRONTEND_PORT:-${OPENHANDS_PORT:-3000}}:3000"
+      - "172.17.0.1:${OPENHANDS_FRONTEND_PORT:-${OPENHANDS_PORT:-3000}}:3000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - openhands_state:/.openhands
