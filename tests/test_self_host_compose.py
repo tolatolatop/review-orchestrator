@@ -9,12 +9,9 @@ def test_openhands_state_uses_the_configured_file_store_path() -> None:
     assert "- openhands_state:/.openhands\n" in compose
     assert "- openhands_state:/.openhands-state\n" not in compose
     assert (
-        "SANDBOX_HOST_PORT: "
-        "${SANDBOX_HOST_PORT:-${REVIEW_PROXY_PORT:-18080}}"
+        "SANDBOX_HOST_PORT: ${SANDBOX_HOST_PORT:-3000}"
     ) in compose
     assert "OH_SANDBOX_KIND: DockerSandboxServiceInjector" in compose
-    assert '"host.docker.internal":"172.17.0.1"' in compose
-    assert (
-        '"172.17.0.1:${OPENHANDS_FRONTEND_PORT:-${OPENHANDS_PORT:-3000}}:3000"'
-        in compose
-    )
+    assert '"host.docker.internal":"172.28.0.10"' in compose
+    assert "ipv4_address: 172.28.0.10" in compose
+    assert "subnet: 172.28.0.0/24" in compose

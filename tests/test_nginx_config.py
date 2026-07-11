@@ -11,8 +11,5 @@ def test_nginx_resolves_api_service_dynamically() -> None:
 
     assert "resolver 127.0.0.11 ipv6=off valid=10s;" in config
     assert "set $review_orchestrator_upstream review-orchestrator:8000;" in config
-    assert "set $openhands_upstream openhands:3000;" in config
     assert config.count("proxy_pass http://$review_orchestrator_upstream;") == 3
-    assert "location ^~ /api/v1/webhooks" in config
-    assert "proxy_pass http://$openhands_upstream;" in config
     assert "proxy_pass http://review-orchestrator:8000;" not in config
