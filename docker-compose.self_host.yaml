@@ -28,7 +28,7 @@ services:
       - "127.0.0.1:${OPENHANDS_FRONTEND_PORT:-${OPENHANDS_PORT:-3000}}:3000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - openhands_state:/.openhands-state
+      - openhands_state:/.openhands
       - review_orchestrator_data:/var/lib/review-orchestrator
     extra_hosts:
       - "host.docker.internal:host-gateway"
