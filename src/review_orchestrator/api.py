@@ -144,6 +144,10 @@ async def accept_webhook(
 
 
 @router.get("/provider-events", response_model=ProviderEventInboxListResponse)
+@router.get(
+    "/observability/provider-events",
+    response_model=ProviderEventInboxListResponse,
+)
 async def list_provider_events_endpoint(
     provider: str | None = Query(default=None, min_length=1, max_length=64),
     repo_full_name: str | None = Query(default=None, min_length=1, max_length=512),
@@ -178,6 +182,10 @@ async def list_provider_events_endpoint(
 
 
 @router.get("/provider-events/{event_id}", response_model=ProviderEventInboxDetail)
+@router.get(
+    "/observability/provider-events/{event_id}",
+    response_model=ProviderEventInboxDetail,
+)
 async def get_provider_event_endpoint(
     event_id: str,
     include_payload: bool = False,
@@ -194,6 +202,7 @@ async def get_provider_event_endpoint(
 
 
 @router.get("/agent-tasks", response_model=AgentTaskListResponse)
+@router.get("/observability/agent-tasks", response_model=AgentTaskListResponse)
 async def list_agent_tasks_endpoint(
     status_filter: str | None = Query(
         default=None,
@@ -226,6 +235,7 @@ async def list_agent_tasks_endpoint(
 
 
 @router.get("/agent-tasks/{task_id}", response_model=AgentTaskDetail)
+@router.get("/observability/agent-tasks/{task_id}", response_model=AgentTaskDetail)
 async def get_agent_task_endpoint(
     task_id: str,
     session: AsyncSession = session_dependency,
@@ -249,6 +259,7 @@ async def create_review_run_endpoint(
 
 
 @router.get("/review-runs", response_model=ReviewRunListResponse)
+@router.get("/observability/review-runs", response_model=ReviewRunListResponse)
 async def list_review_runs_endpoint(
     provider: str | None = Query(default=None, min_length=1, max_length=64),
     repo_full_name: str | None = Query(default=None, min_length=1, max_length=512),
@@ -288,6 +299,10 @@ async def list_review_runs_endpoint(
 
 
 @router.get("/review-runs/{review_run_id}", response_model=ReviewRunDetail)
+@router.get(
+    "/observability/review-runs/{review_run_id}",
+    response_model=ReviewRunDetail,
+)
 async def get_review_run_endpoint(
     review_run_id: str,
     session: AsyncSession = session_dependency,

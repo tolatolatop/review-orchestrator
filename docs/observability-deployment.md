@@ -7,20 +7,20 @@ authentication and TLS.**
 
 ## Current Availability
 
-The current service exposes operator APIs, but does not mount a bundled HTML
-dashboard at `/dashboard/`. A separately deployed operator UI can consume:
+The service mounts its bundled operator dashboard at `/dashboard/`. It consumes
+the canonical observability APIs below from the same origin:
 
 | Purpose | Endpoint |
 | --- | --- |
-| Provider events | `GET /api/v1/provider-events[/{event_id}]` |
-| Agent tasks | `GET /api/v1/agent-tasks[/{task_id}]` |
-| Review runs | `GET /api/v1/review-runs[/{review_run_id}]` |
+| Provider events | `GET /api/v1/observability/provider-events[/{event_id}]` |
+| Agent tasks | `GET /api/v1/observability/agent-tasks[/{task_id}]` |
+| Review runs | `GET /api/v1/observability/review-runs[/{review_run_id}]` |
 | OpenHands by run | `GET /api/v1/observability/review-runs/{review_run_id}/openhands-session` |
 | OpenHands by conversation | `GET /api/v1/observability/openhands-sessions/{conversation_id}` |
 
-Do not publish a `/dashboard/` link until its UI artifact is mounted and the
-route is verified in the deployed release. See
-[observability-api.md](observability-api.md) for the API and redaction contract.
+The legacy paths without `/observability` remain compatible. Protect the
+dashboard and every API route with the same operator authentication boundary.
+See [observability-api.md](observability-api.md) for the API and redaction contract.
 
 ## Recommended Self-host Topology
 
@@ -123,7 +123,7 @@ Run these checks from outside the private service network against Nginx/ingress.
 uv run pytest tests/test_observability.py tests/test_api.py
 ```
 
-### UI (when an artifact is added)
+### UI
 
 - The route is `401` without auth and loads only after authentication.
 - Overview, event, run, task, and session views handle loading, empty, API
@@ -155,4 +155,3 @@ The Nginx exception currently covers GitHub only. If another provider must
 reach the stack, add an equally narrow provider webhook location and rely on
 that provider's configured signature/token validation; never make the full
 `/api/v1/` namespace public.
-

@@ -106,6 +106,52 @@ def json_body(payload: dict) -> bytes:
     return json.dumps(payload, separators=(",", ":")).encode()
 
 
+def test_bundled_dashboard_is_mounted(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        redirect = client.get("/dashboard", follow_redirects=False)
+        response = client.get("/dashboard/")
+
+    assert redirect.status_code == 307
+    assert redirect.headers["location"] == "/dashboard/"
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Review operations" in response.text
+    assert "/api/v1/observability" in response.text
+
+
+def test_observability_list_aliases_are_available(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        for resource in ("provider-events", "review-runs", "agent-tasks"):
+            response = client.get(f"/api/v1/observability/{resource}")
+            assert response.status_code == 200
+            assert response.json()["items"] == []
+
+
+def test_observability_detail_aliases_match_legacy_routes(tmp_path: Path) -> None:
+    payload = pull_request_payload(action="opened")
+    body = json_body(payload)
+    with make_signed_client(tmp_path) as client:
+        accepted = client.post(
+            "/api/v1/webhooks/github",
+            content=body,
+            headers=github_headers(body, delivery_id="alias-detail"),
+        ).json()
+        resources = {
+            "provider-events": accepted["delivery_id"],
+            "review-runs": accepted["review_run_id"],
+        }
+        event = client.get(
+            "/api/v1/observability/provider-events",
+            params={"delivery_id": resources["provider-events"]},
+        ).json()["items"][0]
+        resources["provider-events"] = event["id"]
+        for resource, item_id in resources.items():
+            alias = client.get(f"/api/v1/observability/{resource}/{item_id}")
+            legacy = client.get(f"/api/v1/{resource}/{item_id}")
+            assert alias.status_code == 200
+            assert alias.json() == legacy.json()
+
+
 async def create_agent_task_record(
     client: TestClient,
     *,

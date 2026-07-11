@@ -1,9 +1,7 @@
 # Review Observability API Contract
 
 This document defines the backend contract for operator-facing review
-observability APIs. It is intentionally a contract for future endpoints, plus
-the shared response and redaction model that current and future endpoints must
-reuse.
+observability APIs used by the bundled `/dashboard/` console.
 
 ## Goals
 
@@ -23,14 +21,14 @@ All new operator observability endpoints live under:
 /api/v1/observability
 ```
 
-Existing MVP event endpoints remain supported:
+Legacy MVP endpoints remain supported as compatibility aliases:
 
 ```text
 GET /api/v1/provider-events
 GET /api/v1/provider-events/{event_id}?include_payload=false
 ```
 
-Future observability routes should use these paths:
+Operator clients should use these paths:
 
 | Route | Purpose |
 | --- | --- |
