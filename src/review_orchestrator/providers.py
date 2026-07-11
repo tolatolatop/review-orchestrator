@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from review_orchestrator.models import AgentTask, PullRequestContext, ReviewRun
+    from review_orchestrator.models import (
+        AgentTask,
+        PullRequestContext,
+        ReviewCommentRef,
+        ReviewRun,
+    )
     from review_orchestrator.review_results import ChangedFile
 
 
@@ -86,7 +91,7 @@ class ProviderAdapter(Protocol):
         *,
         status_text: str,
         finding_stats: dict[str, int] | None = None,
-    ) -> Any:
+    ) -> ReviewCommentRef | None:
         ...
 
     async def publish_line_comments(

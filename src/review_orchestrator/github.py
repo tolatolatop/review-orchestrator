@@ -5,11 +5,22 @@ import hmac
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy import select
 
+from review_orchestrator.comments import (
+    SUMMARY_MARKER,
+    _existing_line_ref,
+    _existing_summary_ref_with_body,
+    _line_comment_body,
+    build_summary_comment_body,
+    ensure_line_comment_ref,
+    upsert_summary_comment_ref,
+)
+from review_orchestrator.models import Finding
 from review_orchestrator.providers import (
     ParsedProviderWebhook,
     ProviderCapabilityError,
@@ -20,6 +31,16 @@ from review_orchestrator.providers import (
     lower_headers,
 )
 from review_orchestrator.review_results import ChangedFile
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from review_orchestrator.models import (
+        AgentTask,
+        PullRequestContext,
+        ReviewCommentRef,
+        ReviewRun,
+    )
 
 
 class GitHubWebhookError(ProviderWebhookError):
@@ -102,18 +123,22 @@ class GitHubAdapter:
             raw_body=raw_body,
         )
 
-    async def get_pull_request_context(self, task) -> Any:
+    async def get_pull_request_context(
+        self, task: AgentTask,
+    ) -> PullRequestContext | None:
         if self.client is None:
-            raise ProviderCapabilityError("GitHub client is not configured.")
+            _msg = "GitHub client is not configured."
+            raise ProviderCapabilityError(_msg)
         pull_request = await self.client.get_pull_request(
             task.repo_full_name,
             task.pull_request_number,
         )
         return context_from_pull_request_task(task, pull_request)
 
-    async def list_changed_files(self, review_run) -> list[ChangedFile]:
+    async def list_changed_files(self, review_run: ReviewRun) -> list[ChangedFile]:
         if self.client is None:
-            raise ProviderCapabilityError("GitHub client is not configured.")
+            _msg = "GitHub client is not configured."
+            raise ProviderCapabilityError(_msg)
         return await fetch_changed_files(
             self.client,
             repo_full_name=review_run.repo_full_name,
@@ -122,17 +147,17 @@ class GitHubAdapter:
 
     async def publish_summary_comment(
         self,
-        session,
-        review_run,
+        session: AsyncSession,
+        review_run: ReviewRun,
         *,
         status_text: str,
         finding_stats: dict[str, int] | None = None,
-    ) -> Any:
+    ) -> ReviewCommentRef | None:
         if self.client is None:
-            raise ProviderCapabilityError("GitHub client is not configured.")
-        from review_orchestrator.comments import publish_github_summary_comment
+            _msg = "GitHub client is not configured."
+            raise ProviderCapabilityError(_msg)
 
-        return await publish_github_summary_comment(
+        return await _publish_github_summary_comment(
             session,
             review_run,
             github_client=self.client,
@@ -142,16 +167,16 @@ class GitHubAdapter:
 
     async def publish_line_comments(
         self,
-        session,
-        review_run,
+        session: AsyncSession,
+        review_run: ReviewRun,
         *,
         changed_files: list[ChangedFile],
     ) -> dict[str, int]:
         if self.client is None:
-            raise ProviderCapabilityError("GitHub client is not configured.")
-        from review_orchestrator.comments import publish_github_line_comments
+            _msg = "GitHub client is not configured."
+            raise ProviderCapabilityError(_msg)
 
-        return await publish_github_line_comments(
+        return await _publish_github_line_comments(
             session,
             review_run,
             github_client=self.client,
@@ -188,7 +213,7 @@ class GitHubClient:
         pull_request_number: int,
     ) -> list[dict[str, Any]]:
         return await self._paginate(
-            f"/repos/{repo_full_name}/pulls/{pull_request_number}/files"
+            f"/repos/{repo_full_name}/pulls/{pull_request_number}/files",
         )
 
     async def get_pull_request(
@@ -210,7 +235,7 @@ class GitHubClient:
         pull_request_number: int,
     ) -> list[GitHubComment]:
         items = await self._paginate(
-            f"/repos/{repo_full_name}/issues/{pull_request_number}/comments"
+            f"/repos/{repo_full_name}/issues/{pull_request_number}/comments",
         )
         return [GitHubComment.model_validate(item) for item in items]
 
@@ -268,7 +293,7 @@ class GitHubClient:
         items: list[dict[str, Any]] = []
         while True:
             response = await self._request(
-                "GET", path, params={"per_page": 100, "page": page}
+                "GET", path, params={"per_page": 100, "page": page},
             )
             if not isinstance(response, list):
                 raise GitHubClientError(f"GitHub response for {path} is not a list.")
@@ -302,11 +327,11 @@ class GitHubClient:
         except httpx.HTTPStatusError as exc:
             raise GitHubClientError(
                 f"GitHub request failed ({exc.response.status_code} {method} {path}): "
-                f"{exc.response.text[:500]}"
+                f"{exc.response.text[:500]}",
             ) from exc
         except httpx.RequestError as exc:
             raise GitHubClientError(
-                f"GitHub request failed ({method} {path}): {exc}"
+                f"GitHub request failed ({method} {path}): {exc}",
             ) from exc
         return response.json() if response.content else {}
 
@@ -327,7 +352,7 @@ async def fetch_changed_files(
             ChangedFile(
                 path=filename,
                 commentable_lines=parse_commentable_lines(item.get("patch")),
-            )
+            ),
         )
     return changed_files
 
@@ -366,7 +391,10 @@ def _parse_hunk_new_start(header: str) -> int | None:
         return None
 
 
-def context_from_pull_request_task(task: Any, pull_request: dict[str, Any]) -> Any:
+def context_from_pull_request_task(
+    task: AgentTask,
+    pull_request: dict[str, object],
+) -> PullRequestContext:
     from review_orchestrator.models import PullRequestContext
 
     base = pull_request.get("base") if isinstance(pull_request, dict) else None
@@ -388,42 +416,235 @@ def context_from_pull_request_task(task: Any, pull_request: dict[str, Any]) -> A
         head_sha=_sha(head) or "",
         head_repo_full_name=head_repo_full_name,
         is_fork=bool(
-            head_repo_full_name and head_repo_full_name != base_repo_full_name
+            head_repo_full_name and head_repo_full_name != base_repo_full_name,
         ),
         status=_optional_str(pull_request.get("state")) or "open",
         html_url=_optional_str(pull_request.get("html_url")),
     )
 
 
-def _id_to_str(value: Any) -> str | None:
+def _id_to_str(value: object) -> str | None:
     if isinstance(value, int | str):
         return str(value)
     return None
 
 
-def _sha(ref_object: Any) -> str | None:
+def _sha(ref_object: object) -> str | None:
     if not isinstance(ref_object, dict):
         return None
     return _optional_str(ref_object.get("sha"))
 
 
-def _ref(ref_object: Any) -> str | None:
+def _ref(ref_object: object) -> str | None:
     if not isinstance(ref_object, dict):
         return None
     return _optional_str(ref_object.get("ref"))
 
 
-def _repo_full_name(repo: Any) -> str | None:
+def _repo_full_name(repo: object) -> str | None:
     if not isinstance(repo, dict):
         return None
     return _optional_str(repo.get("full_name"))
 
 
-def _login(user: Any) -> str | None:
+def _login(user: object) -> str | None:
     if not isinstance(user, dict):
         return None
     return _optional_str(user.get("login"))
 
+
+
+async def _publish_github_summary_comment(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    github_client: GitHubClient,
+    status_text: str,
+    finding_stats: dict[str, int] | None = None,
+) -> ReviewCommentRef | None:
+    body = build_summary_comment_body(
+        review_run,
+        status_text=status_text,
+        finding_stats=finding_stats,
+    )
+    existing_ref = await _existing_summary_ref_with_body(session, review_run, body)
+    if existing_ref is not None:
+        return existing_ref
+    try:
+        provider_comment_id = await _upsert_github_issue_comment(
+            github_client,
+            review_run,
+            body,
+        )
+    except GitHubClientError as exc:
+        review_run.failure_code = "provider_permission_denied"
+        review_run.error = str(exc)
+        session.add(review_run)
+        await session.commit()
+        return None
+    return await upsert_summary_comment_ref(
+        session,
+        review_run,
+        provider_comment_id=provider_comment_id,
+        body=body,
+    )
+
+
+async def _publish_github_line_comments(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    github_client: GitHubClient,
+    changed_files: list[ChangedFile],
+) -> dict[str, int]:
+    commentable = {item.path: item.commentable_lines for item in changed_files}
+    result = await session.execute(
+        select(Finding).where(
+            Finding.review_run_id == review_run.id,
+            Finding.status == "active",
+        )
+    )
+    stats = {"published": 0, "summary_only": 0, "deduped": 0, "failed": 0}
+    for finding in result.scalars().all():
+        line = finding.line_start
+        file_lines = commentable.get(finding.file_path)
+        if (
+            line is None
+            or file_lines is None
+            or not file_lines
+            or line not in file_lines
+        ):
+            stats["summary_only"] += 1
+            continue
+
+        body = _line_comment_body(finding)
+        existing = await _existing_line_ref(session, finding)
+        if existing is not None:
+            stats["deduped"] += 1
+            continue
+        try:
+            provider_comment_id = await github_client.create_review_comment(
+                review_run.repo_full_name,
+                review_run.pull_request_number,
+                body=body,
+                commit_id=review_run.head_sha,
+                path=finding.file_path,
+                line=line,
+            )
+        except GitHubClientError as exc:
+            review_run.failure_code = "provider_permission_denied"
+            review_run.error = str(exc)
+            session.add(review_run)
+            await session.commit()
+            stats["failed"] += 1
+            continue
+        _, created = await ensure_line_comment_ref(
+            session,
+            review_run,
+            finding,
+            provider_comment_id=provider_comment_id,
+            body=body,
+        )
+        stats["published" if created else "deduped"] += 1
+    return stats
+
+
+async def _upsert_github_issue_comment(
+    github_client: GitHubClient,
+    review_run: ReviewRun,
+    body: str,
+) -> str:
+    if review_run.summary_comment_id:
+        return await github_client.update_issue_comment(
+            review_run.repo_full_name,
+            review_run.summary_comment_id,
+            body,
+        )
+
+    for comment in await github_client.list_issue_comments(
+        review_run.repo_full_name,
+        review_run.pull_request_number,
+    ):
+        if comment.body and SUMMARY_MARKER in comment.body:
+            return await github_client.update_issue_comment(
+                review_run.repo_full_name,
+                str(comment.id),
+                body,
+            )
+    return await github_client.create_issue_comment(
+        review_run.repo_full_name,
+        review_run.pull_request_number,
+        body,
+    )
+
+
+def extract_pull_request_identity_from_payload(
+    payload: dict[str, object],
+) -> dict[str, object] | None:
+    """Extract PR identity fields from a GitHub webhook payload."""
+    from datetime import datetime
+
+    pull_request = payload.get("pull_request")
+    repository = payload.get("repository")
+    if not isinstance(pull_request, dict) or not isinstance(repository, dict):
+        return None
+    repository_name = _optional_str(repository.get("full_name"))
+    pull_request_number = pull_request.get("number")
+    if not repository_name or not isinstance(pull_request_number, int):
+        return None
+    base = pull_request.get("base")
+    head = pull_request.get("head")
+    base_repo = base.get("repo") if isinstance(base, dict) else None
+    head_repo = head.get("repo") if isinstance(head, dict) else None
+
+    closed_at = pull_request.get("closed_at")
+    if isinstance(closed_at, str):
+        closed_at = datetime.fromisoformat(closed_at.replace("Z", "+00:00"))
+    else:
+        closed_at = None
+    merged_at = pull_request.get("merged_at")
+    if isinstance(merged_at, str):
+        merged_at = datetime.fromisoformat(merged_at.replace("Z", "+00:00"))
+    else:
+        merged_at = None
+
+    return {
+        "repository": repository_name,
+        "number": pull_request_number,
+        "provider_repo_id": _id_to_str(repository.get("id")),
+        "provider_pr_id": _id_to_str(pull_request.get("id")),
+        "title": _optional_str(pull_request.get("title")),
+        "author_login": _login(pull_request.get("user")),
+        "base_ref": _ref(base),
+        "base_sha": _sha(base),
+        "head_ref": _ref(head),
+        "head_sha": _head_sha_github(pull_request),
+        "base_repo_full_name": _repo_full_name(base_repo),
+        "head_repo_full_name": _repo_full_name(head_repo),
+        "status": _pull_request_status(pull_request),
+        "html_url": _optional_str(pull_request.get("html_url")),
+        "closed_at": closed_at,
+        "merged_at": merged_at,
+    }
+
+
+def _pull_request_status(pull_request: dict[str, object]) -> str:
+    if pull_request.get("merged") is True:
+        return "merged"
+    state = pull_request.get("state")
+    return state if isinstance(state, str) and state else "open"
+
+
+def _head_sha_github(pull_request: dict[str, object]) -> str | None:
+    head = pull_request.get("head")
+    if not isinstance(head, dict):
+        return None
+    return _optional_str(head.get("sha"))
+
+
+def get_github_clone_url(repo_full_name: str) -> str:
+    """Build a GitHub clone URL from a repository full name."""
+    return f"https://github.com/{repo_full_name}.git"
 
 PR_ACTIONS_TO_INTERNAL_EVENT = {
     "opened": "pr_opened",

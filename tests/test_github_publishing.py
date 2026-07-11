@@ -2,9 +2,9 @@ from pathlib import Path
 
 import pytest
 
-from review_orchestrator.comments import (
-    publish_github_line_comments,
-    publish_github_summary_comment,
+from review_orchestrator.github import (
+    _publish_github_line_comments as publish_github_line_comments,
+    _publish_github_summary_comment as publish_github_summary_comment,
 )
 from review_orchestrator.config import Settings
 from review_orchestrator.db import create_engine, create_session_factory, init_models

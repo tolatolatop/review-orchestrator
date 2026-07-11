@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel, ConfigDict
 
+from review_orchestrator.comments import (
+    SUMMARY_MARKER,
+    _existing_summary_ref_with_body,
+    build_summary_comment_body,
+    upsert_summary_comment_ref,
+)
 from review_orchestrator.github import parse_commentable_lines
 from review_orchestrator.providers import (
     ParsedProviderWebhook,
@@ -17,6 +23,16 @@ from review_orchestrator.providers import (
     lower_headers,
 )
 from review_orchestrator.review_results import ChangedFile
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from review_orchestrator.models import (
+        AgentTask,
+        PullRequestContext,
+        ReviewCommentRef,
+        ReviewRun,
+    )
 
 
 class GitLabClientError(RuntimeError):
@@ -74,7 +90,7 @@ class GitLabClient:
         merge_request_iid: int,
     ) -> list[GitLabNote]:
         items = await self._paginate(
-            f"/projects/{_quoted(project_path)}/merge_requests/{merge_request_iid}/notes"
+            f"/projects/{_quoted(project_path)}/merge_requests/{merge_request_iid}/notes",
         )
         return [GitLabNote.model_validate(item) for item in items]
 
@@ -110,7 +126,7 @@ class GitLabClient:
         items: list[dict[str, Any]] = []
         while True:
             response = await self._request(
-                "GET", path, params={"per_page": 100, "page": page}
+                "GET", path, params={"per_page": 100, "page": page},
             )
             if not isinstance(response, list):
                 raise GitLabClientError(f"GitLab response for {path} is not a list.")
@@ -141,11 +157,11 @@ class GitLabClient:
         except httpx.HTTPStatusError as exc:
             raise GitLabClientError(
                 f"GitLab request failed ({exc.response.status_code} {method} {path}): "
-                f"{exc.response.text[:500]}"
+                f"{exc.response.text[:500]}",
             ) from exc
         except httpx.RequestError as exc:
             raise GitLabClientError(
-                f"GitLab request failed ({method} {path}): {exc}"
+                f"GitLab request failed ({method} {path}): {exc}",
             ) from exc
         return response.json() if response.content else {}
 
@@ -171,7 +187,7 @@ async def fetch_gitlab_changed_files(
             ChangedFile(
                 path=path,
                 commentable_lines=parse_commentable_lines(item.get("diff")),
-            )
+            ),
         )
     return changed_files
 
@@ -214,18 +230,22 @@ class GitLabAdapter:
             raw_body=raw_body,
         )
 
-    async def get_pull_request_context(self, task) -> Any:
+    async def get_pull_request_context(
+        self, task: AgentTask,
+    ) -> PullRequestContext | None:
         if self.client is None:
-            raise ProviderCapabilityError("GitLab client is not configured.")
+            _msg = "GitLab client is not configured."
+            raise ProviderCapabilityError(_msg)
         merge_request = await self.client.get_merge_request(
             task.repo_full_name,
             task.pull_request_number,
         )
         return context_from_merge_request_task(task, merge_request)
 
-    async def list_changed_files(self, review_run) -> list[ChangedFile]:
+    async def list_changed_files(self, review_run: ReviewRun) -> list[ChangedFile]:
         if self.client is None:
-            raise ProviderCapabilityError("GitLab client is not configured.")
+            _msg = "GitLab client is not configured."
+            raise ProviderCapabilityError(_msg)
         return await fetch_gitlab_changed_files(
             self.client,
             project_path=review_run.repo_full_name,
@@ -234,17 +254,17 @@ class GitLabAdapter:
 
     async def publish_summary_comment(
         self,
-        session,
-        review_run,
+        session: AsyncSession,
+        review_run: ReviewRun,
         *,
         status_text: str,
         finding_stats: dict[str, int] | None = None,
-    ) -> Any:
+    ) -> ReviewCommentRef | None:
         if self.client is None:
-            raise ProviderCapabilityError("GitLab client is not configured.")
-        from review_orchestrator.comments import publish_gitlab_summary_comment
+            _msg = "GitLab client is not configured."
+            raise ProviderCapabilityError(_msg)
 
-        return await publish_gitlab_summary_comment(
+        return await _publish_gitlab_summary_comment(
             session,
             review_run,
             gitlab_client=self.client,
@@ -254,13 +274,150 @@ class GitLabAdapter:
 
     async def publish_line_comments(
         self,
-        session,
-        review_run,
+        session: AsyncSession,
+        review_run: ReviewRun,
         *,
         changed_files: list[ChangedFile],
-    ) -> dict[str, int]:
+    ) -> dict[str, int]:  # noqa: ARG002
         return {"published": 0, "summary_only": 0, "deduped": 0, "failed": 0}
 
+
+
+async def _publish_gitlab_summary_comment(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    gitlab_client: GitLabClient,
+    status_text: str,
+    finding_stats: dict[str, int] | None = None,
+) -> ReviewCommentRef | None:
+    body = build_summary_comment_body(
+        review_run,
+        status_text=status_text,
+        finding_stats=finding_stats,
+    )
+    existing_ref = await _existing_summary_ref_with_body(session, review_run, body)
+    if existing_ref is not None:
+        return existing_ref
+    try:
+        provider_comment_id = await _upsert_gitlab_note(
+            gitlab_client,
+            review_run,
+            body,
+        )
+    except GitLabClientError as exc:
+        review_run.failure_code = "provider_permission_denied"
+        review_run.error = str(exc)
+        session.add(review_run)
+        await session.commit()
+        return None
+    return await upsert_summary_comment_ref(
+        session,
+        review_run,
+        provider_comment_id=provider_comment_id,
+        body=body,
+    )
+
+
+async def _upsert_gitlab_note(
+    gitlab_client: GitLabClient,
+    review_run: ReviewRun,
+    body: str,
+) -> str:
+    if review_run.summary_comment_id:
+        return await gitlab_client.update_merge_request_note(
+            review_run.repo_full_name,
+            review_run.pull_request_number,
+            review_run.summary_comment_id,
+            body,
+        )
+
+    for note in await gitlab_client.list_merge_request_notes(
+        review_run.repo_full_name,
+        review_run.pull_request_number,
+    ):
+        if note.body and SUMMARY_MARKER in note.body:
+            return await gitlab_client.update_merge_request_note(
+                review_run.repo_full_name,
+                review_run.pull_request_number,
+                str(note.id),
+                body,
+            )
+    return await gitlab_client.create_merge_request_note(
+        review_run.repo_full_name,
+        review_run.pull_request_number,
+        body,
+    )
+
+
+def extract_pull_request_identity_from_payload(
+    payload: dict[str, object],
+) -> dict[str, object] | None:
+    """Extract MR identity fields from a GitLab webhook payload."""
+    from datetime import datetime
+
+    # event_name is available as payload key; not needed for extraction
+
+    attrs = payload.get("object_attributes")
+    project = payload.get("project")
+    if not isinstance(attrs, dict) or not isinstance(project, dict):
+        return None
+    repository_name = _optional_str(project.get("path_with_namespace"))
+    pull_request_number = attrs.get("iid")
+    head_sha = None
+    last_commit = attrs.get("last_commit")
+    if isinstance(last_commit, dict):
+        head_sha = _optional_str(last_commit.get("id"))
+    head_sha = head_sha or _optional_str(attrs.get("last_commit_id"))
+    if (
+        not repository_name
+        or not isinstance(pull_request_number, int)
+        or not head_sha
+    ):
+        return None
+    target = attrs.get("target")
+    source = attrs.get("source")
+
+    closed_at = attrs.get("closed_at")
+    if isinstance(closed_at, str):
+        closed_at = datetime.fromisoformat(closed_at.replace("Z", "+00:00"))
+    else:
+        closed_at = None
+    merged_at = attrs.get("merged_at")
+    if isinstance(merged_at, str):
+        merged_at = datetime.fromisoformat(merged_at.replace("Z", "+00:00"))
+    else:
+        merged_at = None
+
+    return {
+        "repository": repository_name,
+        "number": pull_request_number,
+        "provider_repo_id": _id_to_str(project.get("id")),
+        "provider_pr_id": _id_to_str(attrs.get("id")),
+        "title": _optional_str(attrs.get("title")),
+        "author_login": _gitlab_author(payload.get("user")),
+        "base_ref": _optional_str(attrs.get("target_branch")),
+        "base_sha": _optional_str(attrs.get("target_branch_sha")),
+        "head_ref": _optional_str(attrs.get("source_branch")),
+        "head_sha": head_sha,
+        "base_repo_full_name": _gitlab_project_path(target),
+        "head_repo_full_name": _gitlab_project_path(source),
+        "status": _optional_str(attrs.get("state")) or "open",
+        "html_url": _optional_str(attrs.get("url")),
+        "closed_at": closed_at,
+        "merged_at": merged_at,
+    }
+
+
+def _gitlab_project_path(project_ref: object) -> str | None:
+    if not isinstance(project_ref, dict):
+        return None
+    return _optional_str(project_ref.get("path_with_namespace"))
+
+
+def get_gitlab_clone_url(repo_full_name: str) -> str:
+    """Build a GitLab clone URL from a repository full name."""
+    return f"https://gitlab.com/{repo_full_name}.git"
 
 def normalize_gitlab_event(
     event_name: str,
@@ -284,7 +441,7 @@ def normalize_gitlab_event(
     attrs = payload.get("object_attributes")
     if not isinstance(attrs, dict):
         raise ProviderPayloadError(
-            "GitLab merge request payload is missing attributes."
+            "GitLab merge request payload is missing attributes.",
         )
     action = _optional_str(attrs.get("action")) or _optional_str(attrs.get("state"))
     source_changed = _source_commit_changed(attrs)
@@ -350,7 +507,10 @@ def _quoted(value: str) -> str:
     return quote(value, safe="")
 
 
-def context_from_merge_request_task(task: Any, merge_request: dict[str, Any]) -> Any:
+def context_from_merge_request_task(
+    task: AgentTask,
+    merge_request: dict[str, object],
+) -> PullRequestContext:
     from review_orchestrator.models import PullRequestContext
 
     return PullRequestContext(
@@ -373,13 +533,13 @@ def context_from_merge_request_task(task: Any, merge_request: dict[str, Any]) ->
     )
 
 
-def _id_to_str(value: Any) -> str | None:
+def _id_to_str(value: object) -> str | None:
     if isinstance(value, int | str):
         return str(value)
     return None
 
 
-def _gitlab_author(author: Any) -> str | None:
+def _gitlab_author(author: object) -> str | None:
     if not isinstance(author, dict):
         return None
     return _optional_str(author.get("username")) or _optional_str(author.get("name"))

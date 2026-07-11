@@ -81,7 +81,7 @@ async def acquire_next_review_run(
             ),
         )
         .order_by(ReviewRun.status == "running", ReviewRun.created_at)
-        .limit(1)
+        .limit(1),
     )
     review_run = result.scalar_one_or_none()
     if review_run is None:
@@ -108,7 +108,7 @@ async def acquire_next_agent_task(
         select(AgentTask)
         .where(AgentTask.status == "queued")
         .order_by(AgentTask.created_at)
-        .limit(1)
+        .limit(1),
     )
     task = result.scalar_one_or_none()
     if task is None:
@@ -433,7 +433,7 @@ async def process_next_review_run(
             review_run.stage = "waiting_for_result"
             review_run.lock_owner = None
             review_run.locked_until = utc_now() + timedelta(
-                seconds=settings.worker_poll_interval_seconds
+                seconds=settings.worker_poll_interval_seconds,
             )
             session.add(review_run)
             await session.commit()
@@ -540,7 +540,7 @@ async def process_review_run_timeouts(
     result = await session.execute(
         select(ReviewRun).where(
             ReviewRun.status.in_(WORKER_ACTIVE_STATUSES),
-        )
+        ),
     )
     touched: list[ReviewRun] = []
     for review_run in result.scalars().all():
@@ -632,7 +632,7 @@ async def publish_review_run_status_comment(
             {
                 "code": "summary_publish_failed",
                 "message": review_run.error,
-            }
+            },
         )
         review_run.failure_code = original_failure_code
         review_run.error = original_error
@@ -768,7 +768,7 @@ async def _get_internal_event(
             ProviderEventInbox.provider == "internal",
             ProviderEventInbox.review_run_id == review_run_id,
             ProviderEventInbox.internal_event == internal_event,
-        )
+        ),
     )
     return result.scalar_one_or_none()
 
@@ -788,7 +788,7 @@ async def _task_context(
             PullRequestContext.provider == task.provider,
             PullRequestContext.repo_full_name == task.repo_full_name,
             PullRequestContext.pull_request_number == task.pull_request_number,
-        )
+        ),
     )
     return result.scalar_one_or_none()
 
@@ -804,7 +804,7 @@ async def _review_run_context(
             PullRequestContext.provider == review_run.provider,
             PullRequestContext.repo_full_name == review_run.repo_full_name,
             PullRequestContext.pull_request_number == review_run.pull_request_number,
-        )
+        ),
     )
     return result.scalar_one_or_none()
 
@@ -825,15 +825,17 @@ def _workspace_request_from_context(
                 "head_sha": context.head_sha,
                 "is_fork": context.is_fork,
             },
-        }
+        },
     )
 
 
 def _clone_url(context: PullRequestContext) -> str:
     if context.provider == "github":
-        return f"https://github.com/{context.repo_full_name}.git"
+        from review_orchestrator.github import get_github_clone_url
+        return get_github_clone_url(context.repo_full_name)
     if context.provider == "gitlab":
-        return f"https://gitlab.com/{context.repo_full_name}.git"
+        from review_orchestrator.gitlab import get_gitlab_clone_url
+        return get_gitlab_clone_url(context.repo_full_name)
     return context.html_url or context.repo_full_name
 
 
@@ -876,7 +878,7 @@ async def _fetch_changed_files(
             {
                 "code": "changed_files_lookup_failed",
                 "message": f"Using summary-only fallback: {exc}",
-            }
+            },
         )
         review_run.validation_warnings_json = warnings
         session.add(review_run)
