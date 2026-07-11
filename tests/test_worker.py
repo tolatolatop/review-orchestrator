@@ -165,6 +165,14 @@ class SessionRequestFailingOpenHandsClient(FakeOpenHandsClient):
         )
 
 
+class StartTaskPollFailingOpenHandsClient(FakeOpenHandsClient):
+    async def get_start_task(self, task_id: str):
+        raise OpenHandsClientError(
+            "OpenHands request failed "
+            "(GET /api/v1/app-conversations/start-tasks): timeout"
+        )
+
+
 class EventRequestFailingOpenHandsClient(FakeOpenHandsClient):
     async def list_events(self, conversation_id: str, *, page_id=None, limit=100):
         raise OpenHandsClientError(
@@ -1092,6 +1100,59 @@ async def test_review_worker_retries_transient_openhands_session_request(
             ),
         }
     ]
+
+
+async def test_review_worker_preserves_start_task_on_poll_timeout(
+    session_factory,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+        workspace_root=str(tmp_path / "workspaces"),
+        git_cache_root=str(tmp_path / "git-cache"),
+        worker_poll_interval_seconds=1,
+    )
+    async with session_factory() as session:
+        context = PullRequestContext(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="open",
+        )
+        session.add(context)
+        await session.commit()
+        review_run = await create_review_run(
+            session,
+            ReviewRunCreate(
+                provider="github",
+                repo_full_name="example/repo",
+                pull_request_number=42,
+                base_sha="a" * 40,
+                head_sha="b" * 40,
+            ),
+        )
+        review_run.pull_request_context_id = context.id
+        review_run.workspace_path = str(tmp_path / "existing-workspace")
+        review_run.openhands_start_task_id = "task-1"
+        session.add(review_run)
+        await session.commit()
+
+        processed = await process_next_review_run(
+            session,
+            settings=settings,
+            openhands_client=StartTaskPollFailingOpenHandsClient(),
+            worker_id="worker-1",
+        )
+
+    assert processed is not None
+    assert processed.status == "running"
+    assert processed.stage == "waiting_for_openhands_start"
+    assert processed.openhands_start_task_id == "task-1"
+    assert processed.validation_warnings_json[0]["code"] == (
+        "openhands_start_task_poll_retry"
+    )
 
 
 async def test_review_worker_retries_transient_openhands_event_request(

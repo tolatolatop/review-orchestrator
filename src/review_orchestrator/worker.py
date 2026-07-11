@@ -368,6 +368,7 @@ async def process_next_review_run(
             await session.commit()
             await session.refresh(review_run)
 
+        _restore_openhands_start_task_after_poll_failure(review_run)
         if (
             not review_run.openhands_start_task_id
             and not review_run.openhands_conversation_id
@@ -1007,6 +1008,37 @@ async def _schedule_openhands_start_retry(
         return False
 
     warnings = list(review_run.validation_warnings_json or [])
+    if (
+        review_run.openhands_start_task_id
+        and review_run.error
+        and "GET /api/v1/app-conversations/start-tasks" in review_run.error
+    ):
+        if not any(
+            isinstance(warning, dict)
+            and warning.get("code") == "openhands_start_task_poll_retry"
+            for warning in warnings
+        ):
+            warnings.append(
+                {
+                    "code": "openhands_start_task_poll_retry",
+                    "message": review_run.error,
+                    "start_task_id": review_run.openhands_start_task_id,
+                }
+            )
+        review_run.status = "running"
+        review_run.stage = "waiting_for_openhands_start"
+        review_run.failure_code = None
+        review_run.error = None
+        review_run.validation_warnings_json = warnings
+        review_run.lock_owner = None
+        review_run.locked_until = utc_now() + timedelta(
+            seconds=settings.worker_poll_interval_seconds
+        )
+        session.add(review_run)
+        await session.commit()
+        await session.refresh(review_run)
+        return True
+
     if review_run.openhands_conversation_id:
         if not any(
             isinstance(warning, dict)
@@ -1068,6 +1100,29 @@ async def _schedule_openhands_start_retry(
     await session.commit()
     await session.refresh(review_run)
     return True
+
+
+def _restore_openhands_start_task_after_poll_failure(
+    review_run: ReviewRun,
+) -> None:
+    if review_run.openhands_start_task_id or review_run.openhands_conversation_id:
+        return
+    for warning in reversed(review_run.validation_warnings_json or []):
+        if not isinstance(warning, dict):
+            continue
+        if warning.get("code") != "openhands_start_retry":
+            continue
+        message = warning.get("message")
+        start_task_id = warning.get("start_task_id")
+        if (
+            isinstance(message, str)
+            and "GET /api/v1/app-conversations/start-tasks" in message
+            and isinstance(start_task_id, str)
+            and start_task_id
+        ):
+            review_run.openhands_start_task_id = start_task_id
+            review_run.stage = "waiting_for_openhands_start"
+            return
 
 
 def _is_review_result_payload(value: Any) -> bool:
