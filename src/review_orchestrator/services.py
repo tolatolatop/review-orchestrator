@@ -367,7 +367,11 @@ async def start_review_session(
         task = await openhands_client.start_conversation(review_input)
     except OpenHandsClientError as exc:
         review_run.status = "failed"
-        review_run.failure_code = "openhands_error"
+        review_run.failure_code = (
+            "openhands_infrastructure_error"
+            if _is_openhands_infrastructure_error(str(exc))
+            else "openhands_error"
+        )
         review_run.error = str(exc)
         await session.commit()
         await session.refresh(review_run)

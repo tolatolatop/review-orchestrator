@@ -379,6 +379,13 @@ async def process_next_review_run(
                 workspace_path=review_run.workspace_path,
             )
             if review_run.status == "failed":
+                if await _schedule_openhands_start_retry(
+                    session,
+                    review_run,
+                    settings=settings,
+                ):
+                    release_lock = False
+                    return review_run
                 await publish_review_run_status_comment(
                     session,
                     review_run,
