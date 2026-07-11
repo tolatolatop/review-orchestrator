@@ -408,10 +408,33 @@ async def process_next_review_run(
                 status_text="failed",
             )
             return review_run
-        raw_result = await _extract_openhands_json_result(
-            openhands_client,
-            review_run.openhands_conversation_id,
-        )
+        try:
+            raw_result = await _extract_openhands_json_result(
+                openhands_client,
+                review_run.openhands_conversation_id,
+            )
+        except OpenHandsClientError as exc:
+            review_run.status = "failed"
+            review_run.failure_code = "openhands_infrastructure_error"
+            review_run.error = str(exc)
+            session.add(review_run)
+            await session.commit()
+            await session.refresh(review_run)
+            if await _schedule_openhands_start_retry(
+                session,
+                review_run,
+                settings=settings,
+            ):
+                release_lock = False
+                return review_run
+            await publish_review_run_status_comment(
+                session,
+                review_run,
+                github_client=github_client,
+                gitlab_client=gitlab_client,
+                status_text="failed",
+            )
+            return review_run
         if raw_result is None:
             review_run.stage = "waiting_for_result"
             review_run.lock_owner = None
