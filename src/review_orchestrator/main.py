@@ -2,9 +2,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from review_orchestrator.api import router
 from review_orchestrator.config import Settings, get_settings
+from review_orchestrator.dashboard import DASHBOARD_HTML
 from review_orchestrator.db import create_engine, create_session_factory, init_models
 
 
@@ -25,6 +27,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
     app.include_router(router)
+
+    @app.get("/dashboard", include_in_schema=False)
+    async def dashboard_redirect() -> RedirectResponse:
+        return RedirectResponse("/dashboard/", status_code=307)
+
+    @app.get("/dashboard/", response_class=HTMLResponse, include_in_schema=False)
+    async def dashboard() -> HTMLResponse:
+        return HTMLResponse(DASHBOARD_HTML)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

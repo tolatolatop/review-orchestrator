@@ -61,6 +61,7 @@ passwords.
 | `GITLAB_API_BASE_URL` | `https://gitlab.com/api/v4` | no | GitLab API base URL. Override for self-managed GitLab. |
 | `GITLAB_API_TOKEN` | empty | for GitLab MR lookup and notes | Token used by the worker for MR details, changes, and summary note publishing. |
 | `OPENHANDS_BASE_URL` | `http://localhost:3000` | yes | Base URL for OpenHands App Server. |
+| `OPENHANDS_UI_BASE_URL` | empty | no | Operator-facing OpenHands UI base URL used by observability responses to build conversation links. |
 | `OPENHANDS_FRONTEND_PORT` | `3000` | no | Local-only host port for the OpenHands UI/API in `docker-compose.self_host.yaml`; bound to `127.0.0.1`. |
 | `OPENHANDS_API_TOKEN` | empty | if OpenHands requires auth | Bearer token sent to OpenHands. |
 | `OPENHANDS_REVIEW_SKILL` | `code-review` | no | Review skill name stored with repository review defaults. |
@@ -195,6 +196,12 @@ the header form is preferred because query strings are commonly stored in
 browser history, proxy logs, and analytics systems. GitHub webhooks cannot send
 this custom header, so `/api/v1/webhooks/github` is allowed through Nginx and
 must be protected by setting `GITHUB_WEBHOOK_SECRET`.
+
+The observability endpoints contain private repository and execution metadata.
+Read the dedicated [secure observability deployment and verification guide](observability-deployment.md)
+before exposing an operator UI or API. It documents the current route set,
+edge-authentication boundary, raw-payload behavior, redaction limitations, and
+the API/UI/webhook regression checklist.
 
 Recommended production settings:
 

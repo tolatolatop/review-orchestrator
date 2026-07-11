@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import func, select
@@ -11,12 +12,17 @@ from review_orchestrator.github import (
 )
 from review_orchestrator.models import (
     AgentTask,
+    Finding,
     ProviderEventInbox,
     PullRequestContext,
+    ReviewCommentRef,
     ReviewConfig,
     ReviewRun,
+    ReviewSession,
+    Workspace,
     utc_now,
 )
+from review_orchestrator.observability import DEFAULT_OBSERVABILITY_SORT, redact_value
 from review_orchestrator.openhands import (
     OpenHandsClient,
     OpenHandsClientError,
@@ -32,10 +38,28 @@ from review_orchestrator.review_results import (
     parse_review_result,
 )
 from review_orchestrator.schemas import (
+    AgentTaskDetail,
+    AgentTaskListResponse,
+    AgentTaskQueueHealth,
+    AgentTaskSummary,
+    OpenHandsPassthroughStatus,
+    OpenHandsSessionDiagnostics,
     ProviderEventInboxDetail,
     ProviderEventInboxListResponse,
     ProviderEventInboxSummary,
     ReviewRunCreate,
+    ReviewRunDetail,
+    ReviewRunFindingsSummary,
+    ReviewRunLinkedEventSummary,
+    ReviewRunLinkedTaskSummary,
+    ReviewRunListItem,
+    ReviewRunListResponse,
+    ReviewRunOperationalState,
+    ReviewRunProviderPublishing,
+    ReviewRunPullRequestContext,
+    ReviewRunRead,
+    ReviewRunSessionSummary,
+    ReviewRunWorkspaceSummary,
     WebhookAccepted,
 )
 
@@ -43,19 +67,6 @@ OPENHANDS_TERMINAL_SUCCESS_STATUSES = {"FINISHED", "COMPLETED", "STOPPED"}
 OPENHANDS_TERMINAL_FAILURE_STATUSES = {"ERROR", "STUCK", "FAILED"}
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "superseded"}
 CANCELLABLE_STATUSES = {"queued", "running"}
-SENSITIVE_PAYLOAD_KEYS = {
-    "access_token",
-    "authorization",
-    "client_secret",
-    "hook",
-    "installation",
-    "private_key",
-    "secret",
-    "signature",
-    "token",
-}
-
-
 class ReviewRunTransitionError(ValueError):
     def __init__(self, message: str, *, status_code: int = 409) -> None:
         super().__init__(message)
@@ -115,6 +126,215 @@ async def get_review_run(
     review_run_id: str,
 ) -> ReviewRun | None:
     return await session.get(ReviewRun, review_run_id)
+
+
+async def get_openhands_session_diagnostics_for_review_run(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    openhands_client: OpenHandsClient | None = None,
+    openhands_live_status_disabled_reason: str | None = None,
+    openhands_ui_base_url: str | None = None,
+) -> OpenHandsSessionDiagnostics:
+    agent_task_ids = await _get_agent_task_ids_for_review_run(session, review_run)
+    execution_status: str | None = None
+    sandbox_status: str | None = None
+    live_status_error = openhands_live_status_disabled_reason
+
+    if review_run.openhands_conversation_id and openhands_client is not None:
+        try:
+            conversation = await openhands_client.get_conversation(
+                review_run.openhands_conversation_id
+            )
+        except OpenHandsClientError as exc:
+            live_status_error = str(exc)
+        else:
+            execution_status = conversation.execution_status
+            sandbox_status = conversation.sandbox_status
+            live_status_error = None
+
+    return OpenHandsSessionDiagnostics(
+        review_run_id=review_run.id,
+        agent_task_ids=agent_task_ids,
+        provider=review_run.provider,
+        repo_full_name=review_run.repo_full_name,
+        pull_request_number=review_run.pull_request_number,
+        status=review_run.status,
+        stage=review_run.stage,
+        openhands_start_task_id=review_run.openhands_start_task_id,
+        openhands_conversation_id=review_run.openhands_conversation_id,
+        openhands_sandbox_id=review_run.openhands_sandbox_id,
+        openhands_agent_server_url=review_run.openhands_agent_server_url,
+        execution_status=execution_status,
+        sandbox_status=sandbox_status,
+        session_available=bool(review_run.openhands_conversation_id),
+        live_status_available=(
+            execution_status is not None or sandbox_status is not None
+        ),
+        live_status_error=live_status_error,
+        passthrough=_build_openhands_passthrough_status(
+            conversation_id=review_run.openhands_conversation_id,
+            openhands_ui_base_url=openhands_ui_base_url,
+        ),
+        created_at=review_run.created_at,
+        updated_at=review_run.updated_at,
+    )
+
+
+async def get_openhands_session_diagnostics_for_conversation(
+    session: AsyncSession,
+    conversation_id: str,
+    *,
+    openhands_client: OpenHandsClient | None = None,
+    openhands_live_status_disabled_reason: str | None = None,
+    openhands_ui_base_url: str | None = None,
+) -> OpenHandsSessionDiagnostics | None:
+    result = await session.execute(
+        select(ReviewRun)
+        .where(ReviewRun.openhands_conversation_id == conversation_id)
+        .order_by(ReviewRun.created_at.desc(), ReviewRun.id.desc())
+        .limit(1)
+    )
+    review_run = result.scalar_one_or_none()
+    if review_run is None:
+        return None
+    return await get_openhands_session_diagnostics_for_review_run(
+        session,
+        review_run,
+        openhands_client=openhands_client,
+        openhands_live_status_disabled_reason=openhands_live_status_disabled_reason,
+        openhands_ui_base_url=openhands_ui_base_url,
+    )
+
+
+async def _get_agent_task_ids_for_review_run(
+    session: AsyncSession,
+    review_run: ReviewRun,
+) -> list[str]:
+    result = await session.execute(
+        select(AgentTask).where(
+            AgentTask.provider == review_run.provider,
+            AgentTask.repo_full_name == review_run.repo_full_name,
+            AgentTask.pull_request_number == review_run.pull_request_number,
+        )
+    )
+    task_ids: list[str] = []
+    for task in result.scalars():
+        result_json = task.result_json or {}
+        if (
+            task.provider_event_id == review_run.trigger_event_id
+            or result_json.get("review_run_id") == review_run.id
+        ):
+            task_ids.append(task.id)
+    return task_ids
+
+
+def _build_openhands_passthrough_status(
+    *,
+    conversation_id: str | None,
+    openhands_ui_base_url: str | None,
+) -> OpenHandsPassthroughStatus:
+    if not conversation_id:
+        return OpenHandsPassthroughStatus(
+            enabled=False,
+            reason="OpenHands conversation id is not recorded for this review run.",
+        )
+    if not openhands_ui_base_url:
+        return OpenHandsPassthroughStatus(
+            enabled=False,
+            reason="OPENHANDS_UI_BASE_URL is not configured.",
+        )
+    return OpenHandsPassthroughStatus(
+        enabled=True,
+        conversation_url=(
+            f"{openhands_ui_base_url.rstrip('/')}/conversations/{conversation_id}"
+        ),
+    )
+
+
+async def list_review_runs(
+    session: AsyncSession,
+    *,
+    provider: str | None = None,
+    repo_full_name: str | None = None,
+    pull_request_number: int | None = None,
+    merge_request_number: int | None = None,
+    status: str | None = None,
+    stage: str | None = None,
+    head_sha: str | None = None,
+    trigger_type: str | None = None,
+    lock_state: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> ReviewRunListResponse:
+    filters = _review_run_filters(
+        provider=provider,
+        repo_full_name=repo_full_name,
+        pull_request_number=pull_request_number or merge_request_number,
+        status=status,
+        stage=stage,
+        head_sha=head_sha,
+        trigger_type=trigger_type,
+        lock_state=lock_state,
+    )
+    total_result = await session.execute(
+        select(func.count()).select_from(ReviewRun).where(*filters)
+    )
+    total = int(total_result.scalar_one())
+
+    result = await session.execute(
+        select(ReviewRun)
+        .where(*filters)
+        .order_by(ReviewRun.created_at.desc(), ReviewRun.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    review_runs = list(result.scalars().all())
+    publishing_by_run_id = await _provider_publishing_for_runs(
+        session, [review_run.id for review_run in review_runs]
+    )
+    return ReviewRunListResponse(
+        items=[
+            _review_run_list_item(
+                review_run,
+                publishing_by_run_id.get(review_run.id),
+            )
+            for review_run in review_runs
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+async def get_review_run_detail(
+    session: AsyncSession,
+    review_run_id: str,
+) -> ReviewRunDetail | None:
+    review_run = await get_review_run(session, review_run_id)
+    if review_run is None:
+        return None
+
+    publishing = await _provider_publishing_for_run(session, review_run.id)
+    context = await _pull_request_context_for_run(session, review_run)
+    workspace = await _workspace_for_run(session, review_run)
+    review_session = await _review_session_for_run(session, review_run.id)
+    findings = await _findings_summary_for_run(session, review_run.id)
+    trigger_event = await _trigger_event_for_run(session, review_run)
+    agent_task = await _agent_task_for_run(session, review_run)
+    list_item = _review_run_list_item(review_run, publishing)
+
+    return ReviewRunDetail(
+        **list_item.model_dump(),
+        pull_request_context=_pull_request_context_summary(context),
+        workspace=_workspace_summary(workspace, review_run.workspace_path),
+        review_session=_review_session_summary(review_session),
+        findings_summary=findings,
+        validation_warnings=review_run.validation_warnings_json or [],
+        validation_errors=review_run.validation_errors_json or [],
+        trigger_event=_linked_event_summary(trigger_event),
+        agent_task=_linked_task_summary(agent_task),
+    )
 
 
 async def start_review_session(
@@ -552,6 +772,7 @@ async def list_provider_event_inbox(
         total=total,
         limit=limit,
         offset=offset,
+        sort=DEFAULT_OBSERVABILITY_SORT,
     )
 
 
@@ -568,7 +789,7 @@ async def get_provider_event_inbox_detail(
     return ProviderEventInboxDetail(
         **_provider_event_summary(event, agent_task_id).model_dump(),
         dedupe_key=event.dedupe_key,
-        payload=_redact_payload(event.payload) if include_payload else None,
+        payload=redact_value(event.payload) if include_payload else None,
     )
 
 
@@ -664,6 +885,74 @@ async def create_agent_task_from_event(
     return agent_task
 
 
+async def list_agent_tasks(
+    session: AsyncSession,
+    *,
+    status: str | None = None,
+    provider: str | None = None,
+    repo_full_name: str | None = None,
+    pull_request_number: int | None = None,
+    task_type: str | None = None,
+    created_from: Any | None = None,
+    created_to: Any | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> AgentTaskListResponse:
+    filters = _agent_task_filters(
+        status=status,
+        provider=provider,
+        repo_full_name=repo_full_name,
+        pull_request_number=pull_request_number,
+        task_type=task_type,
+        created_from=created_from,
+        created_to=created_to,
+    )
+    total_result = await session.execute(
+        select(func.count()).select_from(AgentTask).where(*filters)
+    )
+    total = int(total_result.scalar_one())
+
+    result = await session.execute(
+        select(AgentTask)
+        .where(*filters)
+        .order_by(AgentTask.created_at.desc(), AgentTask.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    tasks = list(result.scalars().all())
+
+    health_filters = _agent_task_filters(
+        status=None,
+        provider=provider,
+        repo_full_name=repo_full_name,
+        pull_request_number=pull_request_number,
+        task_type=task_type,
+        created_from=created_from,
+        created_to=created_to,
+    )
+    return AgentTaskListResponse(
+        items=[_agent_task_summary(task) for task in tasks],
+        total=total,
+        limit=limit,
+        offset=offset,
+        queue=await _agent_task_queue_health(session, health_filters),
+    )
+
+
+async def get_agent_task_detail(
+    session: AsyncSession,
+    task_id: str,
+) -> AgentTaskDetail | None:
+    task = await session.get(AgentTask, task_id)
+    if task is None:
+        return None
+    return AgentTaskDetail(
+        **_agent_task_summary(task).model_dump(),
+        input_metadata=redact_value(task.input_json),
+        result_json=task.result_json,
+    )
+
+
 async def _get_agent_task_id_for_event(
     session: AsyncSession,
     provider_event_id: str,
@@ -693,6 +982,93 @@ async def _get_agent_task_ids_for_events(
         if provider_event_id is not None and provider_event_id not in task_ids:
             task_ids[provider_event_id] = task_id
     return task_ids
+
+
+def _agent_task_filters(
+    *,
+    status: str | None,
+    provider: str | None,
+    repo_full_name: str | None,
+    pull_request_number: int | None,
+    task_type: str | None,
+    created_from: Any | None,
+    created_to: Any | None,
+) -> list[Any]:
+    filters: list[Any] = []
+    if status:
+        filters.append(AgentTask.status == status)
+    if provider:
+        filters.append(AgentTask.provider == provider)
+    if repo_full_name:
+        filters.append(AgentTask.repo_full_name == repo_full_name)
+    if pull_request_number is not None:
+        filters.append(AgentTask.pull_request_number == pull_request_number)
+    if task_type:
+        filters.append(AgentTask.task_type == task_type)
+    if created_from is not None:
+        filters.append(AgentTask.created_at >= created_from)
+    if created_to is not None:
+        filters.append(AgentTask.created_at <= created_to)
+    return filters
+
+
+async def _agent_task_queue_health(
+    session: AsyncSession,
+    filters: list[Any],
+) -> AgentTaskQueueHealth:
+    count_result = await session.execute(
+        select(AgentTask.status, func.count())
+        .where(*filters)
+        .group_by(AgentTask.status)
+    )
+    counts = {status: int(count) for status, count in count_result.all()}
+    oldest_result = await session.execute(
+        select(func.min(AgentTask.created_at)).where(
+            *filters,
+            AgentTask.status == "queued",
+        )
+    )
+    oldest_queued_at = oldest_result.scalar_one()
+    oldest_queued_age_seconds = None
+    if oldest_queued_at is not None:
+        if oldest_queued_at.tzinfo is None:
+            oldest_queued_at = oldest_queued_at.replace(tzinfo=UTC)
+        oldest_queued_age_seconds = max(
+            0,
+            int((utc_now() - oldest_queued_at).total_seconds()),
+        )
+    return AgentTaskQueueHealth(
+        queued=counts.get("queued", 0),
+        running=counts.get("running", 0),
+        completed=counts.get("completed", 0),
+        failed=counts.get("failed", 0),
+        oldest_queued_age_seconds=oldest_queued_age_seconds,
+    )
+
+
+def _agent_task_summary(task: AgentTask) -> AgentTaskSummary:
+    return AgentTaskSummary(
+        id=task.id,
+        provider=task.provider,
+        repo_full_name=task.repo_full_name,
+        pull_request_number=task.pull_request_number,
+        task_type=task.task_type,
+        status=task.status,
+        provider_event_id=task.provider_event_id,
+        provider_event_link=(
+            f"/api/v1/provider-events/{task.provider_event_id}"
+            if task.provider_event_id
+            else None
+        ),
+        pull_request_context_link=(
+            f"/api/v1/pull-request-contexts/{task.pull_request_context_id}"
+            if task.pull_request_context_id
+            else None
+        ),
+        error_message=_safe_error_message(task.error_message),
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+    )
 
 
 def _provider_event_filters(
@@ -752,6 +1128,363 @@ def _provider_event_summary(
     )
 
 
+def _review_run_filters(
+    *,
+    provider: str | None,
+    repo_full_name: str | None,
+    pull_request_number: int | None,
+    status: str | None,
+    stage: str | None,
+    head_sha: str | None,
+    trigger_type: str | None,
+    lock_state: str | None,
+) -> list[Any]:
+    filters: list[Any] = []
+    if provider:
+        filters.append(ReviewRun.provider == provider)
+    if repo_full_name:
+        filters.append(ReviewRun.repo_full_name == repo_full_name)
+    if pull_request_number is not None:
+        filters.append(ReviewRun.pull_request_number == pull_request_number)
+    if status:
+        filters.append(ReviewRun.status == status)
+    if stage:
+        filters.append(ReviewRun.stage == stage)
+    if head_sha:
+        filters.append(ReviewRun.head_sha == head_sha)
+    if trigger_type:
+        filters.append(ReviewRun.trigger_type == trigger_type)
+    if lock_state == "unlocked":
+        filters.append(ReviewRun.lock_owner.is_(None))
+    elif lock_state == "locked":
+        now = utc_now()
+        filters.append(ReviewRun.lock_owner.is_not(None))
+        filters.append(
+            (ReviewRun.locked_until.is_(None)) | (ReviewRun.locked_until > now)
+        )
+    elif lock_state == "expired":
+        filters.append(ReviewRun.lock_owner.is_not(None))
+        filters.append(ReviewRun.locked_until <= utc_now())
+    return filters
+
+
+def _review_run_list_item(
+    review_run: ReviewRun,
+    publishing: ReviewRunProviderPublishing | None,
+) -> ReviewRunListItem:
+    base = ReviewRunRead.model_validate(review_run).model_dump()
+    base["error"] = _safe_error_message(review_run.error)
+    return ReviewRunListItem(
+        **base,
+        operational_state=_operational_state(review_run),
+        provider_publishing=publishing or ReviewRunProviderPublishing(
+            summary_comment_id=review_run.summary_comment_id,
+            summary_published=review_run.summary_comment_id is not None,
+        ),
+    )
+
+
+def _operational_state(review_run: ReviewRun) -> ReviewRunOperationalState:
+    return ReviewRunOperationalState(
+        lock_state=_lock_state(review_run),
+        timeout_state=_timeout_state(review_run),
+        worker_state=_worker_state(review_run),
+    )
+
+
+def _lock_state(review_run: ReviewRun) -> str:
+    if review_run.lock_owner is None:
+        return "unlocked"
+    if review_run.locked_until is not None and _is_past(review_run.locked_until):
+        return "expired"
+    return "locked"
+
+
+def _timeout_state(review_run: ReviewRun) -> str:
+    if review_run.hard_timeout_emitted_at is not None:
+        return "hard_timeout"
+    if review_run.soft_timeout_emitted_at is not None:
+        return "soft_timeout"
+    if review_run.deadline_at is not None and _is_past(review_run.deadline_at):
+        return "deadline_elapsed"
+    return "none"
+
+
+def _is_past(value: datetime) -> bool:
+    now = utc_now()
+    if value.tzinfo is None:
+        now = now.replace(tzinfo=None)
+    return value <= now
+
+
+def _worker_state(review_run: ReviewRun) -> str:
+    if review_run.status in TERMINAL_STATUSES:
+        return "terminal"
+    lock_state = _lock_state(review_run)
+    if lock_state == "locked":
+        return "locked_by_worker"
+    if lock_state == "expired":
+        return "worker_lock_expired"
+    if review_run.status == "queued":
+        return "waiting_for_worker"
+    if review_run.status == "running" and not review_run.openhands_conversation_id:
+        return "waiting_for_openhands"
+    if review_run.status == "running":
+        return "running_in_openhands"
+    return review_run.status
+
+
+async def _provider_publishing_for_runs(
+    session: AsyncSession,
+    review_run_ids: list[str],
+) -> dict[str, ReviewRunProviderPublishing]:
+    if not review_run_ids:
+        return {}
+
+    result = await session.execute(
+        select(ReviewCommentRef).where(ReviewCommentRef.review_run_id.in_(review_run_ids))
+    )
+    refs_by_run_id: dict[str, list[ReviewCommentRef]] = {}
+    for ref in result.scalars().all():
+        if ref.review_run_id is not None:
+            refs_by_run_id.setdefault(ref.review_run_id, []).append(ref)
+    return {
+        review_run_id: _provider_publishing_from_refs(refs)
+        for review_run_id, refs in refs_by_run_id.items()
+    }
+
+
+async def _provider_publishing_for_run(
+    session: AsyncSession,
+    review_run_id: str,
+) -> ReviewRunProviderPublishing:
+    return (
+        await _provider_publishing_for_runs(session, [review_run_id])
+    ).get(review_run_id, ReviewRunProviderPublishing())
+
+
+def _provider_publishing_from_refs(
+    refs: list[ReviewCommentRef],
+) -> ReviewRunProviderPublishing:
+    summary_ref = next((ref for ref in refs if ref.comment_type == "summary"), None)
+    line_status_counts: dict[str, int] = {}
+    line_comment_count = 0
+    for ref in refs:
+        if ref.comment_type != "line":
+            continue
+        line_comment_count += 1
+        line_status_counts[ref.status] = line_status_counts.get(ref.status, 0) + 1
+
+    return ReviewRunProviderPublishing(
+        summary_comment_id=summary_ref.provider_comment_id if summary_ref else None,
+        summary_comment_ref_id=summary_ref.id if summary_ref else None,
+        summary_comment_status=summary_ref.status if summary_ref else None,
+        summary_published=summary_ref is not None,
+        line_comment_count=line_comment_count,
+        line_comment_status_counts=line_status_counts,
+    )
+
+
+async def _pull_request_context_for_run(
+    session: AsyncSession,
+    review_run: ReviewRun,
+) -> PullRequestContext | None:
+    if review_run.pull_request_context_id:
+        context = await session.get(
+            PullRequestContext,
+            review_run.pull_request_context_id,
+        )
+        if context is not None:
+            return context
+    result = await session.execute(
+        select(PullRequestContext).where(
+            PullRequestContext.provider == review_run.provider,
+            PullRequestContext.repo_full_name == review_run.repo_full_name,
+            PullRequestContext.pull_request_number == review_run.pull_request_number,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def _workspace_for_run(
+    session: AsyncSession,
+    review_run: ReviewRun,
+) -> Workspace | None:
+    result = await session.execute(
+        select(Workspace)
+        .where(
+            Workspace.provider == review_run.provider,
+            Workspace.repository == review_run.repo_full_name,
+            Workspace.pull_request_number == review_run.pull_request_number,
+            Workspace.head_sha == review_run.head_sha,
+        )
+        .order_by(Workspace.updated_at.desc(), Workspace.id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _review_session_for_run(
+    session: AsyncSession,
+    review_run_id: str,
+) -> ReviewSession | None:
+    result = await session.execute(
+        select(ReviewSession).where(ReviewSession.review_run_id == review_run_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _findings_summary_for_run(
+    session: AsyncSession,
+    review_run_id: str,
+) -> ReviewRunFindingsSummary:
+    result = await session.execute(
+        select(Finding).where(Finding.review_run_id == review_run_id)
+    )
+    findings = list(result.scalars().all())
+    by_severity: dict[str, int] = {}
+    by_state: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    for finding in findings:
+        by_severity[finding.severity] = by_severity.get(finding.severity, 0) + 1
+        by_state[finding.state] = by_state.get(finding.state, 0) + 1
+        by_status[finding.status] = by_status.get(finding.status, 0) + 1
+    return ReviewRunFindingsSummary(
+        total=len(findings),
+        by_severity=by_severity,
+        by_state=by_state,
+        by_status=by_status,
+    )
+
+
+async def _trigger_event_for_run(
+    session: AsyncSession,
+    review_run: ReviewRun,
+) -> ProviderEventInbox | None:
+    if review_run.trigger_event_id:
+        return await session.get(ProviderEventInbox, review_run.trigger_event_id)
+    result = await session.execute(
+        select(ProviderEventInbox)
+        .where(ProviderEventInbox.review_run_id == review_run.id)
+        .order_by(ProviderEventInbox.created_at.desc(), ProviderEventInbox.id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _agent_task_for_run(
+    session: AsyncSession,
+    review_run: ReviewRun,
+) -> AgentTask | None:
+    result = await session.execute(
+        select(AgentTask)
+        .where(
+            AgentTask.provider == review_run.provider,
+            AgentTask.repo_full_name == review_run.repo_full_name,
+            AgentTask.pull_request_number == review_run.pull_request_number,
+        )
+        .order_by(AgentTask.created_at.desc(), AgentTask.id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+def _pull_request_context_summary(
+    context: PullRequestContext | None,
+) -> ReviewRunPullRequestContext | None:
+    if context is None:
+        return None
+    return ReviewRunPullRequestContext(
+        id=context.id,
+        title=context.title,
+        author_login=context.author_login,
+        base_ref=context.base_ref,
+        base_sha=context.base_sha,
+        head_ref=context.head_ref,
+        head_sha=context.head_sha,
+        head_repo_full_name=context.head_repo_full_name,
+        is_fork=context.is_fork,
+        status=context.status,
+        html_url=context.html_url,
+        latest_event_id=context.latest_event_id,
+        closed_at=context.closed_at,
+        merged_at=context.merged_at,
+    )
+
+
+def _workspace_summary(
+    workspace: Workspace | None,
+    review_run_workspace_path: str | None,
+) -> ReviewRunWorkspaceSummary | None:
+    if workspace is None and review_run_workspace_path is None:
+        return None
+    if workspace is None:
+        return ReviewRunWorkspaceSummary(workspace_path=review_run_workspace_path)
+    return ReviewRunWorkspaceSummary(
+        workspace_id=workspace.workspace_id,
+        workspace_path=workspace.workspace_path,
+        status=workspace.status,
+        failure_code=workspace.failure_code,
+        failure_message=_safe_error_message(workspace.failure_message),
+        ready_at=workspace.ready_at,
+        last_used_at=workspace.last_used_at,
+        expires_at=workspace.expires_at,
+    )
+
+
+def _review_session_summary(
+    review_session: ReviewSession | None,
+) -> ReviewRunSessionSummary | None:
+    if review_session is None:
+        return None
+    return ReviewRunSessionSummary(
+        id=review_session.id,
+        status=review_session.status,
+        openhands_conversation_id=review_session.openhands_conversation_id,
+        skill_name=review_session.skill_name,
+        profile_name=review_session.profile_name,
+        result_ref=review_session.result_ref,
+        error_message=_safe_error_message(review_session.error_message),
+        created_at=review_session.created_at,
+        updated_at=review_session.updated_at,
+    )
+
+
+def _linked_event_summary(
+    event: ProviderEventInbox | None,
+) -> ReviewRunLinkedEventSummary | None:
+    if event is None:
+        return None
+    return ReviewRunLinkedEventSummary(
+        id=event.id,
+        provider_event=event.provider_event,
+        provider_action=event.provider_action,
+        internal_event=event.internal_event,
+        delivery_id=event.delivery_id,
+        status=event.status,
+        error_code=event.error_code,
+        error_message=_safe_error_message(event.error_message),
+        created_at=event.created_at,
+        processed_at=event.processed_at,
+    )
+
+
+def _linked_task_summary(
+    task: AgentTask | None,
+) -> ReviewRunLinkedTaskSummary | None:
+    if task is None:
+        return None
+    return ReviewRunLinkedTaskSummary(
+        id=task.id,
+        provider_event_id=task.provider_event_id,
+        task_type=task.task_type,
+        status=task.status,
+        error_message=_safe_error_message(task.error_message),
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+    )
+
+
 def _safe_error_message(error_message: str | None) -> str | None:
     if error_message is None:
         return None
@@ -759,21 +1492,6 @@ def _safe_error_message(error_message: str | None) -> str | None:
     if len(first_line) > 1000:
         return f"{first_line[:1000]}..."
     return first_line
-
-
-def _redact_payload(value: Any) -> Any:
-    if isinstance(value, dict):
-        redacted: dict[str, Any] = {}
-        for key, item in value.items():
-            lowered = str(key).lower()
-            if any(sensitive in lowered for sensitive in SENSITIVE_PAYLOAD_KEYS):
-                redacted[str(key)] = "[redacted]"
-            else:
-                redacted[str(key)] = _redact_payload(item)
-        return redacted
-    if isinstance(value, list):
-        return [_redact_payload(item) for item in value]
-    return value
 
 
 async def cancel_active_review_runs_for_pr(
