@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -49,6 +49,13 @@ def test_invalid_private_key_fails_before_service_starts(tmp_path: Path) -> None
 @dataclass
 class FakeInstallation:
     id: int
+    permissions: dict[str, str] = field(
+        default_factory=lambda: {
+            "contents": "read",
+            "issues": "write",
+            "pull_requests": "write",
+        }
+    )
 
 
 class FakeAppAuth:
@@ -95,6 +102,7 @@ class FakeIntegration:
         self.base_url = base_url
         self.requester = object()
         self.installation_calls: list[tuple[str, str]] = []
+        self.installation_id_calls: list[int] = []
         self.closed = False
         self.instances.append(self)
 
@@ -102,6 +110,10 @@ class FakeIntegration:
         self.installation_calls.append((owner, repo))
         installations = {"alpha": 101, "beta": 202}
         return FakeInstallation(installations[repo])
+
+    def get_app_installation(self, installation_id: int) -> FakeInstallation:
+        self.installation_id_calls.append(installation_id)
+        return FakeInstallation(installation_id)
 
     def close(self) -> None:
         self.closed = True
@@ -132,6 +144,7 @@ async def test_app_provider_resolves_and_caches_installations_per_repository(
     first = await provider.get_token("Acme/alpha")
     refreshed = await provider.get_token("acme/alpha")
     other = await provider.get_token("acme/beta")
+    permissions = await provider.get_permissions("acme/alpha")
 
     integration = FakeIntegration.instances[0]
     assert integration.base_url == "https://github.example/api/v3"
@@ -139,6 +152,12 @@ async def test_app_provider_resolves_and_caches_installations_per_repository(
     assert first == "installation-101-read-1"
     assert refreshed == "installation-101-read-2"
     assert other == "installation-202-read-3"
+    assert permissions == {
+        "contents": "read",
+        "issues": "write",
+        "pull_requests": "write",
+    }
+    assert integration.installation_id_calls == [101]
     assert FakeInstallationAuth.token_reads == [101, 101, 202]
 
     await provider.aclose()
@@ -158,7 +177,14 @@ async def test_fixed_installation_id_skips_repository_lookup(
     )
 
     assert await provider.get_token("any/repository") == "installation-303-read-1"
-    assert FakeIntegration.instances[0].installation_calls == []
+    assert await provider.get_permissions("any/repository") == {
+        "contents": "read",
+        "issues": "write",
+        "pull_requests": "write",
+    }
+    integration = FakeIntegration.instances[0]
+    assert integration.installation_calls == []
+    assert integration.installation_id_calls == [303]
 
 
 class RecordingTokenProvider:
@@ -169,6 +195,10 @@ class RecordingTokenProvider:
     async def get_token(self, repo_full_name: str) -> str:
         self.repositories.append(repo_full_name)
         return f"token-{len(self.repositories)}"
+
+    async def get_permissions(self, repo_full_name: str) -> None:
+        del repo_full_name
+        return None
 
     async def aclose(self) -> None:
         self.closed = True

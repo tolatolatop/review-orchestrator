@@ -64,6 +64,7 @@ locally:
 ### MVP Endpoints
 
 - `GET /health`
+- `POST /api/v1/diagnostics/platform-permissions`
 - `POST /api/v1/webhooks/{provider}`
 - `POST /api/v1/review-runs`
 - `GET /api/v1/review-runs/{review_run_id}`
@@ -84,6 +85,46 @@ the deployment verification checklist are documented in
 `provider + repo_full_name + pull_request_number + head_sha`. A repeated request
 returns the latest existing run unless `force=true` is supplied. Failed runs can
 be retried through the retry endpoint without `force=true`.
+
+### Platform permission diagnostics
+
+`POST /api/v1/diagnostics/platform-permissions` performs read-only checks with
+the configured GitHub App, static GitHub token, or GitLab API token. It verifies
+repository access and, when `pull_request_number` is supplied, PR/MR read access.
+It also reports safe
+OAuth scopes or GitHub App Installation permissions, repository-role, and
+rate-limit metadata when the provider returns them.
+Credentials and upstream response bodies are never included in the response.
+
+```bash
+curl -sS http://localhost:8000/api/v1/diagnostics/platform-permissions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "provider": "github",
+    "repo_full_name": "owner/repo",
+    "pull_request_number": 123
+  }'
+```
+
+The overall `status` is `healthy`, `degraded`, or `failed`. A write check can be
+`unknown` when a fine-grained provider token does not advertise its grants;
+the diagnostic intentionally does not create a probe comment to test writes.
+
+Run the standalone black-box verifier against a deployed service:
+
+```bash
+REVIEW_ORCHESTRATOR_URL=http://localhost:8000 \
+uv run python scripts/check_platform_permissions.py \
+  --provider github \
+  --repository owner/repo \
+  --pull-request 123
+```
+
+If the deployment is protected by the self-host reverse proxy, set
+`REVIEW_PROXY_TOKEN` in the environment; the script sends it as
+`X-Review-Token` and never prints it. Add `--json` for machine-readable output.
+The exit codes are `0` for healthy, `1` for degraded, `2` for failed provider
+checks, and `3` for request or response-contract errors.
 
 ### GitHub Webhooks
 

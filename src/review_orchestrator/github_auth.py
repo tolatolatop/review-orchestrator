@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from github import Auth, GithubIntegration
 
@@ -14,6 +14,8 @@ class GitHubAuthenticationError(RuntimeError):
 class GitHubTokenProvider(Protocol):
     async def get_token(self, repo_full_name: str) -> str | None: ...
 
+    async def get_permissions(self, repo_full_name: str) -> dict[str, str] | None: ...
+
     async def aclose(self) -> None: ...
 
 
@@ -24,6 +26,10 @@ class StaticGitHubTokenProvider:
     async def get_token(self, repo_full_name: str) -> str | None:
         del repo_full_name
         return self._token
+
+    async def get_permissions(self, repo_full_name: str) -> None:
+        del repo_full_name
+        return None
 
     async def aclose(self) -> None:
         return None
@@ -91,6 +97,22 @@ class GitHubAppTokenProvider:
                     f"{repo_full_name}."
                 ) from retry_exc
 
+    async def get_permissions(self, repo_full_name: str) -> dict[str, str]:
+        installation_id = await self._installation_id(repo_full_name)
+        try:
+            installation = await asyncio.to_thread(
+                self._integration.get_app_installation,
+                installation_id,
+            )
+        except Exception as exc:
+            raise GitHubAuthenticationError(
+                "Unable to read GitHub App permissions for installation "
+                f"{installation_id}."
+            ) from exc
+
+        permissions = _installation_permission_map(installation)
+        return dict(permissions)
+
     async def aclose(self) -> None:
         await asyncio.to_thread(self._integration.close)
 
@@ -134,3 +156,14 @@ class GitHubAppTokenProvider:
         async with self._lock:
             self._installation_ids[normalized] = installation.id
         return installation.id
+
+
+def _installation_permission_map(installation: Any) -> dict[str, str]:
+    permissions = getattr(installation, "permissions", None)
+    if not isinstance(permissions, dict):
+        return {}
+    return {
+        str(name): str(level)
+        for name, level in permissions.items()
+        if isinstance(name, str) and isinstance(level, str)
+    }

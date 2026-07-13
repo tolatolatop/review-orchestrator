@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from review_orchestrator.observability import ObservabilityListEnvelope
 from review_orchestrator.review_results import ChangedFile, ParsedReviewResult
@@ -198,6 +198,44 @@ class WebhookAccepted(BaseModel):
     review_run_id: str | None = None
     agent_task_id: str | None = None
     duplicate: bool = False
+
+
+class PlatformPermissionDiagnosticRequest(BaseModel):
+    provider: str = Field(pattern="^(github|gitlab)$")
+    repo_full_name: str = Field(
+        min_length=3,
+        max_length=512,
+        pattern=r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$",
+    )
+    pull_request_number: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_repository_path(self) -> "PlatformPermissionDiagnosticRequest":
+        parts = self.repo_full_name.split("/")
+        if any(part in {".", ".."} for part in parts):
+            raise ValueError("repo_full_name contains an invalid path segment")
+        if self.provider == "github" and len(parts) != 2:
+            raise ValueError("GitHub repo_full_name must be owner/repository")
+        return self
+
+
+class PlatformPermissionCheck(BaseModel):
+    name: str
+    status: str = Field(pattern="^(passed|failed|unknown|skipped)$")
+    required: bool = True
+    message: str
+
+
+class PlatformPermissionDiagnosticResponse(BaseModel):
+    provider: str
+    repo_full_name: str
+    pull_request_number: int | None
+    status: str = Field(pattern="^(healthy|degraded|failed)$")
+    token_configured: bool
+    reported_scopes: list[str] = Field(default_factory=list)
+    repository_role: str | None = None
+    rate_limit_remaining: int | None = None
+    checks: list[PlatformPermissionCheck] = Field(default_factory=list)
 
 
 class ProviderEventInboxSummary(BaseModel):
