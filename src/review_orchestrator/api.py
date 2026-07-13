@@ -491,7 +491,12 @@ async def prepare_workspace_endpoint(
     request: Request,
     session: AsyncSession = session_dependency,
 ) -> WorkspacePrepareResponse:
-    return await prepare_workspace(session, request.app.state.settings, payload)
+    return await prepare_workspace(
+        session,
+        request.app.state.settings,
+        payload,
+        github_client=request.app.state.github_client,
+    )
 
 
 @router.get("/workspaces/{workspace_id}", response_model=WorkspaceRead)

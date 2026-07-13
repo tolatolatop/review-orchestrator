@@ -100,6 +100,14 @@ Required headers:
 
 Duplicate delivery IDs are idempotent and return the original event status.
 
+For long-running GitHub App authentication, configure `GITHUB_APP_ID` and a
+mounted `GITHUB_PRIVATE_KEY_PATH`. The service uses PyGithub to sign App JWTs,
+resolve the Installation for each repository, and refresh short-lived
+Installation Tokens for API calls and private-repository checkout. See the
+[GitHub App deployment instructions](docs/deployment.md#github-app-authentication)
+for permissions, webhook events, secrets, and the optional
+`GITHUB_INSTALLATION_ID` setting.
+
 ### Review Run Status Values
 
 `ReviewRunRead.status` is one of:
@@ -187,9 +195,6 @@ Prepare a workspace:
     "head_sha": "def5678",
     "is_fork": false
   },
-  "auth": {
-    "token_ref": "GITHUB_INSTALLATION_TOKEN"
-  },
   "options": {
     "use_git_cache": true,
     "force_refresh": false,
@@ -198,6 +203,10 @@ Prepare a workspace:
   }
 }
 ```
+
+When GitHub App authentication is configured, the service obtains checkout
+credentials automatically. `auth.token_ref` remains available only for the
+legacy static-token mode.
 
 The response returns `workspace_path`, `base_sha`, and `head_sha`. Callers can run
 their own diff commands from that path:

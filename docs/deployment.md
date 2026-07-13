@@ -52,10 +52,11 @@ passwords.
 | `PORT` | `8000` | no | Bind port for local `uvicorn` examples. |
 | `DATABASE_URL` | `sqlite+aiosqlite:///./review_orchestrator.db` | yes | SQLAlchemy async URL. `sqlite:///`, `postgres://`, and `postgresql://` are normalized to async drivers. |
 | `GITHUB_WEBHOOK_SECRET` | empty | production yes | Shared webhook secret. If unset, signature verification is skipped for local development. |
-| `GITHUB_APP_ID` | empty | when using a GitHub App | GitHub App ID used by deployment tooling or provider integrations. |
-| `GITHUB_PRIVATE_KEY_PATH` | empty | when using a GitHub App | Filesystem path to the GitHub App private key. Keep the key outside the repository. |
+| `GITHUB_APP_ID` | empty | with App auth | GitHub App ID. Configure it together with `GITHUB_PRIVATE_KEY_PATH`. |
+| `GITHUB_PRIVATE_KEY_PATH` | empty | with App auth | Read-only filesystem path to the App private key PEM. Self-host Compose uses `/run/secrets/github-app.pem`. |
+| `GITHUB_INSTALLATION_ID` | empty | no | Optional fixed Installation ID for a single Installation. When empty, the service resolves and caches the Installation independently for each repository. |
 | `GITHUB_API_BASE_URL` | `https://api.github.com` | no | GitHub API base URL. Override for GitHub Enterprise. |
-| `GITHUB_INSTALLATION_TOKEN` | empty | for private workspace checkout and comment publishing | Token used by the worker for PR lookup, changed files, summary comments, and line comments. It may also be referenced by workspace prepare requests via `auth.token_ref`. |
+| `GITHUB_INSTALLATION_TOKEN` | empty | legacy auth only | Static token compatibility mode. Leave it empty when App ID and private key are configured; App mode signs and refreshes Installation Tokens automatically. |
 | `REVIEW_BOT_LOGIN` | `review-agent` | no | Bot login recognized in PR comments such as `@review-agent`. |
 | `GITLAB_WEBHOOK_SECRET` | empty | production yes for GitLab | Shared token checked against `X-Gitlab-Token`. |
 | `GITLAB_API_BASE_URL` | `https://gitlab.com/api/v4` | no | GitLab API base URL. Override for self-managed GitLab. |
@@ -164,7 +165,7 @@ docker compose -f docker-compose.self_host.yaml up --build -d
 ```
 
 Before starting the self-host stack, edit `.env` and set production secrets such
-as `REVIEW_PROXY_TOKEN`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_INSTALLATION_TOKEN`,
+as `REVIEW_PROXY_TOKEN`, `GITHUB_WEBHOOK_SECRET`, the GitHub App settings below,
 and `OPENHANDS_API_TOKEN` when your OpenHands deployment requires one. Override
 `POSTGRES_PASSWORD` in `.env` or the shell; the compose default is only suitable
 for local testing.
@@ -222,6 +223,69 @@ curl -fsS -X POST http://review-orchestrator.internal:8000/api/v1/workspaces/cle
 If multiple service instances share the same database, they must also share
 compatible workspace storage or route workspace/session operations to the same
 instance that prepared the workspace.
+
+## GitHub App Authentication
+
+GitHub Installation Tokens normally expire after one hour. Do not generate one
+manually for a long-running deployment. Review Orchestrator uses PyGithub's App
+authentication implementation to sign App JWTs, resolve the Installation for
+each repository, and obtain or refresh Installation Tokens when an API call or
+Git checkout needs one. Tokens stay in memory and temporary child-process Git
+configuration; they are not written to the database, workspace, clone URL, or
+Compose environment file.
+
+Create a GitHub App with these minimum repository permissions:
+
+- Metadata: read (GitHub requires this permission for every App).
+- Contents: read, for private repository checkout and commit access.
+- Pull requests: read and write, for PR lookup and line review comments.
+- Issues: read and write, for PR summary/status comments.
+
+Subscribe the App to these webhook events:
+
+- Pull requests.
+- Issue comments.
+- Pull request reviews.
+- Pull request review comments.
+
+Set its webhook URL to:
+
+```text
+https://<public-host>/api/v1/webhooks/github
+```
+
+Install the App on every organization/account and repository that the service
+must review. Then copy the downloaded PEM into the ignored `secrets` directory:
+
+```bash
+mkdir -p secrets
+cp /secure/path/github-app-private-key.pem secrets/github-app.pem
+chmod 600 secrets/github-app.pem
+```
+
+Configure `.env`:
+
+```dotenv
+GITHUB_APP_ID=123456
+GITHUB_PRIVATE_KEY_PATH=/run/secrets/github-app.pem
+# Optional optimization for deployments that will always use one Installation:
+GITHUB_INSTALLATION_ID=
+GITHUB_WEBHOOK_SECRET=<same-secret-configured-in-the-app>
+GITHUB_API_BASE_URL=https://api.github.com
+GITHUB_INSTALLATION_TOKEN=
+REVIEW_BOT_LOGIN=<app-slug>[bot]
+```
+
+`GITHUB_APP_ID` and `GITHUB_PRIVATE_KEY_PATH` are an all-or-nothing pair. App
+mode takes precedence over `GITHUB_INSTALLATION_TOKEN`. Leave
+`GITHUB_INSTALLATION_ID` empty when one service reviews repositories across
+multiple App Installations; the repository-to-Installation mapping is resolved
+automatically. The self-host Compose file mounts `./secrets` read-only into only
+the API and worker containers.
+
+Without App ID and private key, the service retains static-token compatibility
+through `GITHUB_INSTALLATION_TOKEN`. Static mode cannot refresh an expiring
+Installation Token and is therefore not recommended for unattended operation.
 
 ## GitHub Webhook
 
@@ -315,9 +379,6 @@ curl -fsS -X POST http://localhost:8000/api/v1/workspaces/prepare \
       "head_sha": "HEAD_SHA",
       "is_fork": false
     },
-    "auth": {
-      "token_ref": "GITHUB_INSTALLATION_TOKEN"
-    },
     "options": {
       "use_git_cache": true,
       "force_refresh": false,
@@ -326,6 +387,9 @@ curl -fsS -X POST http://localhost:8000/api/v1/workspaces/prepare \
     }
   }'
 ```
+
+App mode obtains the repository token automatically. In legacy static mode, an
+API caller can still add `"auth":{"token_ref":"GITHUB_INSTALLATION_TOKEN"}`.
 
 OpenHands session start after a workspace is ready:
 
@@ -454,8 +518,9 @@ OpenHands request fails:
 
 Workspace checkout fails:
 
-- `auth_failed`: the request `auth.token_ref` does not name an available
-  environment variable, or the token cannot clone the repository.
+- `auth_failed`: the App is not installed for the repository, its private key or
+  Installation ID is wrong, a legacy `auth.token_ref` is unavailable, or the
+  resulting token cannot clone the repository.
 - `repo_not_found`: the clone URL or token permissions are wrong.
 - `base_missing` or `head_missing`: GitHub cannot fetch the requested commit.
 - `network_error`: DNS, proxy, firewall, or GitHub availability problem.
@@ -465,7 +530,9 @@ Workspace checkout fails:
 GitHub API or publishing fails:
 
 - Verify the GitHub App installation has access to the repository.
-- Verify tokens are injected at runtime and are not expired.
+- Verify the API and worker containers can read `GITHUB_PRIVATE_KEY_PATH`.
+- Verify App permissions include Contents read, Pull requests read/write, and
+  Issues read/write. Token expiry is handled automatically in App mode.
 - Confirm summary comments are tracked by the hidden summary marker generated by
   `build_summary_comment_body`.
 - Confirm line comments are only attempted for findings marked
