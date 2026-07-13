@@ -1,9 +1,9 @@
 # 平台 Provider 扩展指南
 
-Review Orchestrator 当前是 GitHub 优先的 MVP。数据模型和部分 API schema
-已经携带 `provider` 字段，但 webhook 接入、事件标准化、请求头处理以及平台侧
-发布行为仍然绑定 GitHub 语义。本文说明如何在不破坏现有 GitHub 路径的前提下，
-扩展到 GitLab、Azure DevOps、Bitbucket、GitCode 或其他代码托管平台。
+Review Orchestrator 以 GitHub 作为参考 provider，并已包含初步的 GitLab 实现。
+数据模型、API schema、webhook 接入和 worker 操作都携带 `provider` 字段，并通过
+provider adapter 路由平台行为。本文说明如何在不破坏现有 provider 的前提下，
+扩展到 Azure DevOps、Bitbucket、GitCode 或其他代码托管平台。
 
 目标形态是在外部平台行为周围建立一个小而清晰的 provider adapter 边界。Review
 run 生命周期、OpenHands session 编排、workspace 准备、结果解析、finding 对账和
@@ -29,15 +29,15 @@ GitHub 支持当前覆盖：
 - 通过 `ReviewCommentRef` 跟踪 summary comment 和 line comment 引用。
 - 当 finding 无法映射到 changed file 中可评论的行时，降级为 summary-only。
 
-代码里仍然可见的 GitHub 绑定假设：
+代码中仍然可见的 provider-specific 集成点：
 
-- 通用的 `/webhooks/{provider}` 路由仍拒绝除 `github` 以外的 provider。
-- 请求头名称、签名格式、事件名称和 payload 字段路径直接在 route 和
-  `review_orchestrator.github` 中处理。
-- `accept_github_webhook` 的命名和类型围绕 `NormalizedGitHubEvent`。
-- 运行时 settings 仅包含 GitHub App 和 GitHub API 字段。
-- Provider diff 获取、comment 发布、review thread resolve 和 rate limit 处理尚未
-  表达为共享 adapter 接口。
+- 每个 adapter 仍负责所属平台的请求头、签名格式、事件名、payload 路径、client
+  和认证设置。
+- Workspace clone URL 和凭据准备仍包含 worker adapter 操作之外的 provider-aware
+  行为。
+- GitHub 支持 line comment；GitLab 当前返回 summary-only 统计。
+- Review thread resolve 和 provider-specific rate-limit backoff 尚未进入最小
+  adapter 契约。
 
 不要在第二个平台证明需求之前就重命名或泛化所有 GitHub 代码。应该添加能让下一个
 provider 复用内部契约的最小 adapter surface。
@@ -74,43 +74,55 @@ Orchestrator core 负责共享行为：
 
 ```python
 class ProviderAdapter(Protocol):
-    name: str
+    provider: str
 
-    async def parse_webhook(
+    def parse_webhook(
         self,
-        headers: Mapping[str, str],
-        body: bytes,
-    ) -> ProviderWebhookEvent: ...
+        *,
+        headers: dict[str, str],
+        raw_body: bytes,
+        settings: Settings,
+    ) -> ParsedProviderWebhook: ...
 
     async def get_pull_request_context(
         self,
-        event: ProviderWebhookEvent,
-    ) -> ProviderPullRequestContext: ...
+        task: AgentTask,
+    ) -> PullRequestContext | None: ...
 
     async def list_changed_files(
         self,
-        context: ProviderPullRequestContext,
-    ) -> list[ProviderChangedFile]: ...
+        review_run: ReviewRun,
+    ) -> list[ChangedFile]: ...
 
-    async def upsert_summary_comment(
+    async def publish_summary_comment(
         self,
-        context: ProviderPullRequestContext,
-        body: str,
-        existing_provider_comment_id: str | None,
-    ) -> ProviderCommentRef: ...
+        session: AsyncSession,
+        review_run: ReviewRun,
+        *,
+        status_text: str,
+        finding_stats: dict[str, int] | None = None,
+    ) -> ReviewCommentRef | None: ...
 
-    async def create_line_comment(
+    async def publish_line_comments(
         self,
-        context: ProviderPullRequestContext,
-        finding: PublishableFinding,
-        body: str,
-    ) -> ProviderCommentRef: ...
+        session: AsyncSession,
+        review_run: ReviewRun,
+        *,
+        changed_files: list[ChangedFile],
+    ) -> dict[str, int]: ...
 ```
 
-如果一个 provider 只需要排队 review run，`parse_webhook` 和
-`get_pull_request_context` 是必需能力。只有在启用 line comment 发布前，
-`list_changed_files` 才是必需能力。Summary 和 line comment 发布可以在
-`ReviewConfig.line_comments_enabled` 与 provider capability check 后逐步接入。
+`parse_webhook` 由 API registry 用于 webhook 接入。Worker 侧也通过同一个
+adapter 对象完成 PR context hydration、changed-file lookup、summary
+发布和 line comment 发布。暂不支持 line comment 的 provider 应让
+`publish_line_comments` 返回全零统计，并保持该 provider 的
+`ReviewConfig.line_comments_enabled` 关闭。
+
+Worker 启动时应只构造一次持有 client 的 registry，并在 task 处理、review 处理和
+timeout 扫描中复用。操作未配置时，adapter 抛出 `ProviderCapabilityError`；平台
+client 或 SDK 失败时，adapter 将其转换成带有 `provider` 和 `operation` 属性的
+`ProviderOperationError`。Worker 只处理共享的 `ProviderError` 边界，不应导入
+平台专属的 client error。
 
 无论外部平台使用什么术语，内部都使用这些数据形状：
 

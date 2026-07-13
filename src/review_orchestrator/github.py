@@ -5,7 +5,7 @@ import hmac
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from pydantic import BaseModel, ConfigDict
@@ -18,6 +18,8 @@ from review_orchestrator.github_auth import (
 )
 from review_orchestrator.providers import (
     ParsedProviderWebhook,
+    ProviderCapabilityError,
+    ProviderOperationError,
     ProviderPayloadError,
     ProviderSignatureError,
     ProviderWebhookError,
@@ -25,6 +27,17 @@ from review_orchestrator.providers import (
     lower_headers,
 )
 from review_orchestrator.review_results import ChangedFile
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from review_orchestrator.config import Settings
+    from review_orchestrator.models import (
+        AgentTask,
+        PullRequestContext,
+        ReviewCommentRef,
+        ReviewRun,
+    )
 
 
 class GitHubWebhookError(ProviderWebhookError):
@@ -71,12 +84,15 @@ class NormalizedGitHubEvent:
 class GitHubAdapter:
     provider = "github"
 
+    def __init__(self, client: GitHubClient | None = None) -> None:
+        self.client = client
+
     def parse_webhook(
         self,
         *,
         headers: dict[str, str],
         raw_body: bytes,
-        settings: Any,
+        settings: Settings,
     ) -> ParsedProviderWebhook:
         normalized_headers = lower_headers(headers)
         delivery_id = normalized_headers.get("x-github-delivery")
@@ -102,6 +118,100 @@ class GitHubAdapter:
             provider_event=normalized_event.to_provider_event(),
             payload=payload,
             raw_body=raw_body,
+        )
+
+    async def get_pull_request_context(
+        self,
+        task: AgentTask,
+    ) -> PullRequestContext:
+        operation = "get_pull_request_context"
+        client = self._require_client(operation)
+        try:
+            pull_request = await client.get_pull_request(
+                task.repo_full_name,
+                task.pull_request_number,
+            )
+        except GitHubClientError as exc:
+            raise self._operation_error(operation, exc) from exc
+        return context_from_pull_request_task(task, pull_request)
+
+    async def list_changed_files(
+        self,
+        review_run: ReviewRun,
+    ) -> list[ChangedFile]:
+        operation = "list_changed_files"
+        client = self._require_client(operation)
+        try:
+            return await fetch_changed_files(
+                client,
+                repo_full_name=review_run.repo_full_name,
+                pull_request_number=review_run.pull_request_number,
+            )
+        except GitHubClientError as exc:
+            raise self._operation_error(operation, exc) from exc
+
+    async def publish_summary_comment(
+        self,
+        session: AsyncSession,
+        review_run: ReviewRun,
+        *,
+        status_text: str,
+        finding_stats: dict[str, int] | None = None,
+    ) -> ReviewCommentRef | None:
+        operation = "publish_summary_comment"
+        client = self._require_client(operation)
+        from review_orchestrator.comments import publish_github_summary_comment
+
+        try:
+            return await publish_github_summary_comment(
+                session,
+                review_run,
+                github_client=client,
+                status_text=status_text,
+                finding_stats=finding_stats,
+            )
+        except GitHubClientError as exc:
+            raise self._operation_error(operation, exc) from exc
+
+    async def publish_line_comments(
+        self,
+        session: AsyncSession,
+        review_run: ReviewRun,
+        *,
+        changed_files: list[ChangedFile],
+    ) -> dict[str, int]:
+        operation = "publish_line_comments"
+        client = self._require_client(operation)
+        from review_orchestrator.comments import publish_github_line_comments
+
+        try:
+            return await publish_github_line_comments(
+                session,
+                review_run,
+                github_client=client,
+                changed_files=changed_files,
+            )
+        except GitHubClientError as exc:
+            raise self._operation_error(operation, exc) from exc
+
+    def _require_client(self, operation: str) -> GitHubClient:
+        if self.client is None:
+            raise ProviderCapabilityError(
+                "GitHub client is not configured.",
+                provider=self.provider,
+                operation=operation,
+            )
+        return self.client
+
+    def _operation_error(
+        self,
+        operation: str,
+        error: GitHubClientError,
+    ) -> ProviderOperationError:
+        return ProviderOperationError(
+            str(error),
+            provider=self.provider,
+            operation=operation,
         )
 
 
@@ -367,6 +477,68 @@ def _parse_hunk_new_start(header: str) -> int | None:
         return int(start)
     except ValueError:
         return None
+
+
+def context_from_pull_request_task(
+    task: AgentTask,
+    pull_request: dict[str, Any],
+) -> PullRequestContext:
+    from review_orchestrator.models import PullRequestContext
+
+    base = pull_request.get("base") if isinstance(pull_request, dict) else None
+    head = pull_request.get("head") if isinstance(pull_request, dict) else None
+    base_repo = base.get("repo") if isinstance(base, dict) else None
+    head_repo = head.get("repo") if isinstance(head, dict) else None
+    head_repo_full_name = _repo_full_name(head_repo)
+    base_repo_full_name = _repo_full_name(base_repo)
+    return PullRequestContext(
+        provider=task.provider,
+        repo_full_name=task.repo_full_name,
+        pull_request_number=task.pull_request_number,
+        provider_pr_id=_id_to_str(pull_request.get("id")),
+        title=_optional_str(pull_request.get("title")),
+        author_login=_login(pull_request.get("user")),
+        base_ref=_ref(base),
+        base_sha=_sha(base),
+        head_ref=_ref(head),
+        head_sha=_sha(head) or "",
+        head_repo_full_name=head_repo_full_name,
+        is_fork=bool(
+            head_repo_full_name and head_repo_full_name != base_repo_full_name
+        ),
+        status=_optional_str(pull_request.get("state")) or "open",
+        html_url=_optional_str(pull_request.get("html_url")),
+    )
+
+
+def _id_to_str(value: Any) -> str | None:
+    if isinstance(value, int | str):
+        return str(value)
+    return None
+
+
+def _sha(ref_object: Any) -> str | None:
+    if not isinstance(ref_object, dict):
+        return None
+    return _optional_str(ref_object.get("sha"))
+
+
+def _ref(ref_object: Any) -> str | None:
+    if not isinstance(ref_object, dict):
+        return None
+    return _optional_str(ref_object.get("ref"))
+
+
+def _repo_full_name(repo: Any) -> str | None:
+    if not isinstance(repo, dict):
+        return None
+    return _optional_str(repo.get("full_name"))
+
+
+def _login(user: Any) -> str | None:
+    if not isinstance(user, dict):
+        return None
+    return _optional_str(user.get("login"))
 
 
 PR_ACTIONS_TO_INTERNAL_EVENT = {
