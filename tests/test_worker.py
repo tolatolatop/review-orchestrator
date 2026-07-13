@@ -185,6 +185,10 @@ class FakeGitHubClient:
         self.issue_comments = []
         self.updated_issue_comment_count = 0
 
+    async def get_token(self, repo_full_name: str):
+        del repo_full_name
+        return None
+
     async def get_pull_request(self, repo_full_name: str, pull_request_number: int):
         return {
             "id": 2002,

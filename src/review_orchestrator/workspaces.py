@@ -8,11 +8,13 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from review_orchestrator.config import Settings
+from review_orchestrator.github import GitHubClient, GitHubClientError
 from review_orchestrator.models import Workspace, WorkspaceLease, utc_now
 from review_orchestrator.schemas import (
     CleanupSummary,
@@ -58,6 +60,8 @@ async def prepare_workspace(
     session: AsyncSession,
     settings: Settings,
     request: WorkspacePrepareRequest,
+    *,
+    github_client: GitHubClient | None = None,
 ) -> WorkspacePrepareResponse:
     if request.provider != "github":
         return WorkspacePrepareResponse(
@@ -114,7 +118,20 @@ async def prepare_workspace(
     await session.refresh(workspace)
 
     try:
-        await asyncio.to_thread(_prepare_git_workspace, paths, request)
+        auth_token = (
+            await github_client.get_token(request.repository.full_name)
+            if github_client is not None
+            else None
+        )
+        await asyncio.to_thread(_prepare_git_workspace, paths, request, auth_token)
+    except GitHubClientError as exc:
+        workspace.status = "failed"
+        workspace.failure_code = WorkspaceErrorCode.auth_failed
+        workspace.failure_message = str(exc)
+        workspace.expires_at = utc_now() + timedelta(hours=6)
+        await session.commit()
+        await session.refresh(workspace)
+        return _prepare_response(workspace, from_cache=False)
     except GitCommandError as exc:
         workspace.status = "failed"
         workspace.failure_code = exc.code
@@ -324,12 +341,13 @@ def _workspace_paths(
 def _prepare_git_workspace(
     paths: WorkspacePaths,
     request: WorkspacePrepareRequest,
+    auth_token: str | None = None,
 ) -> None:
     paths.repo_path.parent.mkdir(parents=True, exist_ok=True)
     if request.options.force_refresh:
         shutil.rmtree(paths.repo_path, ignore_errors=True)
 
-    env = _git_env(request)
+    env = _git_env(request, auth_token=auth_token)
     if request.options.use_git_cache:
         _ensure_cache(paths.cache_path, request.repository.clone_url, env)
         clone_source = str(paths.cache_path)
@@ -435,22 +453,40 @@ def _classify_git_error(stderr: str) -> str:
     return WorkspaceErrorCode.git_error
 
 
-def _git_env(request: WorkspacePrepareRequest) -> dict[str, str]:
+def _git_env(
+    request: WorkspacePrepareRequest,
+    *,
+    auth_token: str | None = None,
+) -> dict[str, str]:
     env = os.environ.copy()
     token_ref = request.auth.token_ref if request.auth else None
-    if not token_ref:
-        return env
-    token = os.environ.get(token_ref)
+    token = auth_token or (os.environ.get(token_ref) if token_ref else None)
     if not token:
-        raise GitCommandError(
-            WorkspaceErrorCode.auth_failed,
-            f"Token reference is not available: {token_ref}",
-        )
+        if token_ref:
+            raise GitCommandError(
+                WorkspaceErrorCode.auth_failed,
+                f"Token reference is not available: {token_ref}",
+            )
+        return env
+
+    authenticated_base = _authenticated_https_base(request.repository.clone_url)
+    if authenticated_base is None:
+        return env
     env["GIT_CONFIG_COUNT"] = "1"
-    env["GIT_CONFIG_KEY_0"] = f"url.https://x-access-token:{token}@github.com/.insteadOf"
-    env["GIT_CONFIG_VALUE_0"] = "https://github.com/"
+    env["GIT_CONFIG_KEY_0"] = (
+        f"url.https://x-access-token:{token}@{authenticated_base}.insteadOf"
+    )
+    env["GIT_CONFIG_VALUE_0"] = f"https://{authenticated_base}"
     env["REVIEW_GIT_TOKEN_MASK"] = token
     return env
+
+
+def _authenticated_https_base(clone_url: str) -> str | None:
+    parsed = urlsplit(clone_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.hostname}{port}/"
 
 
 def _mask_secret(value: str, env: dict[str, str]) -> str:

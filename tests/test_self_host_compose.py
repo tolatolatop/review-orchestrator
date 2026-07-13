@@ -16,8 +16,9 @@ def test_openhands_state_uses_the_configured_file_store_path() -> None:
 
 
 def test_openhands_uses_a_separate_provisioned_postgres_database() -> None:
-    compose = Path("docker-compose.self_host.yaml").read_text()
-    example_env = Path(".env.example").read_text()
+    root = Path(__file__).parents[1]
+    compose = (root / "docker-compose.self_host.yaml").read_text()
+    example_env = (root / ".env.example").read_text()
 
     assert "openhands-db-init:" in compose
     assert "openhands-db-migrate:" in compose
@@ -33,13 +34,29 @@ def test_openhands_uses_a_separate_provisioned_postgres_database() -> None:
 
 
 def test_openhands_migration_is_fail_closed_and_keeps_a_backup() -> None:
-    migration = Path("deploy/openhands/migrate_sqlite_to_postgres.py").read_text()
+    migration = (
+        Path(__file__).parents[1]
+        / "deploy"
+        / "openhands"
+        / "migrate_sqlite_to_postgres.py"
+    ).read_text()
 
-    assert 'with_suffix(".db.pre-postgres.bak")' in migration
+    assert 'f".db.pre-postgres-{_sqlite_digest(temporary)}.bak"' in migration
     assert "CREATE TYPE eventcallbackstatus" in migration
     assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS" in migration
-    assert "Refusing partial migration" in migration
+    assert "Refusing conflicting migration" in migration
+    assert "missing_keys = source_rows.keys() - target_rows.keys()" in migration
     assert (
         "with source_engine.connect() as source, target_engine.begin() as target"
         in migration
     )
+
+
+def test_github_app_private_key_is_mounted_only_into_orchestrator_services() -> None:
+    compose = (Path(__file__).parents[1] / "docker-compose.self_host.yaml").read_text()
+
+    assert compose.count("- ./secrets:/run/secrets:ro") == 2
+    openhands_section = compose.split("  openhands:", 1)[1].split(
+        "  review-orchestrator:", 1
+    )[0]
+    assert "/run/secrets" not in openhands_section

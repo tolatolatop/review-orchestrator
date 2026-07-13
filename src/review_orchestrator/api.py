@@ -7,6 +7,7 @@ from review_orchestrator.db import get_session
 from review_orchestrator.github import GitHubAdapter
 from review_orchestrator.gitlab import GitLabAdapter
 from review_orchestrator.openhands import OpenHandsClient
+from review_orchestrator.platform_diagnostics import diagnose_platform_permissions
 from review_orchestrator.providers import ProviderRegistry, ProviderWebhookError
 from review_orchestrator.review_results import ReviewResultError
 from review_orchestrator.schemas import (
@@ -14,6 +15,8 @@ from review_orchestrator.schemas import (
     AgentTaskListResponse,
     CleanupSummary,
     OpenHandsSessionDiagnostics,
+    PlatformPermissionDiagnosticRequest,
+    PlatformPermissionDiagnosticResponse,
     ProviderEventInboxDetail,
     ProviderEventInboxListResponse,
     PullRequestWorkspaceCleanupRequest,
@@ -67,6 +70,24 @@ from review_orchestrator.workspaces import (
 router = APIRouter(prefix="/api/v1")
 session_dependency = Depends(get_session)
 provider_registry = ProviderRegistry([GitHubAdapter(), GitLabAdapter()])
+
+
+@router.post(
+    "/diagnostics/platform-permissions",
+    response_model=PlatformPermissionDiagnosticResponse,
+)
+async def diagnose_platform_permissions_endpoint(
+    payload: PlatformPermissionDiagnosticRequest,
+    request: Request,
+) -> PlatformPermissionDiagnosticResponse:
+    injected = getattr(request.app.state, "platform_permission_probe", None)
+    if injected is not None:
+        return await injected(request.app.state.settings, payload)
+    return await diagnose_platform_permissions(
+        request.app.state.settings,
+        payload,
+        github_client=request.app.state.github_client,
+    )
 
 
 def get_openhands_client(request: Request) -> OpenHandsClient:
@@ -491,7 +512,12 @@ async def prepare_workspace_endpoint(
     request: Request,
     session: AsyncSession = session_dependency,
 ) -> WorkspacePrepareResponse:
-    return await prepare_workspace(session, request.app.state.settings, payload)
+    return await prepare_workspace(
+        session,
+        request.app.state.settings,
+        payload,
+        github_client=request.app.state.github_client,
+    )
 
 
 @router.get("/workspaces/{workspace_id}", response_model=WorkspaceRead)

@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     )
     github_app_id: str | None = None
     github_private_key_path: str | None = None
+    github_installation_id: int | None = Field(default=None, gt=0)
     github_installation_token: str | None = Field(
         default=None,
         description=(
@@ -67,6 +68,11 @@ class Settings(BaseSettings):
     gitlab_api_token: str | None = Field(
         default=None,
         description="GitLab API token used by the worker for MR lookup and notes.",
+    )
+    platform_diagnostics_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        description="HTTP timeout for read-only provider permission diagnostics.",
     )
     workspace_root: str = "./.workspaces"
     git_cache_root: str = "./.git-cache"

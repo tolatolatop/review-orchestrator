@@ -8,6 +8,7 @@ from review_orchestrator.api import router
 from review_orchestrator.config import Settings, get_settings
 from review_orchestrator.dashboard import DASHBOARD_HTML
 from review_orchestrator.db import create_engine, create_session_factory, init_models
+from review_orchestrator.github import create_github_client
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -16,14 +17,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         engine = create_engine(settings)
-        app.state.settings = settings
-        app.state.engine = engine
-        app.state.session_factory = create_session_factory(engine)
-        await init_models(engine)
+        github_client = None
         try:
+            app.state.settings = settings
+            app.state.engine = engine
+            app.state.session_factory = create_session_factory(engine)
+            github_client = create_github_client(settings)
+            app.state.github_client = github_client
+            await init_models(engine)
             yield
         finally:
-            await engine.dispose()
+            try:
+                if github_client is not None:
+                    await github_client.aclose()
+            finally:
+                await engine.dispose()
 
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
     app.include_router(router)

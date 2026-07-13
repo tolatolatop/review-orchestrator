@@ -2,25 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
 import sys
 import traceback
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from alembic import command
-from alembic.config import Config
 from sqlalchemy import (
     JSON,
     DateTime,
     MetaData,
     Uuid,
     create_engine,
-    func,
     select,
     text,
 )
@@ -28,7 +26,6 @@ from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.sql.schema import Table
 
 SQLITE_PATH = Path(os.getenv("OPENHANDS_SQLITE_PATH", "/.openhands/openhands.db"))
-BACKUP_PATH = SQLITE_PATH.with_suffix(".db.pre-postgres.bak")
 ALEMBIC_INI = Path("/app/openhands/app_server/app_lifespan/alembic.ini")
 TABLE_NAMES = (
     "app_conversation_start_task",
@@ -81,6 +78,9 @@ def _alembic_revision(engine: Engine) -> str | None:
 
 
 def upgrade_postgres(engine: Engine) -> None:
+    from alembic import command
+    from alembic.config import Config
+
     if not ALEMBIC_INI.is_file():
         raise RuntimeError(f"OpenHands Alembic config is missing: {ALEMBIC_INI}")
     config = Config(str(ALEMBIC_INI))
@@ -101,11 +101,31 @@ def upgrade_postgres(engine: Engine) -> None:
     command.upgrade(config, "head")
 
 
-def backup_sqlite(source: Path = SQLITE_PATH, backup: Path = BACKUP_PATH) -> None:
-    if backup.exists():
-        return
-    with sqlite3.connect(source) as source_db, sqlite3.connect(backup) as backup_db:
-        source_db.backup(backup_db)
+def _sqlite_digest(source: Path) -> str:
+    digest = hashlib.sha256()
+    with source.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()[:12]
+
+
+def backup_sqlite(source: Path = SQLITE_PATH) -> Path:
+    temporary = source.with_suffix(".db.pre-postgres.tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        with sqlite3.connect(source) as source_db, sqlite3.connect(
+            temporary
+        ) as backup_db:
+            source_db.backup(backup_db)
+        backup = source.with_suffix(
+            f".db.pre-postgres-{_sqlite_digest(temporary)}.bak"
+        )
+        if backup.exists():
+            return backup
+        temporary.replace(backup)
+        return backup
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _primary_key(table: Table) -> tuple[str, ...]:
@@ -121,7 +141,13 @@ def _normalize(value: Any, column: Any) -> Any:
     if isinstance(column.type, Uuid) and not isinstance(value, uuid.UUID):
         return uuid.UUID(str(value))
     if isinstance(column.type, DateTime) and isinstance(value, str):
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if isinstance(column.type, DateTime) and isinstance(value, datetime):
+        if column.type.timezone and value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        if not column.type.timezone and value.tzinfo is not None:
+            return value.astimezone(UTC).replace(tzinfo=None)
+        return value
     if isinstance(column.type, JSON) and isinstance(value, str):
         return json.loads(value)
     return value
@@ -164,31 +190,45 @@ def migrate_tables(source_engine: Engine, target_engine: Engine) -> dict[str, in
                 continue
             target_table = target_metadata.tables[name]
             rows = _source_rows(source, name, target_table)
-            source_keys = {
-                tuple(row[key] for key in _primary_key(target_table)) for row in rows
+            primary_key = _primary_key(target_table)
+            source_rows = {
+                tuple(row[key] for key in primary_key): row for row in rows
             }
-            target_rows = target.execute(select(target_table)).mappings()
-            target_keys = {
-                tuple(row[key] for key in _primary_key(target_table))
-                for row in target_rows
+            target_rows = {
+                tuple(row[key] for key in primary_key): dict(row)
+                for row in target.execute(select(target_table)).mappings()
             }
-            if source_keys <= target_keys:
-                copied[name] = 0
-                continue
-            if target_keys:
-                raise RuntimeError(
-                    f"Refusing partial migration for {name}: PostgreSQL already "
-                    "contains different rows"
+
+            conflicting_columns: set[str] = set()
+            for key in source_rows.keys() & target_rows.keys():
+                source_row = source_rows[key]
+                target_row = target_rows[key]
+                conflicting_columns.update(
+                    column
+                    for column, value in source_row.items()
+                    if target_row.get(column) != value
                 )
-            if rows:
-                target.execute(target_table.insert(), rows)
-            actual = target.scalar(select(func.count()).select_from(target_table))
-            if actual != len(rows):
+            if conflicting_columns:
                 raise RuntimeError(
-                    f"Row validation failed for {name}: expected {len(rows)}, "
-                    f"got {actual}"
+                    f"Refusing conflicting migration for {name}: matching primary "
+                    "keys contain different values in columns "
+                    f"{sorted(conflicting_columns)}"
                 )
-            copied[name] = len(rows)
+
+            missing_keys = source_rows.keys() - target_rows.keys()
+            missing_rows = [source_rows[key] for key in missing_keys]
+            if missing_rows:
+                target.execute(target_table.insert(), missing_rows)
+
+            migrated_keys = {
+                tuple(row[key] for key in primary_key)
+                for row in target.execute(select(target_table)).mappings()
+            }
+            if not source_rows.keys() <= migrated_keys:
+                raise RuntimeError(
+                    f"Primary-key validation failed after migrating {name}"
+                )
+            copied[name] = len(missing_rows)
     return copied
 
 
@@ -204,7 +244,7 @@ def main() -> int:
             )
             return 0
 
-        backup_sqlite()
+        backup = backup_sqlite()
         source_engine = create_engine(f"sqlite:///{SQLITE_PATH}")
         try:
             copied = migrate_tables(source_engine, target_engine)
@@ -216,7 +256,7 @@ def main() -> int:
         "OpenHands SQLite migration verified: "
         + ", ".join(f"{name}={count}" for name, count in copied.items())
     )
-    print(f"Legacy backup retained at {BACKUP_PATH}")
+    print(f"Legacy backup retained at {backup}")
     return 0
 
 

@@ -110,6 +110,7 @@ services:
       - "8000"
     volumes:
       - review_orchestrator_data:/var/lib/review-orchestrator
+      - ./secrets:/run/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -147,6 +148,7 @@ services:
       WORKER_LOCK_SECONDS: ${WORKER_LOCK_SECONDS:-300}
     volumes:
       - review_orchestrator_data:/var/lib/review-orchestrator
+      - ./secrets:/run/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
