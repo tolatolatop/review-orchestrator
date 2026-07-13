@@ -64,6 +64,7 @@ locally:
 ### MVP Endpoints
 
 - `GET /health`
+- `POST /api/v1/diagnostics/platform-permissions`
 - `POST /api/v1/webhooks/{provider}`
 - `POST /api/v1/review-runs`
 - `GET /api/v1/review-runs/{review_run_id}`
@@ -84,6 +85,28 @@ the deployment verification checklist are documented in
 `provider + repo_full_name + pull_request_number + head_sha`. A repeated request
 returns the latest existing run unless `force=true` is supplied. Failed runs can
 be retried through the retry endpoint without `force=true`.
+
+### Platform permission diagnostics
+
+`POST /api/v1/diagnostics/platform-permissions` performs read-only checks with
+the configured GitHub or GitLab API token. It verifies repository access and,
+when `pull_request_number` is supplied, PR/MR read access. It also reports safe
+scope, repository-role, and rate-limit metadata when the provider returns it.
+Credentials and upstream response bodies are never included in the response.
+
+```bash
+curl -sS http://localhost:8000/api/v1/diagnostics/platform-permissions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "provider": "github",
+    "repo_full_name": "owner/repo",
+    "pull_request_number": 123
+  }'
+```
+
+The overall `status` is `healthy`, `degraded`, or `failed`. A write check can be
+`unknown` when a fine-grained provider token does not advertise its grants;
+the diagnostic intentionally does not create a probe comment to test writes.
 
 ### GitHub Webhooks
 

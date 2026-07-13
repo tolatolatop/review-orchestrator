@@ -68,6 +68,11 @@ class Settings(BaseSettings):
         default=None,
         description="GitLab API token used by the worker for MR lookup and notes.",
     )
+    platform_diagnostics_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        description="HTTP timeout for read-only provider permission diagnostics.",
+    )
     workspace_root: str = "./.workspaces"
     git_cache_root: str = "./.git-cache"
     review_run_timeout_seconds: int = 1800
