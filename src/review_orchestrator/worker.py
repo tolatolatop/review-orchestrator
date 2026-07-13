@@ -13,12 +13,10 @@ from review_orchestrator.config import Settings
 from review_orchestrator.github import (
     GitHubAdapter,
     GitHubClient,
-    GitHubClientError,
 )
 from review_orchestrator.gitlab import (
     GitLabAdapter,
     GitLabClient,
-    GitLabClientError,
 )
 from review_orchestrator.models import (
     AgentTask,
@@ -28,7 +26,12 @@ from review_orchestrator.models import (
     utc_now,
 )
 from review_orchestrator.openhands import OpenHandsClient, OpenHandsClientError
-from review_orchestrator.providers import ProviderCapabilityError, ProviderRegistry
+from review_orchestrator.providers import (
+    ProviderAdapter,
+    ProviderError,
+    ProviderRegistry,
+)
+from review_orchestrator.review_results import ChangedFile
 from review_orchestrator.schemas import ReviewRunCreate, WorkspacePrepareRequest
 from review_orchestrator.services import (
     collect_review_result,
@@ -52,7 +55,7 @@ def build_worker_provider_registry(
     github_client: GitHubClient | None = None,
     gitlab_client: GitLabClient | None = None,
 ) -> ProviderRegistry:
-    adapters = []
+    adapters: list[ProviderAdapter] = []
     if github_client is not None:
         adapters.append(GitHubAdapter(github_client))
     if gitlab_client is not None:
@@ -146,14 +149,13 @@ async def process_next_agent_task(
                     task,
                     provider_registry=registry,
                 )
-            except (GitHubClientError, GitLabClientError) as exc:
+            except ProviderError as exc:
                 return await _fail_agent_task(
                     session,
                     task,
                     failure_code="provider_context_lookup_failed",
                     error=str(exc),
-                    github_client=github_client,
-                    gitlab_client=gitlab_client,
+                    provider_registry=registry,
                 )
         if context is None:
             return await _fail_agent_task(
@@ -161,8 +163,7 @@ async def process_next_agent_task(
                 task,
                 failure_code="missing_pr_context",
                 error="Pull request context was not found for mention task.",
-                github_client=github_client,
-                gitlab_client=gitlab_client,
+                provider_registry=registry,
             )
 
         review_run = await create_review_run(
@@ -190,8 +191,7 @@ async def process_next_agent_task(
             task,
             failure_code="agent_task_failed",
             error=str(exc),
-            github_client=github_client,
-            gitlab_client=gitlab_client,
+            provider_registry=registry,
         )
 
 
@@ -201,8 +201,7 @@ async def _fail_agent_task(
     *,
     failure_code: str,
     error: str,
-    github_client: GitHubClient | None,
-    gitlab_client: GitLabClient | None,
+    provider_registry: ProviderRegistry,
 ) -> AgentTask:
     task.status = "failed"
     task.error_message = error
@@ -220,8 +219,7 @@ async def _fail_agent_task(
         await publish_review_run_status_comment(
             session,
             review_run,
-            github_client=github_client,
-            gitlab_client=gitlab_client,
+            provider_registry=provider_registry,
             status_text="failed",
         )
     except Exception as exc:
@@ -439,6 +437,7 @@ async def process_next_review_run(
                 review_run,
                 github_client=github_client,
                 gitlab_client=gitlab_client,
+                provider_registry=registry,
                 status_text="failed",
             )
             return review_run
@@ -645,8 +644,8 @@ async def publish_review_run_status_comment(
     session: AsyncSession,
     review_run: ReviewRun,
     *,
-    github_client: GitHubClient | None,
-    gitlab_client: GitLabClient | None,
+    github_client: GitHubClient | None = None,
+    gitlab_client: GitLabClient | None = None,
     provider_registry: ProviderRegistry | None = None,
     status_text: str,
 ) -> None:
@@ -905,13 +904,13 @@ async def _fetch_changed_files(
     review_run: ReviewRun,
     *,
     provider_registry: ProviderRegistry,
-) -> list[Any]:
+) -> list[ChangedFile]:
     try:
         adapter = provider_registry.get(review_run.provider)
         if adapter is None:
             return []
         return await adapter.list_changed_files(review_run)
-    except (GitHubClientError, GitLabClientError, ProviderCapabilityError) as exc:
+    except ProviderError as exc:
         warnings = list(review_run.validation_warnings_json or [])
         warnings.append(
             {

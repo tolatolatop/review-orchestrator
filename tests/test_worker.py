@@ -20,6 +20,7 @@ from review_orchestrator.openhands import (
     OpenHandsStartTask,
     OpenHandsStartTaskStatus,
 )
+from review_orchestrator.providers import ProviderOperationError, ProviderRegistry
 from review_orchestrator.review_results import parse_review_result
 from review_orchestrator.schemas import ReviewRunCreate
 from review_orchestrator.services import create_review_run
@@ -251,6 +252,42 @@ class FailingChangedFilesGitHubClient(FakeGitHubClient):
 class FailingPullRequestGitHubClient(FakeGitHubClient):
     async def get_pull_request(self, repo_full_name: str, pull_request_number: int):
         raise GitHubClientError("GitHub token invalid")
+
+
+class CustomProviderAdapter:
+    provider = "custom"
+
+    def __init__(self, *, fail_context: bool = False) -> None:
+        self.fail_context = fail_context
+        self.summary_statuses: list[str] = []
+
+    async def get_pull_request_context(self, task: AgentTask) -> PullRequestContext:
+        if self.fail_context:
+            raise ProviderOperationError(
+                "Custom context lookup failed",
+                provider=self.provider,
+                operation="get_pull_request_context",
+            )
+        return PullRequestContext(
+            provider=self.provider,
+            repo_full_name=task.repo_full_name,
+            pull_request_number=task.pull_request_number,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="open",
+        )
+
+    async def publish_summary_comment(
+        self,
+        session,
+        review_run,
+        *,
+        status_text: str,
+        finding_stats=None,
+    ):
+        del session, review_run, finding_stats
+        self.summary_statuses.append(status_text)
+        return None
 
 
 @pytest.fixture
@@ -544,6 +581,60 @@ async def test_agent_task_worker_hydrates_context_for_first_mention(
     assert processed is not None
     assert processed.status == "completed"
     assert processed.pull_request_context_id is not None
+
+
+async def test_agent_task_worker_uses_custom_provider_registry(
+    session_factory,
+) -> None:
+    adapter = CustomProviderAdapter()
+    async with session_factory() as session:
+        task = AgentTask(
+            provider="custom",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            task_type="mention",
+            status="queued",
+        )
+        session.add(task)
+        await session.commit()
+
+        processed = await process_next_agent_task(
+            session,
+            worker_id="worker-1",
+            provider_registry=ProviderRegistry([adapter]),
+        )
+
+    assert processed is not None
+    assert processed.status == "completed"
+    assert processed.pull_request_context_id is not None
+
+
+async def test_agent_task_provider_failure_uses_same_registry_for_summary(
+    session_factory,
+) -> None:
+    adapter = CustomProviderAdapter(fail_context=True)
+    async with session_factory() as session:
+        task = AgentTask(
+            provider="custom",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+            task_type="mention",
+            status="queued",
+            input_json={"payload": {"pull_request": {"head": {"sha": "b" * 40}}}},
+        )
+        session.add(task)
+        await session.commit()
+
+        processed = await process_next_agent_task(
+            session,
+            worker_id="worker-1",
+            provider_registry=ProviderRegistry([adapter]),
+        )
+
+    assert processed is not None
+    assert processed.status == "failed"
+    assert processed.error_message == "Custom context lookup failed"
+    assert adapter.summary_statuses == ["failed"]
 
 
 async def test_agent_task_hydrate_failure_marks_failed_and_publishes_summary(

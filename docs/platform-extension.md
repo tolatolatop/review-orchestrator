@@ -1,11 +1,10 @@
 # Platform Provider Extension Guide
 
-Review Orchestrator is currently a GitHub-first MVP. The data model and several
-API schemas already carry a `provider` value, but webhook ingestion, event
-normalization, API headers, and provider-side publishing behavior are still
-implemented with GitHub semantics. This guide describes how to add GitLab, Azure
-DevOps, Bitbucket, GitCode, or another code-hosting platform without weakening
-the existing GitHub path.
+Review Orchestrator uses GitHub as its reference provider and includes an initial
+GitLab implementation. The data model, API schemas, webhook intake, and worker
+operations carry a `provider` value and route platform behavior through provider
+adapters. This guide describes how to add Azure DevOps, Bitbucket, GitCode, or
+another code-hosting platform without weakening the existing providers.
 
 The target shape is a small provider adapter boundary around external platform
 behavior. Review run lifecycle, OpenHands session orchestration, workspace
@@ -32,17 +31,15 @@ GitHub support currently covers:
 - Summary-only fallback when a finding cannot be mapped to a changed,
   commentable line.
 
-GitHub-specific assumptions still visible in the code:
+Provider-specific integration points that remain visible in the code:
 
-- The generic `/webhooks/{provider}` route rejects every provider except
-  `github`.
-- Header names, signature format, event names, and payload field paths are
-  handled directly in the route and `review_orchestrator.github`.
-- `accept_github_webhook` is named and typed around
-  `NormalizedGitHubEvent`.
-- Runtime settings contain GitHub App and GitHub API fields only.
-- Provider diff fetching, comment publishing, review thread resolve, and rate
-  limit handling are not yet represented as a shared adapter interface.
+- Each adapter still owns its platform's header names, signature format, event
+  names, payload paths, client, and authentication settings.
+- Workspace clone URL and credential preparation still has provider-aware
+  behavior outside the worker adapter operations.
+- GitHub supports line comments; GitLab currently returns summary-only stats.
+- Review thread resolution and provider-specific rate-limit backoff are not yet
+  part of the minimum adapter contract.
 
 Do not rename or generalize all GitHub code before another provider proves the
 need. Add the smallest adapter surface that lets the next provider use the same
@@ -87,7 +84,7 @@ class ProviderAdapter(Protocol):
         *,
         headers: dict[str, str],
         raw_body: bytes,
-        settings: Any,
+        settings: Settings,
     ) -> ParsedProviderWebhook: ...
 
     async def get_pull_request_context(
@@ -107,7 +104,7 @@ class ProviderAdapter(Protocol):
         *,
         status_text: str,
         finding_stats: dict[str, int] | None = None,
-    ) -> Any: ...
+    ) -> ReviewCommentRef | None: ...
 
     async def publish_line_comments(
         self,
@@ -123,6 +120,13 @@ flows use the same adapter object for PR context hydration, changed-file lookup,
 summary publishing, and line comment publishing. Providers that do not support
 line comments yet should return zeroed publish stats from `publish_line_comments`
 and keep `ReviewConfig.line_comments_enabled` disabled for that provider.
+
+Construct the client-bearing worker registry once when the worker starts and
+reuse that registry for task processing, review processing, and timeout scans.
+Adapters raise `ProviderCapabilityError` when an operation is not configured and
+translate platform client or SDK failures into `ProviderOperationError`, with
+`provider` and `operation` attributes. Worker code handles the shared
+`ProviderError` boundary and must not import platform-specific client errors.
 
 Use these internal data shapes regardless of external provider vocabulary:
 

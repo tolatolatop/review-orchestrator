@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 import httpx
@@ -11,12 +11,24 @@ from review_orchestrator.github import parse_commentable_lines
 from review_orchestrator.providers import (
     ParsedProviderWebhook,
     ProviderCapabilityError,
+    ProviderOperationError,
     ProviderPayloadError,
     ProviderSignatureError,
     ProviderWebhookEvent,
     lower_headers,
 )
 from review_orchestrator.review_results import ChangedFile
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from review_orchestrator.config import Settings
+    from review_orchestrator.models import (
+        AgentTask,
+        PullRequestContext,
+        ReviewCommentRef,
+        ReviewRun,
+    )
 
 
 class GitLabClientError(RuntimeError):
@@ -187,7 +199,7 @@ class GitLabAdapter:
         *,
         headers: dict[str, str],
         raw_body: bytes,
-        settings: Any,
+        settings: Settings,
     ) -> ParsedProviderWebhook:
         normalized_headers = lower_headers(headers)
         delivery_id = (
@@ -214,52 +226,87 @@ class GitLabAdapter:
             raw_body=raw_body,
         )
 
-    async def get_pull_request_context(self, task) -> Any:
-        if self.client is None:
-            raise ProviderCapabilityError("GitLab client is not configured.")
-        merge_request = await self.client.get_merge_request(
-            task.repo_full_name,
-            task.pull_request_number,
-        )
+    async def get_pull_request_context(
+        self,
+        task: AgentTask,
+    ) -> PullRequestContext:
+        operation = "get_pull_request_context"
+        client = self._require_client(operation)
+        try:
+            merge_request = await client.get_merge_request(
+                task.repo_full_name,
+                task.pull_request_number,
+            )
+        except GitLabClientError as exc:
+            raise self._operation_error(operation, exc) from exc
         return context_from_merge_request_task(task, merge_request)
 
-    async def list_changed_files(self, review_run) -> list[ChangedFile]:
-        if self.client is None:
-            raise ProviderCapabilityError("GitLab client is not configured.")
-        return await fetch_gitlab_changed_files(
-            self.client,
-            project_path=review_run.repo_full_name,
-            merge_request_iid=review_run.pull_request_number,
-        )
+    async def list_changed_files(
+        self,
+        review_run: ReviewRun,
+    ) -> list[ChangedFile]:
+        operation = "list_changed_files"
+        client = self._require_client(operation)
+        try:
+            return await fetch_gitlab_changed_files(
+                client,
+                project_path=review_run.repo_full_name,
+                merge_request_iid=review_run.pull_request_number,
+            )
+        except GitLabClientError as exc:
+            raise self._operation_error(operation, exc) from exc
 
     async def publish_summary_comment(
         self,
-        session,
-        review_run,
+        session: AsyncSession,
+        review_run: ReviewRun,
         *,
         status_text: str,
         finding_stats: dict[str, int] | None = None,
-    ) -> Any:
-        if self.client is None:
-            raise ProviderCapabilityError("GitLab client is not configured.")
+    ) -> ReviewCommentRef | None:
+        operation = "publish_summary_comment"
+        client = self._require_client(operation)
         from review_orchestrator.comments import publish_gitlab_summary_comment
 
-        return await publish_gitlab_summary_comment(
-            session,
-            review_run,
-            gitlab_client=self.client,
-            status_text=status_text,
-            finding_stats=finding_stats,
-        )
+        try:
+            return await publish_gitlab_summary_comment(
+                session,
+                review_run,
+                gitlab_client=client,
+                status_text=status_text,
+                finding_stats=finding_stats,
+            )
+        except GitLabClientError as exc:
+            raise self._operation_error(operation, exc) from exc
 
     async def publish_line_comments(
         self,
-        session,
-        review_run,
+        session: AsyncSession,
+        review_run: ReviewRun,
         *,
         changed_files: list[ChangedFile],
     ) -> dict[str, int]:
         return {"published": 0, "summary_only": 0, "deduped": 0, "failed": 0}
+
+    def _require_client(self, operation: str) -> GitLabClient:
+        if self.client is None:
+            raise ProviderCapabilityError(
+                "GitLab client is not configured.",
+                provider=self.provider,
+                operation=operation,
+            )
+        return self.client
+
+    def _operation_error(
+        self,
+        operation: str,
+        error: GitLabClientError,
+    ) -> ProviderOperationError:
+        return ProviderOperationError(
+            str(error),
+            provider=self.provider,
+            operation=operation,
+        )
 
 
 def normalize_gitlab_event(
@@ -350,7 +397,10 @@ def _quoted(value: str) -> str:
     return quote(value, safe="")
 
 
-def context_from_merge_request_task(task: Any, merge_request: dict[str, Any]) -> Any:
+def context_from_merge_request_task(
+    task: AgentTask,
+    merge_request: dict[str, Any],
+) -> PullRequestContext:
     from review_orchestrator.models import PullRequestContext
 
     return PullRequestContext(

@@ -10,6 +10,7 @@ from review_orchestrator.github import create_github_client
 from review_orchestrator.gitlab import GitLabClient
 from review_orchestrator.openhands import OpenHandsClient
 from review_orchestrator.worker import (
+    build_worker_provider_registry,
     process_next_agent_task,
     process_next_review_run,
     process_review_run_timeouts,
@@ -53,6 +54,10 @@ async def run_worker(
             token=settings.gitlab_api_token,
             timeout=settings.openhands_timeout_seconds,
         )
+        provider_registry = build_worker_provider_registry(
+            github_client=github_client,
+            gitlab_client=gitlab_client,
+        )
 
         while True:
             async with session_factory() as session:
@@ -60,15 +65,13 @@ async def run_worker(
                     session,
                     settings=settings,
                     openhands_client=openhands_client,
-                    github_client=github_client,
-                    gitlab_client=gitlab_client,
+                    provider_registry=provider_registry,
                 )
             async with session_factory() as session:
                 agent_task = await process_next_agent_task(
                     session,
                     worker_id=resolved_worker_id,
-                    github_client=github_client,
-                    gitlab_client=gitlab_client,
+                    provider_registry=provider_registry,
                 )
             async with session_factory() as session:
                 review_run = await process_next_review_run(
@@ -77,7 +80,7 @@ async def run_worker(
                     openhands_client=openhands_client,
                     worker_id=resolved_worker_id,
                     github_client=github_client,
-                    gitlab_client=gitlab_client,
+                    provider_registry=provider_registry,
                 )
             if once:
                 return

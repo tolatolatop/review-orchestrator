@@ -5,7 +5,7 @@ import hmac
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from pydantic import BaseModel, ConfigDict
@@ -19,6 +19,7 @@ from review_orchestrator.github_auth import (
 from review_orchestrator.providers import (
     ParsedProviderWebhook,
     ProviderCapabilityError,
+    ProviderOperationError,
     ProviderPayloadError,
     ProviderSignatureError,
     ProviderWebhookError,
@@ -26,6 +27,17 @@ from review_orchestrator.providers import (
     lower_headers,
 )
 from review_orchestrator.review_results import ChangedFile
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from review_orchestrator.config import Settings
+    from review_orchestrator.models import (
+        AgentTask,
+        PullRequestContext,
+        ReviewCommentRef,
+        ReviewRun,
+    )
 
 
 class GitHubWebhookError(ProviderWebhookError):
@@ -80,7 +92,7 @@ class GitHubAdapter:
         *,
         headers: dict[str, str],
         raw_body: bytes,
-        settings: Any,
+        settings: Settings,
     ) -> ParsedProviderWebhook:
         normalized_headers = lower_headers(headers)
         delivery_id = normalized_headers.get("x-github-delivery")
@@ -108,60 +120,98 @@ class GitHubAdapter:
             raw_body=raw_body,
         )
 
-    async def get_pull_request_context(self, task) -> Any:
-        if self.client is None:
-            raise ProviderCapabilityError("GitHub client is not configured.")
-        pull_request = await self.client.get_pull_request(
-            task.repo_full_name,
-            task.pull_request_number,
-        )
+    async def get_pull_request_context(
+        self,
+        task: AgentTask,
+    ) -> PullRequestContext:
+        operation = "get_pull_request_context"
+        client = self._require_client(operation)
+        try:
+            pull_request = await client.get_pull_request(
+                task.repo_full_name,
+                task.pull_request_number,
+            )
+        except GitHubClientError as exc:
+            raise self._operation_error(operation, exc) from exc
         return context_from_pull_request_task(task, pull_request)
 
-    async def list_changed_files(self, review_run) -> list[ChangedFile]:
-        if self.client is None:
-            raise ProviderCapabilityError("GitHub client is not configured.")
-        return await fetch_changed_files(
-            self.client,
-            repo_full_name=review_run.repo_full_name,
-            pull_request_number=review_run.pull_request_number,
-        )
+    async def list_changed_files(
+        self,
+        review_run: ReviewRun,
+    ) -> list[ChangedFile]:
+        operation = "list_changed_files"
+        client = self._require_client(operation)
+        try:
+            return await fetch_changed_files(
+                client,
+                repo_full_name=review_run.repo_full_name,
+                pull_request_number=review_run.pull_request_number,
+            )
+        except GitHubClientError as exc:
+            raise self._operation_error(operation, exc) from exc
 
     async def publish_summary_comment(
         self,
-        session,
-        review_run,
+        session: AsyncSession,
+        review_run: ReviewRun,
         *,
         status_text: str,
         finding_stats: dict[str, int] | None = None,
-    ) -> Any:
-        if self.client is None:
-            raise ProviderCapabilityError("GitHub client is not configured.")
+    ) -> ReviewCommentRef | None:
+        operation = "publish_summary_comment"
+        client = self._require_client(operation)
         from review_orchestrator.comments import publish_github_summary_comment
 
-        return await publish_github_summary_comment(
-            session,
-            review_run,
-            github_client=self.client,
-            status_text=status_text,
-            finding_stats=finding_stats,
-        )
+        try:
+            return await publish_github_summary_comment(
+                session,
+                review_run,
+                github_client=client,
+                status_text=status_text,
+                finding_stats=finding_stats,
+            )
+        except GitHubClientError as exc:
+            raise self._operation_error(operation, exc) from exc
 
     async def publish_line_comments(
         self,
-        session,
-        review_run,
+        session: AsyncSession,
+        review_run: ReviewRun,
         *,
         changed_files: list[ChangedFile],
     ) -> dict[str, int]:
-        if self.client is None:
-            raise ProviderCapabilityError("GitHub client is not configured.")
+        operation = "publish_line_comments"
+        client = self._require_client(operation)
         from review_orchestrator.comments import publish_github_line_comments
 
-        return await publish_github_line_comments(
-            session,
-            review_run,
-            github_client=self.client,
-            changed_files=changed_files,
+        try:
+            return await publish_github_line_comments(
+                session,
+                review_run,
+                github_client=client,
+                changed_files=changed_files,
+            )
+        except GitHubClientError as exc:
+            raise self._operation_error(operation, exc) from exc
+
+    def _require_client(self, operation: str) -> GitHubClient:
+        if self.client is None:
+            raise ProviderCapabilityError(
+                "GitHub client is not configured.",
+                provider=self.provider,
+                operation=operation,
+            )
+        return self.client
+
+    def _operation_error(
+        self,
+        operation: str,
+        error: GitHubClientError,
+    ) -> ProviderOperationError:
+        return ProviderOperationError(
+            str(error),
+            provider=self.provider,
+            operation=operation,
         )
 
 
@@ -429,7 +479,10 @@ def _parse_hunk_new_start(header: str) -> int | None:
         return None
 
 
-def context_from_pull_request_task(task: Any, pull_request: dict[str, Any]) -> Any:
+def context_from_pull_request_task(
+    task: AgentTask,
+    pull_request: dict[str, Any],
+) -> PullRequestContext:
     from review_orchestrator.models import PullRequestContext
 
     base = pull_request.get("base") if isinstance(pull_request, dict) else None

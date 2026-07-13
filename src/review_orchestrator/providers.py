@@ -6,7 +6,13 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from review_orchestrator.models import AgentTask, PullRequestContext, ReviewRun
+    from review_orchestrator.config import Settings
+    from review_orchestrator.models import (
+        AgentTask,
+        PullRequestContext,
+        ReviewCommentRef,
+        ReviewRun,
+    )
     from review_orchestrator.review_results import ChangedFile
 
 
@@ -28,8 +34,25 @@ class ProviderPayloadError(ProviderWebhookError):
     error_code = "provider_payload_invalid"
 
 
-class ProviderCapabilityError(Exception):
-    pass
+class ProviderError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str | None = None,
+        operation: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.operation = operation
+
+
+class ProviderCapabilityError(ProviderError):
+    """Raised when an adapter cannot perform a configured operation."""
+
+
+class ProviderOperationError(ProviderError):
+    """Provider-neutral boundary for failures returned by a platform client."""
 
 
 @dataclass(frozen=True)
@@ -63,7 +86,7 @@ class ProviderAdapter(Protocol):
         *,
         headers: dict[str, str],
         raw_body: bytes,
-        settings: Any,
+        settings: Settings,
     ) -> ParsedProviderWebhook:
         ...
 
@@ -86,7 +109,7 @@ class ProviderAdapter(Protocol):
         *,
         status_text: str,
         finding_stats: dict[str, int] | None = None,
-    ) -> Any:
+    ) -> ReviewCommentRef | None:
         ...
 
     async def publish_line_comments(
