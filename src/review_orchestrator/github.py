@@ -136,6 +136,12 @@ class GitHubClient:
         except GitHubAuthenticationError as exc:
             raise GitHubClientError(str(exc)) from exc
 
+    async def get_permissions(self, repo_full_name: str) -> dict[str, str] | None:
+        try:
+            return await self.token_provider.get_permissions(repo_full_name)
+        except GitHubAuthenticationError as exc:
+            raise GitHubClientError(str(exc)) from exc
+
     async def aclose(self) -> None:
         await self.token_provider.aclose()
 

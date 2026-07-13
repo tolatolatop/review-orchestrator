@@ -9,6 +9,21 @@ from review_orchestrator.platform_diagnostics import diagnose_platform_permissio
 from review_orchestrator.schemas import PlatformPermissionDiagnosticRequest
 
 
+class FakeGitHubAppClient:
+    async def get_token(self, repo_full_name: str) -> str:
+        assert repo_full_name == "example/repo"
+        return "installation-secret"
+
+    async def get_permissions(self, repo_full_name: str) -> dict[str, str]:
+        assert repo_full_name == "example/repo"
+        return {
+            "contents": "read",
+            "issues": "write",
+            "metadata": "read",
+            "pull_requests": "write",
+        }
+
+
 async def test_github_diagnostic_verifies_read_and_classic_scope_writes() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["authorization"] == "Bearer github-secret"
@@ -64,6 +79,44 @@ async def test_github_fine_grained_write_permissions_are_not_overstated() -> Non
     assert checks["pull_request_read"].status == "skipped"
     assert checks["summary_comment_write"].status == "unknown"
     assert checks["line_comment_write"].status == "unknown"
+
+
+async def test_github_app_diagnostic_uses_dynamic_token_and_permissions() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer installation-secret"
+        if request.url.path == "/repos/example/repo":
+            return httpx.Response(
+                200,
+                headers={"X-RateLimit-Remaining": "4998"},
+                json={"permissions": {"pull": False}},
+            )
+        if request.url.path == "/repos/example/repo/pulls/42":
+            return httpx.Response(200, json={"number": 42})
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    result = await diagnose_platform_permissions(
+        Settings(github_installation_token=None),
+        PlatformPermissionDiagnosticRequest(
+            provider="github",
+            repo_full_name="example/repo",
+            pull_request_number=42,
+        ),
+        transport=httpx.MockTransport(handler),
+        github_client=FakeGitHubAppClient(),
+    )
+
+    checks = {check.name: check for check in result.checks}
+    assert result.status == "healthy"
+    assert result.repository_role == "installation"
+    assert result.reported_scopes == [
+        "contents:read",
+        "issues:write",
+        "metadata:read",
+        "pull_requests:write",
+    ]
+    assert checks["contents_read"].status == "passed"
+    assert checks["summary_comment_write"].status == "passed"
+    assert checks["line_comment_write"].status == "passed"
 
 
 async def test_gitlab_diagnostic_uses_project_role_and_api_scope() -> None:

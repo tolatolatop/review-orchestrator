@@ -83,7 +83,11 @@ async def diagnose_platform_permissions_endpoint(
     injected = getattr(request.app.state, "platform_permission_probe", None)
     if injected is not None:
         return await injected(request.app.state.settings, payload)
-    return await diagnose_platform_permissions(request.app.state.settings, payload)
+    return await diagnose_platform_permissions(
+        request.app.state.settings,
+        payload,
+        github_client=request.app.state.github_client,
+    )
 
 
 def get_openhands_client(request: Request) -> OpenHandsClient:

@@ -7,6 +7,12 @@ from urllib.parse import quote
 import httpx
 
 from review_orchestrator.config import Settings
+from review_orchestrator.github import (
+    GitHubClient,
+    GitHubClientError,
+    create_github_client,
+)
+from review_orchestrator.github_auth import GitHubAuthenticationError
 from review_orchestrator.schemas import (
     PlatformPermissionCheck,
     PlatformPermissionDiagnosticRequest,
@@ -19,6 +25,7 @@ async def diagnose_platform_permissions(
     payload: PlatformPermissionDiagnosticRequest,
     *,
     transport: httpx.AsyncBaseTransport | None = None,
+    github_client: GitHubClient | None = None,
 ) -> PlatformPermissionDiagnosticResponse:
     """Run non-mutating checks against the configured provider API.
 
@@ -27,7 +34,12 @@ async def diagnose_platform_permissions(
     comment or claiming that access was verified.
     """
     if payload.provider == "github":
-        return await _diagnose_github(settings, payload, transport=transport)
+        return await _diagnose_github(
+            settings,
+            payload,
+            transport=transport,
+            github_client=github_client,
+        )
     return await _diagnose_gitlab(settings, payload, transport=transport)
 
 
@@ -36,10 +48,24 @@ async def _diagnose_github(
     payload: PlatformPermissionDiagnosticRequest,
     *,
     transport: httpx.AsyncBaseTransport | None,
+    github_client: GitHubClient | None,
 ) -> PlatformPermissionDiagnosticResponse:
-    token = settings.github_installation_token
+    owns_client = github_client is None
+    try:
+        github_client = github_client or create_github_client(settings)
+        token = await github_client.get_token(payload.repo_full_name)
+        app_permissions = await github_client.get_permissions(payload.repo_full_name)
+    except (GitHubAuthenticationError, GitHubClientError):
+        return _credential_failure(payload)
+    finally:
+        if owns_client and github_client is not None:
+            await github_client.aclose()
+
     if not token:
-        return _unconfigured(payload, "GITHUB_INSTALLATION_TOKEN is not configured.")
+        return _unconfigured(
+            payload,
+            "GitHub App or static token credentials are not configured.",
+        )
 
     headers = {
         "Accept": "application/vnd.github+json",
@@ -57,7 +83,12 @@ async def _diagnose_github(
         if isinstance(repo_response, Exception):
             return _unreachable(payload, "GitHub", repo_response)
 
-        scopes = _header_list(repo_response.headers, "x-oauth-scopes")
+        oauth_scopes = _header_list(repo_response.headers, "x-oauth-scopes")
+        scopes = (
+            sorted(f"{name}:{level}" for name, level in app_permissions.items())
+            if app_permissions is not None
+            else oauth_scopes
+        )
         rate_limit = _header_int(repo_response.headers, "x-ratelimit-remaining")
         if repo_response.status_code != 200:
             return _denied(
@@ -71,7 +102,9 @@ async def _diagnose_github(
         body = _json_object(repo_response)
         permissions = body.get("permissions")
         permissions = permissions if isinstance(permissions, dict) else {}
-        role = _github_role(permissions)
+        role = (
+            "installation" if app_permissions is not None else _github_role(permissions)
+        )
         checks = [
             PlatformPermissionCheck(
                 name="repository_read",
@@ -79,33 +112,81 @@ async def _diagnose_github(
                 message="The configured token can read the repository.",
             )
         ]
-        await _append_github_pr_check(client, payload, repo_path, checks)
-        write_verified = bool({"repo", "public_repo"}.intersection(scopes))
-        for name, label in (
-            ("summary_comment_write", "issue comment"),
-            ("line_comment_write", "pull request review comment"),
-        ):
+        if app_permissions is not None:
+            contents_level = app_permissions.get("contents")
             checks.append(
                 PlatformPermissionCheck(
-                    name=name,
-                    status="passed" if write_verified else "unknown",
+                    name="contents_read",
+                    status=(
+                        "passed" if contents_level in {"read", "write"} else "failed"
+                    ),
                     message=(
-                        f"The reported OAuth scope permits {label} writes."
-                        if write_verified
-                        else (
-                            f"Repository role {role!r} was reported, but GitHub does "
-                            f"not expose this token's fine-grained {label} grant on a "
-                            "read-only request."
-                        )
+                        "The GitHub App Installation grants repository contents read."
+                        if contents_level in {"read", "write"}
+                        else "The GitHub App Installation lacks Contents read access."
                     ),
                 )
             )
+        await _append_github_pr_check(client, payload, repo_path, checks)
+        if app_permissions is not None:
+            _append_github_app_write_checks(checks, app_permissions)
+        else:
+            _append_github_token_write_checks(checks, oauth_scopes, role)
         return _response(
             payload,
             checks=checks,
             scopes=scopes,
             repository_role=role,
             rate_limit_remaining=rate_limit,
+        )
+
+
+def _append_github_app_write_checks(
+    checks: list[PlatformPermissionCheck],
+    permissions: dict[str, str],
+) -> None:
+    for name, permission, label in (
+        ("summary_comment_write", "issues", "Issues"),
+        ("line_comment_write", "pull_requests", "Pull requests"),
+    ):
+        write_verified = permissions.get(permission) == "write"
+        checks.append(
+            PlatformPermissionCheck(
+                name=name,
+                status="passed" if write_verified else "failed",
+                message=(
+                    f"The GitHub App Installation grants {label} write access."
+                    if write_verified
+                    else f"The GitHub App Installation lacks {label} write access."
+                ),
+            )
+        )
+
+
+def _append_github_token_write_checks(
+    checks: list[PlatformPermissionCheck],
+    oauth_scopes: list[str],
+    role: str | None,
+) -> None:
+    write_verified = bool({"repo", "public_repo"}.intersection(oauth_scopes))
+    for name, label in (
+        ("summary_comment_write", "issue comment"),
+        ("line_comment_write", "pull request review comment"),
+    ):
+        checks.append(
+            PlatformPermissionCheck(
+                name=name,
+                status="passed" if write_verified else "unknown",
+                message=(
+                    f"The reported OAuth scope permits {label} writes."
+                    if write_verified
+                    else (
+                        f"Repository role {role!r} was reported, but GitHub does not "
+                        f"expose this token's fine-grained {label} grant on a "
+                        "read-only request."
+                    )
+                ),
+            )
         )
 
 
@@ -291,6 +372,24 @@ def _unconfigured(
     )
 
 
+def _credential_failure(
+    payload: PlatformPermissionDiagnosticRequest,
+) -> PlatformPermissionDiagnosticResponse:
+    return _response(
+        payload,
+        checks=[
+            PlatformPermissionCheck(
+                name="token_available",
+                status="failed",
+                message=(
+                    "GitHub credentials are configured, but a repository token "
+                    "could not be obtained."
+                ),
+            )
+        ],
+    )
+
+
 def _unreachable(
     payload: PlatformPermissionDiagnosticRequest,
     provider_name: str,
@@ -374,11 +473,7 @@ def _json_object(response: httpx.Response) -> dict[str, Any]:
 
 def _header_list(headers: Mapping[str, str], name: str) -> list[str]:
     return sorted(
-        {
-            item.strip()
-            for item in headers.get(name, "").split(",")
-            if item.strip()
-        }
+        {item.strip() for item in headers.get(name, "").split(",") if item.strip()}
     )
 
 

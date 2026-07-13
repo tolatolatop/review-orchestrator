@@ -89,9 +89,11 @@ be retried through the retry endpoint without `force=true`.
 ### Platform permission diagnostics
 
 `POST /api/v1/diagnostics/platform-permissions` performs read-only checks with
-the configured GitHub or GitLab API token. It verifies repository access and,
-when `pull_request_number` is supplied, PR/MR read access. It also reports safe
-scope, repository-role, and rate-limit metadata when the provider returns it.
+the configured GitHub App, static GitHub token, or GitLab API token. It verifies
+repository access and, when `pull_request_number` is supplied, PR/MR read access.
+It also reports safe
+OAuth scopes or GitHub App Installation permissions, repository-role, and
+rate-limit metadata when the provider returns them.
 Credentials and upstream response bodies are never included in the response.
 
 ```bash
