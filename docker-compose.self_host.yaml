@@ -14,6 +14,49 @@ services:
       retries: 5
     restart: unless-stopped
 
+  openhands-db-init:
+    image: postgres:16-alpine
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB:-review_orchestrator}
+      PGUSER: ${POSTGRES_USER:-review}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-review}
+      OPENHANDS_DB_NAME: ${OPENHANDS_DB_NAME:-openhands}
+      OPENHANDS_DB_USER: ${OPENHANDS_DB_USER:-openhands}
+      OPENHANDS_DB_PASSWORD: ${OPENHANDS_DB_PASSWORD:-openhands}
+    volumes:
+      - ./deploy/postgres/provision-openhands-db.sh:/usr/local/bin/provision-openhands-db:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/usr/local/bin/provision-openhands-db"]
+    restart: "no"
+
+  openhands-db-migrate:
+    image: ${OPENHANDS_IMAGE:-docker.openhands.dev/openhands/openhands:1.8}
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${OPENHANDS_DB_NAME:-openhands}
+      DB_USER: ${OPENHANDS_DB_USER:-openhands}
+      DB_PASS: ${OPENHANDS_DB_PASSWORD:-openhands}
+    volumes:
+      - openhands_state:/.openhands
+      - ./deploy/openhands/migrate_sqlite_to_postgres.py:/opt/openhands/migrate_sqlite_to_postgres.py:ro
+    depends_on:
+      openhands-db-init:
+        condition: service_completed_successfully
+    entrypoint:
+      [
+        "/app/.venv/bin/python",
+        "/opt/openhands/migrate_sqlite_to_postgres.py",
+      ]
+    restart: "no"
+
   openhands:
     image: ${OPENHANDS_IMAGE:-docker.openhands.dev/openhands/openhands:1.8}
     env_file:
@@ -21,17 +64,31 @@ services:
         required: false
     environment:
       SANDBOX_RUNTIME_CONTAINER_IMAGE: ${SANDBOX_RUNTIME_CONTAINER_IMAGE:-docker.all-hands.dev/all-hands-ai/runtime:latest}
-      SANDBOX_HOST_PORT: ${SANDBOX_HOST_PORT:-${OPENHANDS_FRONTEND_PORT:-${OPENHANDS_PORT:-3000}}}
+      SANDBOX_HOST_PORT: ${SANDBOX_HOST_PORT:-3000}
+      OH_SANDBOX_KIND: DockerSandboxServiceInjector
+      OH_SANDBOX_HOST_PORT: ${SANDBOX_HOST_PORT:-3000}
+      OH_SANDBOX_EXTRA_HOSTS: ${OH_SANDBOX_EXTRA_HOSTS:-{"host.docker.internal":"192.168.176.10"}}
       LOG_ALL_EVENTS: ${OPENHANDS_LOG_ALL_EVENTS:-false}
-      OH_WEB_URL: ${OH_WEB_URL:-http://host.docker.internal:${OPENHANDS_FRONTEND_PORT:-${OPENHANDS_PORT:-3000}}}
+      OH_WEB_URL: ${OH_WEB_URL:-http://host.docker.internal:3000}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${OPENHANDS_DB_NAME:-openhands}
+      DB_USER: ${OPENHANDS_DB_USER:-openhands}
+      DB_PASS: ${OPENHANDS_DB_PASSWORD:-openhands}
     ports:
       - "127.0.0.1:${OPENHANDS_FRONTEND_PORT:-${OPENHANDS_PORT:-3000}}:3000"
+    networks:
+      default:
+        ipv4_address: 192.168.176.10
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - openhands_state:/.openhands-state
+      - openhands_state:/.openhands
       - review_orchestrator_data:/var/lib/review-orchestrator
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      openhands-db-migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   review-orchestrator:
@@ -53,6 +110,7 @@ services:
       - "8000"
     volumes:
       - review_orchestrator_data:/var/lib/review-orchestrator
+      - ./secrets:/run/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -90,6 +148,7 @@ services:
       WORKER_LOCK_SECONDS: ${WORKER_LOCK_SECONDS:-300}
     volumes:
       - review_orchestrator_data:/var/lib/review-orchestrator
+      - ./secrets:/run/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -130,3 +189,9 @@ volumes:
   postgres_data:
   openhands_state:
   review_orchestrator_data:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 192.168.176.0/24

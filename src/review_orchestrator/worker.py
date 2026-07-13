@@ -352,6 +352,9 @@ async def process_next_review_run(
                     session,
                     settings,
                     _workspace_request_from_context(context),
+                    github_client=(
+                        github_client if review_run.provider == "github" else None
+                    ),
                 )
             except Exception as exc:
                 review_run.status = "failed"
@@ -390,6 +393,7 @@ async def process_next_review_run(
             await session.commit()
             await session.refresh(review_run)
 
+        _restore_openhands_start_task_after_poll_failure(review_run)
         if (
             not review_run.openhands_start_task_id
             and not review_run.openhands_conversation_id
@@ -401,6 +405,13 @@ async def process_next_review_run(
                 workspace_path=review_run.workspace_path,
             )
             if review_run.status == "failed":
+                if await _schedule_openhands_start_retry(
+                    session,
+                    review_run,
+                    settings=settings,
+                ):
+                    release_lock = False
+                    return review_run
                 await publish_review_run_status_comment(
                     session,
                     review_run,
@@ -416,6 +427,40 @@ async def process_next_review_run(
             openhands_client=openhands_client,
         )
         if review_run.status == "failed":
+            if await _schedule_openhands_start_retry(
+                session,
+                review_run,
+                settings=settings,
+            ):
+                release_lock = False
+                return review_run
+            await publish_review_run_status_comment(
+                session,
+                review_run,
+                github_client=github_client,
+                gitlab_client=gitlab_client,
+                status_text="failed",
+            )
+            return review_run
+        try:
+            raw_result = await _extract_openhands_json_result(
+                openhands_client,
+                review_run.openhands_conversation_id,
+            )
+        except OpenHandsClientError as exc:
+            review_run.status = "failed"
+            review_run.failure_code = "openhands_infrastructure_error"
+            review_run.error = str(exc)
+            session.add(review_run)
+            await session.commit()
+            await session.refresh(review_run)
+            if await _schedule_openhands_start_retry(
+                session,
+                review_run,
+                settings=settings,
+            ):
+                release_lock = False
+                return review_run
             await publish_review_run_status_comment(
                 session,
                 review_run,
@@ -425,10 +470,6 @@ async def process_next_review_run(
                 status_text="failed",
             )
             return review_run
-        raw_result = await _extract_openhands_json_result(
-            openhands_client,
-            review_run.openhands_conversation_id,
-        )
         if raw_result is None:
             review_run.stage = "waiting_for_result"
             review_run.lock_owner = None
@@ -909,6 +950,133 @@ async def _extract_openhands_json_result(
             if _is_review_result_payload(parsed):
                 return parsed
     return None
+
+
+async def _schedule_openhands_start_retry(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    settings: Settings,
+) -> bool:
+    if review_run.failure_code != "openhands_infrastructure_error":
+        return False
+
+    warnings = list(review_run.validation_warnings_json or [])
+    if (
+        review_run.openhands_start_task_id
+        and review_run.error
+        and "GET /api/v1/app-conversations/start-tasks" in review_run.error
+    ):
+        if not any(
+            isinstance(warning, dict)
+            and warning.get("code") == "openhands_start_task_poll_retry"
+            for warning in warnings
+        ):
+            warnings.append(
+                {
+                    "code": "openhands_start_task_poll_retry",
+                    "message": review_run.error,
+                    "start_task_id": review_run.openhands_start_task_id,
+                }
+            )
+        review_run.status = "running"
+        review_run.stage = "waiting_for_openhands_start"
+        review_run.failure_code = None
+        review_run.error = None
+        review_run.validation_warnings_json = warnings
+        review_run.lock_owner = None
+        review_run.locked_until = utc_now() + timedelta(
+            seconds=settings.worker_poll_interval_seconds
+        )
+        session.add(review_run)
+        await session.commit()
+        await session.refresh(review_run)
+        return True
+
+    if review_run.openhands_conversation_id:
+        if not any(
+            isinstance(warning, dict)
+            and warning.get("code") == "openhands_session_retry"
+            for warning in warnings
+        ):
+            warnings.append(
+                {
+                    "code": "openhands_session_retry",
+                    "message": review_run.error
+                    or "OpenHands session request temporarily failed.",
+                }
+            )
+        review_run.status = "running"
+        review_run.stage = "waiting_for_result"
+        review_run.failure_code = None
+        review_run.error = None
+        review_run.validation_warnings_json = warnings
+        review_run.lock_owner = None
+        review_run.locked_until = utc_now() + timedelta(
+            seconds=settings.worker_poll_interval_seconds
+        )
+        session.add(review_run)
+        await session.commit()
+        await session.refresh(review_run)
+        return True
+
+    retry_count = sum(
+        1
+        for warning in warnings
+        if isinstance(warning, dict)
+        and warning.get("code") == "openhands_start_retry"
+    )
+    if retry_count >= settings.retry_max_attempts:
+        return False
+
+    retry_number = retry_count + 1
+    delay_seconds = settings.retry_initial_delay_seconds * (2**retry_count)
+    warnings.append(
+        {
+            "code": "openhands_start_retry",
+            "message": review_run.error or "OpenHands infrastructure start failure.",
+            "retry": retry_number,
+            "start_task_id": review_run.openhands_start_task_id,
+        }
+    )
+    review_run.status = "running"
+    review_run.stage = "retrying_openhands_start"
+    review_run.openhands_start_task_id = None
+    review_run.openhands_conversation_id = None
+    review_run.openhands_sandbox_id = None
+    review_run.openhands_agent_server_url = None
+    review_run.failure_code = None
+    review_run.error = None
+    review_run.validation_warnings_json = warnings
+    review_run.lock_owner = None
+    review_run.locked_until = utc_now() + timedelta(seconds=delay_seconds)
+    session.add(review_run)
+    await session.commit()
+    await session.refresh(review_run)
+    return True
+
+
+def _restore_openhands_start_task_after_poll_failure(
+    review_run: ReviewRun,
+) -> None:
+    if review_run.openhands_start_task_id or review_run.openhands_conversation_id:
+        return
+    for warning in reversed(review_run.validation_warnings_json or []):
+        if not isinstance(warning, dict):
+            continue
+        if warning.get("code") != "openhands_start_retry":
+            continue
+        message = warning.get("message")
+        start_task_id = warning.get("start_task_id")
+        if (
+            isinstance(message, str)
+            and "GET /api/v1/app-conversations/start-tasks" in message
+            and isinstance(start_task_id, str)
+            and start_task_id
+        ):
+            review_run.openhands_start_task_id = start_task_id
+            review_run.stage = "waiting_for_openhands_start"
+            return
 
 
 def _is_review_result_payload(value: Any) -> bool:

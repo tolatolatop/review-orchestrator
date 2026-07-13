@@ -30,16 +30,25 @@ class Settings(BaseSettings):
         default="http://localhost:3000",
         description="Base URL for the OpenHands App Server API.",
     )
+    openhands_ui_base_url: str | None = Field(
+        default=None,
+        description=(
+            "Operator-facing OpenHands UI base URL used to build safe "
+            "conversation links. If unset, observability responses make that "
+            "disabled state explicit."
+        ),
+    )
     openhands_api_token: str | None = None
     openhands_review_skill: str = "code-review"
     openhands_review_profile: str = "default"
     openhands_timeout_seconds: float = Field(
-        default=30.0,
+        default=120.0,
         gt=0,
         description="HTTP timeout for OpenHands App Server requests.",
     )
     github_app_id: str | None = None
     github_private_key_path: str | None = None
+    github_installation_id: int | None = Field(default=None, gt=0)
     github_installation_token: str | None = Field(
         default=None,
         description=(
@@ -59,6 +68,11 @@ class Settings(BaseSettings):
     gitlab_api_token: str | None = Field(
         default=None,
         description="GitLab API token used by the worker for MR lookup and notes.",
+    )
+    platform_diagnostics_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        description="HTTP timeout for read-only provider permission diagnostics.",
     )
     workspace_root: str = "./.workspaces"
     git_cache_root: str = "./.git-cache"

@@ -64,6 +64,7 @@ locally:
 ### MVP Endpoints
 
 - `GET /health`
+- `POST /api/v1/diagnostics/platform-permissions`
 - `POST /api/v1/webhooks/{provider}`
 - `POST /api/v1/review-runs`
 - `GET /api/v1/review-runs/{review_run_id}`
@@ -74,10 +75,56 @@ locally:
 - `POST /api/v1/review-runs/{review_run_id}/retry`
 - `POST /api/v1/review-runs/{review_run_id}/cancel`
 
+The operator observability API contract and shared redaction rules are defined
+in [`docs/observability-api.md`](docs/observability-api.md).
+Secure self-host exposure, authentication boundaries, raw-payload risks, and
+the deployment verification checklist are documented in
+[`docs/observability-deployment.md`](docs/observability-deployment.md).
+
 `POST /api/v1/review-runs` is idempotent for
 `provider + repo_full_name + pull_request_number + head_sha`. A repeated request
 returns the latest existing run unless `force=true` is supplied. Failed runs can
 be retried through the retry endpoint without `force=true`.
+
+### Platform permission diagnostics
+
+`POST /api/v1/diagnostics/platform-permissions` performs read-only checks with
+the configured GitHub App, static GitHub token, or GitLab API token. It verifies
+repository access and, when `pull_request_number` is supplied, PR/MR read access.
+It also reports safe
+OAuth scopes or GitHub App Installation permissions, repository-role, and
+rate-limit metadata when the provider returns them.
+Credentials and upstream response bodies are never included in the response.
+
+```bash
+curl -sS http://localhost:8000/api/v1/diagnostics/platform-permissions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "provider": "github",
+    "repo_full_name": "owner/repo",
+    "pull_request_number": 123
+  }'
+```
+
+The overall `status` is `healthy`, `degraded`, or `failed`. A write check can be
+`unknown` when a fine-grained provider token does not advertise its grants;
+the diagnostic intentionally does not create a probe comment to test writes.
+
+Run the standalone black-box verifier against a deployed service:
+
+```bash
+REVIEW_ORCHESTRATOR_URL=http://localhost:8000 \
+uv run python scripts/check_platform_permissions.py \
+  --provider github \
+  --repository owner/repo \
+  --pull-request 123
+```
+
+If the deployment is protected by the self-host reverse proxy, set
+`REVIEW_PROXY_TOKEN` in the environment; the script sends it as
+`X-Review-Token` and never prints it. Add `--json` for machine-readable output.
+The exit codes are `0` for healthy, `1` for degraded, `2` for failed provider
+checks, and `3` for request or response-contract errors.
 
 ### GitHub Webhooks
 
@@ -93,6 +140,14 @@ Required headers:
 - `X-Hub-Signature-256` when a webhook secret is configured
 
 Duplicate delivery IDs are idempotent and return the original event status.
+
+For long-running GitHub App authentication, configure `GITHUB_APP_ID` and a
+mounted `GITHUB_PRIVATE_KEY_PATH`. The service uses PyGithub to sign App JWTs,
+resolve the Installation for each repository, and refresh short-lived
+Installation Tokens for API calls and private-repository checkout. See the
+[GitHub App deployment instructions](docs/deployment.md#github-app-authentication)
+for permissions, webhook events, secrets, and the optional
+`GITHUB_INSTALLATION_ID` setting.
 
 ### Review Run Status Values
 
@@ -181,9 +236,6 @@ Prepare a workspace:
     "head_sha": "def5678",
     "is_fork": false
   },
-  "auth": {
-    "token_ref": "GITHUB_INSTALLATION_TOKEN"
-  },
   "options": {
     "use_git_cache": true,
     "force_refresh": false,
@@ -192,6 +244,10 @@ Prepare a workspace:
   }
 }
 ```
+
+When GitHub App authentication is configured, the service obtains checkout
+credentials automatically. `auth.token_ref` remains available only for the
+legacy static-token mode.
 
 The response returns `workspace_path`, `base_sha`, and `head_sha`. Callers can run
 their own diff commands from that path:

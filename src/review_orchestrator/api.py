@@ -7,10 +7,16 @@ from review_orchestrator.db import get_session
 from review_orchestrator.github import GitHubAdapter
 from review_orchestrator.gitlab import GitLabAdapter
 from review_orchestrator.openhands import OpenHandsClient
+from review_orchestrator.platform_diagnostics import diagnose_platform_permissions
 from review_orchestrator.providers import ProviderRegistry, ProviderWebhookError
 from review_orchestrator.review_results import ReviewResultError
 from review_orchestrator.schemas import (
+    AgentTaskDetail,
+    AgentTaskListResponse,
     CleanupSummary,
+    OpenHandsSessionDiagnostics,
+    PlatformPermissionDiagnosticRequest,
+    PlatformPermissionDiagnosticResponse,
     ProviderEventInboxDetail,
     ProviderEventInboxListResponse,
     PullRequestWorkspaceCleanupRequest,
@@ -18,6 +24,8 @@ from review_orchestrator.schemas import (
     ReviewResultCollectResponse,
     ReviewRunActionResult,
     ReviewRunCreate,
+    ReviewRunDetail,
+    ReviewRunListResponse,
     ReviewRunRead,
     ReviewSessionCancel,
     ReviewSessionStart,
@@ -36,9 +44,15 @@ from review_orchestrator.services import (
     cancel_review_session,
     collect_review_result,
     create_review_run,
+    get_agent_task_detail,
+    get_openhands_session_diagnostics_for_conversation,
+    get_openhands_session_diagnostics_for_review_run,
     get_provider_event_inbox_detail,
     get_review_run,
+    get_review_run_detail,
+    list_agent_tasks,
     list_provider_event_inbox,
+    list_review_runs,
     retry_review_run,
     start_review_session,
     sync_review_session,
@@ -56,6 +70,24 @@ from review_orchestrator.workspaces import (
 router = APIRouter(prefix="/api/v1")
 session_dependency = Depends(get_session)
 provider_registry = ProviderRegistry([GitHubAdapter(), GitLabAdapter()])
+
+
+@router.post(
+    "/diagnostics/platform-permissions",
+    response_model=PlatformPermissionDiagnosticResponse,
+)
+async def diagnose_platform_permissions_endpoint(
+    payload: PlatformPermissionDiagnosticRequest,
+    request: Request,
+) -> PlatformPermissionDiagnosticResponse:
+    injected = getattr(request.app.state, "platform_permission_probe", None)
+    if injected is not None:
+        return await injected(request.app.state.settings, payload)
+    return await diagnose_platform_permissions(
+        request.app.state.settings,
+        payload,
+        github_client=request.app.state.github_client,
+    )
 
 
 def get_openhands_client(request: Request) -> OpenHandsClient:
@@ -77,6 +109,26 @@ def get_openhands_client(request: Request) -> OpenHandsClient:
 
 
 openhands_client_dependency = Depends(get_openhands_client)
+
+
+def get_optional_openhands_client(
+    request: Request,
+) -> tuple[OpenHandsClient | None, str | None]:
+    injected = getattr(request.app.state, "openhands_client", None)
+    if injected is not None:
+        return injected, None
+
+    settings = request.app.state.settings
+    if not settings.openhands_base_url:
+        return None, "OpenHands base URL is not configured."
+    return (
+        OpenHandsClient(
+            base_url=settings.openhands_base_url,
+            api_key=settings.openhands_api_token,
+            timeout=settings.openhands_timeout_seconds,
+        ),
+        None,
+    )
 
 
 @router.post("/webhooks/{provider}", response_model=WebhookAccepted)
@@ -113,6 +165,10 @@ async def accept_webhook(
 
 
 @router.get("/provider-events", response_model=ProviderEventInboxListResponse)
+@router.get(
+    "/observability/provider-events",
+    response_model=ProviderEventInboxListResponse,
+)
 async def list_provider_events_endpoint(
     provider: str | None = Query(default=None, min_length=1, max_length=64),
     repo_full_name: str | None = Query(default=None, min_length=1, max_length=512),
@@ -147,6 +203,10 @@ async def list_provider_events_endpoint(
 
 
 @router.get("/provider-events/{event_id}", response_model=ProviderEventInboxDetail)
+@router.get(
+    "/observability/provider-events/{event_id}",
+    response_model=ProviderEventInboxDetail,
+)
 async def get_provider_event_endpoint(
     event_id: str,
     include_payload: bool = False,
@@ -162,6 +222,51 @@ async def get_provider_event_endpoint(
     return event
 
 
+@router.get("/agent-tasks", response_model=AgentTaskListResponse)
+@router.get("/observability/agent-tasks", response_model=AgentTaskListResponse)
+async def list_agent_tasks_endpoint(
+    status_filter: str | None = Query(
+        default=None,
+        alias="status",
+        min_length=1,
+        max_length=32,
+    ),
+    provider: str | None = Query(default=None, min_length=1, max_length=64),
+    repo_full_name: str | None = Query(default=None, min_length=1, max_length=512),
+    pull_request_number: int | None = Query(default=None, gt=0),
+    task_type: str | None = Query(default=None, min_length=1, max_length=64),
+    created_from: datetime | None = None,
+    created_to: datetime | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = session_dependency,
+) -> AgentTaskListResponse:
+    return await list_agent_tasks(
+        session,
+        status=status_filter,
+        provider=provider,
+        repo_full_name=repo_full_name,
+        pull_request_number=pull_request_number,
+        task_type=task_type,
+        created_from=created_from,
+        created_to=created_to,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/agent-tasks/{task_id}", response_model=AgentTaskDetail)
+@router.get("/observability/agent-tasks/{task_id}", response_model=AgentTaskDetail)
+async def get_agent_task_endpoint(
+    task_id: str,
+    session: AsyncSession = session_dependency,
+) -> AgentTaskDetail:
+    task = await get_agent_task_detail(session, task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return task
+
+
 @router.post(
     "/review-runs",
     response_model=ReviewRunRead,
@@ -174,15 +279,104 @@ async def create_review_run_endpoint(
     return await create_review_run(session, payload)
 
 
-@router.get("/review-runs/{review_run_id}", response_model=ReviewRunRead)
+@router.get("/review-runs", response_model=ReviewRunListResponse)
+@router.get("/observability/review-runs", response_model=ReviewRunListResponse)
+async def list_review_runs_endpoint(
+    provider: str | None = Query(default=None, min_length=1, max_length=64),
+    repo_full_name: str | None = Query(default=None, min_length=1, max_length=512),
+    pull_request_number: int | None = Query(default=None, gt=0),
+    merge_request_number: int | None = Query(default=None, gt=0),
+    status_filter: str | None = Query(
+        default=None,
+        alias="status",
+        min_length=1,
+        max_length=32,
+    ),
+    stage: str | None = Query(default=None, min_length=1, max_length=64),
+    head_sha: str | None = Query(default=None, min_length=7, max_length=80),
+    trigger_type: str | None = Query(default=None, min_length=1, max_length=32),
+    lock_state: str | None = Query(
+        default=None,
+        pattern="^(locked|unlocked|expired)$",
+    ),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = session_dependency,
+) -> ReviewRunListResponse:
+    return await list_review_runs(
+        session,
+        provider=provider,
+        repo_full_name=repo_full_name,
+        pull_request_number=pull_request_number,
+        merge_request_number=merge_request_number,
+        status=status_filter,
+        stage=stage,
+        head_sha=head_sha,
+        trigger_type=trigger_type,
+        lock_state=lock_state,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/review-runs/{review_run_id}", response_model=ReviewRunDetail)
+@router.get(
+    "/observability/review-runs/{review_run_id}",
+    response_model=ReviewRunDetail,
+)
 async def get_review_run_endpoint(
     review_run_id: str,
     session: AsyncSession = session_dependency,
-) -> ReviewRunRead:
-    review_run = await get_review_run(session, review_run_id)
+) -> ReviewRunDetail:
+    review_run = await get_review_run_detail(session, review_run_id)
     if review_run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return review_run
+
+
+@router.get(
+    "/observability/review-runs/{review_run_id}/openhands-session",
+    response_model=OpenHandsSessionDiagnostics,
+)
+async def get_review_run_openhands_session_endpoint(
+    review_run_id: str,
+    request: Request,
+    session: AsyncSession = session_dependency,
+) -> OpenHandsSessionDiagnostics:
+    review_run = await get_review_run(session, review_run_id)
+    if review_run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    openhands_client, disabled_reason = get_optional_openhands_client(request)
+    return await get_openhands_session_diagnostics_for_review_run(
+        session,
+        review_run,
+        openhands_client=openhands_client,
+        openhands_live_status_disabled_reason=disabled_reason,
+        openhands_ui_base_url=request.app.state.settings.openhands_ui_base_url,
+    )
+
+
+@router.get(
+    "/observability/openhands-sessions/{conversation_id}",
+    response_model=OpenHandsSessionDiagnostics,
+)
+async def get_openhands_session_endpoint(
+    conversation_id: str,
+    request: Request,
+    session: AsyncSession = session_dependency,
+) -> OpenHandsSessionDiagnostics:
+    openhands_client, disabled_reason = get_optional_openhands_client(request)
+    diagnostics = await get_openhands_session_diagnostics_for_conversation(
+        session,
+        conversation_id,
+        openhands_client=openhands_client,
+        openhands_live_status_disabled_reason=disabled_reason,
+        openhands_ui_base_url=request.app.state.settings.openhands_ui_base_url,
+    )
+    if diagnostics is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return diagnostics
+
 
 @router.post("/review-runs/{review_run_id}/session/start", response_model=ReviewRunRead)
 async def start_review_session_endpoint(
@@ -318,7 +512,12 @@ async def prepare_workspace_endpoint(
     request: Request,
     session: AsyncSession = session_dependency,
 ) -> WorkspacePrepareResponse:
-    return await prepare_workspace(session, request.app.state.settings, payload)
+    return await prepare_workspace(
+        session,
+        request.app.state.settings,
+        payload,
+        github_client=request.app.state.github_client,
+    )
 
 
 @router.get("/workspaces/{workspace_id}", response_model=WorkspaceRead)
