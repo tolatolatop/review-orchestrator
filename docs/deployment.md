@@ -171,6 +171,62 @@ and `OPENHANDS_API_TOKEN` when your OpenHands deployment requires one. Override
 `POSTGRES_PASSWORD` in `.env` or the shell; the compose default is only suitable
 for local testing.
 
+The same PostgreSQL container also hosts OpenHands, but OpenHands uses a
+separate logical database and login. Set `OPENHANDS_DB_PASSWORD` to a different
+strong password in production. `openhands-db-init` provisions or updates the
+role and database on every deployment, including deployments with an existing
+`postgres_data` volume; it does not rely on first-boot
+`/docker-entrypoint-initdb.d` behavior.
+
+Before OpenHands starts, `openhands-db-migrate` applies the OpenHands Alembic
+migrations and checks the persistent `openhands_state` volume for the legacy
+`/.openhands/openhands.db`. When it exists, the service:
+
+1. creates a content-addressed
+   `/.openhands/openhands.db.pre-postgres-<sha256>.bak` with the SQLite backup
+   API without overwriting an earlier cutover snapshot;
+2. copies the six OpenHands application tables to PostgreSQL in one
+   transaction;
+3. validates row counts before allowing OpenHands to start.
+
+The migration is restart-safe. It validates rows with matching primary keys,
+copies only missing legacy rows, and preserves PostgreSQL-only rows from an
+earlier trial or cutover. If a matching primary key contains different values,
+it fails closed and prevents OpenHands from starting instead of overwriting
+ambiguous state. Keep the backup through at least one successful review and the
+deployment observation period. `settings.json`, `secrets.json`, `.keys`, and
+other file-backed state remain on `openhands_state`; do not remove that volume
+after switching databases.
+
+Before the first cutover, stop OpenHands and the orchestrator worker so SQLite
+cannot receive new writes while the final backup and migration run:
+
+```bash
+docker compose -f docker-compose.self_host.yaml stop \
+  review-orchestrator-worker review-orchestrator openhands
+docker compose -f docker-compose.self_host.yaml up --build -d
+```
+
+The migration service also contains narrow compatibility handling for the
+OpenHands 1.8 PostgreSQL migrations: it creates the enum omitted by migration
+002 and applies migration 010's concurrent index outside a transaction. These
+steps are idempotent and can be removed after the pinned OpenHands image ships
+equivalent fixed migrations.
+
+Inspect the one-shot services and verify the selected backend with:
+
+```bash
+docker compose -f docker-compose.self_host.yaml logs openhands-db-init openhands-db-migrate
+docker compose -f docker-compose.self_host.yaml exec openhands \
+  /app/.venv/bin/python -c \
+  "from openhands.app_server.config import get_global_config; print(get_global_config().db_session.host)"
+```
+
+The second command must print `postgres`. To roll back before new PostgreSQL
+state is accepted, stop OpenHands, remove its `DB_*` settings from the compose
+service, and restore the retained SQLite backup. Do not run SQLite and
+PostgreSQL-backed OpenHands concurrently against the same deployment.
+
 The self-host compose file runs separate `review-orchestrator` API and
 `review-orchestrator-worker` services. It publishes Nginx as the public Review
 Orchestrator entrypoint and keeps the FastAPI service on the private Docker
