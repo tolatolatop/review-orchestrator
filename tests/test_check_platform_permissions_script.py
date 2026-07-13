@@ -83,6 +83,9 @@ def test_script_calls_deployed_endpoint_and_returns_healthy(
         "https://review.example/api/v1/diagnostics/platform-permissions"
     )
     assert request.headers["X-review-token"] == "operator-secret"
+    assert request.headers["User-agent"] == (
+        "review-orchestrator-permission-check/1.0"
+    )
     assert json.loads(request.data) == {
         "provider": "github",
         "repo_full_name": "example/repo",

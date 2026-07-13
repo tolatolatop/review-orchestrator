@@ -77,7 +77,11 @@ def main(argv: list[str] | None = None) -> int:
         f"{args.base_url.rstrip('/')}"
         "/api/v1/diagnostics/platform-permissions"
     )
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "review-orchestrator-permission-check/1.0",
+    }
     operator_token = os.getenv("REVIEW_PROXY_TOKEN")
     if operator_token:
         headers["X-Review-Token"] = operator_token
