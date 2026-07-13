@@ -108,6 +108,22 @@ The overall `status` is `healthy`, `degraded`, or `failed`. A write check can be
 `unknown` when a fine-grained provider token does not advertise its grants;
 the diagnostic intentionally does not create a probe comment to test writes.
 
+Run the standalone black-box verifier against a deployed service:
+
+```bash
+REVIEW_ORCHESTRATOR_URL=http://localhost:8000 \
+uv run python scripts/check_platform_permissions.py \
+  --provider github \
+  --repository owner/repo \
+  --pull-request 123
+```
+
+If the deployment is protected by the self-host reverse proxy, set
+`REVIEW_PROXY_TOKEN` in the environment; the script sends it as
+`X-Review-Token` and never prints it. Add `--json` for machine-readable output.
+The exit codes are `0` for healthy, `1` for degraded, `2` for failed provider
+checks, and `3` for request or response-contract errors.
+
 ### GitHub Webhooks
 
 `POST /api/v1/webhooks/github` verifies `X-Hub-Signature-256` when
