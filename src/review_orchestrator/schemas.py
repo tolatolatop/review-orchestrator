@@ -78,18 +78,6 @@ class ReviewRunProviderPublishing(BaseModel):
     line_comment_status_counts: dict[str, int] = Field(default_factory=dict)
 
 
-class ReviewRunListItem(ReviewRunRead):
-    operational_state: ReviewRunOperationalState
-    provider_publishing: ReviewRunProviderPublishing
-
-
-class ReviewRunListResponse(BaseModel):
-    items: list[ReviewRunListItem]
-    total: int
-    limit: int
-    offset: int
-
-
 class ReviewRunPullRequestContext(BaseModel):
     id: str | None = None
     title: str | None = None
@@ -105,6 +93,19 @@ class ReviewRunPullRequestContext(BaseModel):
     latest_event_id: str | None = None
     closed_at: datetime | None = None
     merged_at: datetime | None = None
+
+
+class ReviewRunListItem(ReviewRunRead):
+    operational_state: ReviewRunOperationalState
+    provider_publishing: ReviewRunProviderPublishing
+    pull_request_context: ReviewRunPullRequestContext | None = None
+
+
+class ReviewRunListResponse(BaseModel):
+    items: list[ReviewRunListItem]
+    total: int
+    limit: int
+    offset: int
 
 
 class ReviewRunWorkspaceSummary(BaseModel):
@@ -161,7 +162,6 @@ class ReviewRunLinkedTaskSummary(BaseModel):
 
 
 class ReviewRunDetail(ReviewRunListItem):
-    pull_request_context: ReviewRunPullRequestContext | None = None
     workspace: ReviewRunWorkspaceSummary | None = None
     review_session: ReviewRunSessionSummary | None = None
     findings_summary: ReviewRunFindingsSummary

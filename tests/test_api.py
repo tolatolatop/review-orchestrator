@@ -119,6 +119,20 @@ def test_bundled_dashboard_is_mounted(tmp_path: Path) -> None:
     assert "/api/v1/observability" in response.text
 
 
+def test_review_ledger_dashboard_is_mounted(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        redirect = client.get("/reviews", follow_redirects=False)
+        response = client.get("/reviews/")
+
+    assert redirect.status_code == 307
+    assert redirect.headers["location"] == "/reviews/"
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Review 执行台账" in response.text
+    assert "/api/v1/observability/review-runs" in response.text
+    assert "REFRESH_SECONDS=30" in response.text
+
+
 def test_observability_list_aliases_are_available(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
         for resource in ("provider-events", "review-runs", "agent-tasks"):
@@ -394,6 +408,102 @@ def test_list_review_runs_filters_and_reports_worker_state(tmp_path: Path) -> No
     assert unlocked_response.status_code == 200
     assert unlocked_response.json()["total"] == 1
     assert unlocked_response.json()["items"][0]["id"] == first["id"]
+
+
+def test_list_review_runs_includes_pull_request_context_in_bulk(
+    tmp_path: Path,
+) -> None:
+    github_payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+    gitlab_payload = {
+        "provider": "gitlab",
+        "repo_full_name": "group/project",
+        "pull_request_number": 7,
+        "base_sha": "c" * 40,
+        "head_sha": "d" * 40,
+    }
+
+    async def seed_contexts(
+        client: TestClient,
+        github_run_id: str,
+    ) -> None:
+        async with client.app.state.session_factory() as session:
+            github_context = PullRequestContext(
+                provider="github",
+                repo_full_name="example/repo",
+                pull_request_number=42,
+                title="Add review ledger",
+                author_login="alice",
+                base_ref="main",
+                base_sha="a" * 40,
+                head_ref="feature/ledger",
+                head_sha="b" * 40,
+                status="open",
+                html_url="https://github.com/example/repo/pull/42",
+            )
+            gitlab_context = PullRequestContext(
+                provider="gitlab",
+                repo_full_name="group/project",
+                pull_request_number=7,
+                title="Improve review state",
+                author_login="bob",
+                base_ref="main",
+                base_sha="c" * 40,
+                head_ref="review-state",
+                head_sha="d" * 40,
+                status="opened",
+                html_url="https://gitlab.com/group/project/-/merge_requests/7",
+            )
+            session.add_all([github_context, gitlab_context])
+            await session.flush()
+            github_run = await session.get(ReviewRun, github_run_id)
+            assert github_run is not None
+            github_run.pull_request_context_id = github_context.id
+            await session.commit()
+
+    with make_client(tmp_path) as client:
+        github_run = client.post(
+            "/api/v1/review-runs", json=github_payload
+        ).json()
+        gitlab_run = client.post(
+            "/api/v1/review-runs", json=gitlab_payload
+        ).json()
+        client.portal.call(seed_contexts, client, github_run["id"])
+
+        github_response = client.get(
+            "/api/v1/observability/review-runs",
+            params={"provider": "github"},
+        )
+        gitlab_response = client.get(
+            "/api/v1/observability/review-runs",
+            params={"provider": "gitlab"},
+        )
+        page_response = client.get(
+            "/api/v1/observability/review-runs",
+            params={"limit": 1, "offset": 0},
+        )
+
+    assert github_response.status_code == 200
+    github_context = github_response.json()["items"][0]["pull_request_context"]
+    assert github_context["title"] == "Add review ledger"
+    assert github_context["html_url"].endswith("/pull/42")
+
+    assert gitlab_response.status_code == 200
+    gitlab_item = gitlab_response.json()["items"][0]
+    assert gitlab_item["id"] == gitlab_run["id"]
+    assert gitlab_item["pull_request_context"]["title"] == "Improve review state"
+    assert gitlab_item["pull_request_context"]["html_url"].endswith(
+        "/merge_requests/7"
+    )
+
+    assert page_response.status_code == 200
+    assert page_response.json()["total"] == 2
+    assert len(page_response.json()["items"]) == 1
 
 
 def test_get_review_run_detail_exposes_operator_context(tmp_path: Path) -> None:

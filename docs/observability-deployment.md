@@ -7,8 +7,9 @@ authentication and TLS.**
 
 ## Current Availability
 
-The service mounts its bundled operator dashboard at `/dashboard/`. It consumes
-the canonical observability APIs below from the same origin:
+The service mounts its bundled operator dashboard at `/dashboard/` and a
+focused review-run ledger at `/reviews/`. Both consume the canonical
+observability APIs below from the same origin:
 
 | Purpose | Endpoint |
 | --- | --- |
