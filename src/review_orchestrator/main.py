@@ -9,6 +9,7 @@ from review_orchestrator.config import Settings, get_settings
 from review_orchestrator.dashboard import DASHBOARD_HTML
 from review_orchestrator.db import create_engine, create_session_factory, init_models
 from review_orchestrator.github import create_github_client
+from review_orchestrator.reviews_dashboard import REVIEWS_DASHBOARD_HTML
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -43,6 +44,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/dashboard/", response_class=HTMLResponse, include_in_schema=False)
     async def dashboard() -> HTMLResponse:
         return HTMLResponse(DASHBOARD_HTML)
+
+    @app.get("/reviews", include_in_schema=False)
+    async def reviews_dashboard_redirect() -> RedirectResponse:
+        return RedirectResponse("/reviews/", status_code=307)
+
+    @app.get("/reviews/", response_class=HTMLResponse, include_in_schema=False)
+    async def reviews_dashboard() -> HTMLResponse:
+        return HTMLResponse(REVIEWS_DASHBOARD_HTML)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -293,11 +293,16 @@ async def list_review_runs(
     publishing_by_run_id = await _provider_publishing_for_runs(
         session, [review_run.id for review_run in review_runs]
     )
+    contexts_by_id, contexts_by_identity = await _pull_request_contexts_for_runs(
+        session, review_runs
+    )
     return ReviewRunListResponse(
         items=[
             _review_run_list_item(
                 review_run,
                 publishing_by_run_id.get(review_run.id),
+                contexts_by_id.get(review_run.pull_request_context_id)
+                or contexts_by_identity.get(_review_run_identity(review_run)),
             )
             for review_run in review_runs
         ],
@@ -322,11 +327,10 @@ async def get_review_run_detail(
     findings = await _findings_summary_for_run(session, review_run.id)
     trigger_event = await _trigger_event_for_run(session, review_run)
     agent_task = await _agent_task_for_run(session, review_run)
-    list_item = _review_run_list_item(review_run, publishing)
+    list_item = _review_run_list_item(review_run, publishing, context)
 
     return ReviewRunDetail(
         **list_item.model_dump(),
-        pull_request_context=_pull_request_context_summary(context),
         workspace=_workspace_summary(workspace, review_run.workspace_path),
         review_session=_review_session_summary(review_session),
         findings_summary=findings,
@@ -1191,6 +1195,7 @@ def _review_run_filters(
 def _review_run_list_item(
     review_run: ReviewRun,
     publishing: ReviewRunProviderPublishing | None,
+    context: PullRequestContext | None = None,
 ) -> ReviewRunListItem:
     base = ReviewRunRead.model_validate(review_run).model_dump()
     base["error"] = _safe_error_message(review_run.error)
@@ -1201,6 +1206,7 @@ def _review_run_list_item(
             summary_comment_id=review_run.summary_comment_id,
             summary_published=review_run.summary_comment_id is not None,
         ),
+        pull_request_context=_pull_request_context_summary(context),
     )
 
 
@@ -1324,6 +1330,55 @@ async def _pull_request_context_for_run(
         )
     )
     return result.scalar_one_or_none()
+
+
+async def _pull_request_contexts_for_runs(
+    session: AsyncSession,
+    review_runs: list[ReviewRun],
+) -> tuple[
+    dict[str, PullRequestContext],
+    dict[tuple[str, str, int], PullRequestContext],
+]:
+    if not review_runs:
+        return {}, {}
+
+    context_ids = {
+        review_run.pull_request_context_id
+        for review_run in review_runs
+        if review_run.pull_request_context_id
+    }
+    identities = {_review_run_identity(review_run) for review_run in review_runs}
+    predicates = [
+        tuple_(
+            PullRequestContext.provider,
+            PullRequestContext.repo_full_name,
+            PullRequestContext.pull_request_number,
+        ).in_(identities)
+    ]
+    if context_ids:
+        predicates.append(PullRequestContext.id.in_(context_ids))
+
+    result = await session.execute(
+        select(PullRequestContext).where(or_(*predicates))
+    )
+    contexts = list(result.scalars().all())
+    return (
+        {context.id: context for context in contexts},
+        {
+            (context.provider, context.repo_full_name, context.pull_request_number): (
+                context
+            )
+            for context in contexts
+        },
+    )
+
+
+def _review_run_identity(review_run: ReviewRun) -> tuple[str, str, int]:
+    return (
+        review_run.provider,
+        review_run.repo_full_name,
+        review_run.pull_request_number,
+    )
 
 
 async def _workspace_for_run(

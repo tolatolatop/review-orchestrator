@@ -134,6 +134,12 @@ ProviderEventInbox
   -> Finding / ReviewCommentRef provider publishing state
 ```
 
+Review-run list items include an optional `pull_request_context` summary so
+operator list views can show the provider title, author, branch, state, and
+safe provider URL without issuing one detail request per row. It is `null`
+when no stored context matches the run's explicit context ID or its
+`provider + repo_full_name + pull_request_number` identity.
+
 For each link, return `null` when the entity has not been created or the stored
 provider payload did not include enough identity to derive it.
 
