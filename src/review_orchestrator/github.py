@@ -10,6 +10,12 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, ConfigDict
 
+from review_orchestrator.github_auth import (
+    GitHubAppTokenProvider,
+    GitHubAuthenticationError,
+    GitHubTokenProvider,
+    StaticGitHubTokenProvider,
+)
 from review_orchestrator.providers import (
     ParsedProviderWebhook,
     ProviderPayloadError,
@@ -116,11 +122,22 @@ class GitHubClient:
         *,
         api_base_url: str = "https://api.github.com",
         token: str | None = None,
+        token_provider: GitHubTokenProvider | None = None,
         timeout: float = 30.0,
     ) -> None:
         self.api_base_url = api_base_url.rstrip("/")
         self.token = token
+        self.token_provider = token_provider or StaticGitHubTokenProvider(token)
         self.timeout = timeout
+
+    async def get_token(self, repo_full_name: str) -> str | None:
+        try:
+            return await self.token_provider.get_token(repo_full_name)
+        except GitHubAuthenticationError as exc:
+            raise GitHubClientError(str(exc)) from exc
+
+    async def aclose(self) -> None:
+        await self.token_provider.aclose()
 
     async def list_pull_request_files(
         self,
@@ -128,7 +145,8 @@ class GitHubClient:
         pull_request_number: int,
     ) -> list[dict[str, Any]]:
         return await self._paginate(
-            f"/repos/{repo_full_name}/pulls/{pull_request_number}/files"
+            f"/repos/{repo_full_name}/pulls/{pull_request_number}/files",
+            repo_full_name=repo_full_name,
         )
 
     async def get_pull_request(
@@ -139,6 +157,7 @@ class GitHubClient:
         response = await self._request(
             "GET",
             f"/repos/{repo_full_name}/pulls/{pull_request_number}",
+            repo_full_name=repo_full_name,
         )
         if not isinstance(response, dict):
             raise GitHubClientError("GitHub pull request response is not an object.")
@@ -150,7 +169,8 @@ class GitHubClient:
         pull_request_number: int,
     ) -> list[GitHubComment]:
         items = await self._paginate(
-            f"/repos/{repo_full_name}/issues/{pull_request_number}/comments"
+            f"/repos/{repo_full_name}/issues/{pull_request_number}/comments",
+            repo_full_name=repo_full_name,
         )
         return [GitHubComment.model_validate(item) for item in items]
 
@@ -163,6 +183,7 @@ class GitHubClient:
         response = await self._request(
             "POST",
             f"/repos/{repo_full_name}/issues/{pull_request_number}/comments",
+            repo_full_name=repo_full_name,
             json={"body": body},
         )
         return str(response["id"])
@@ -176,6 +197,7 @@ class GitHubClient:
         response = await self._request(
             "PATCH",
             f"/repos/{repo_full_name}/issues/comments/{comment_id}",
+            repo_full_name=repo_full_name,
             json={"body": body},
         )
         return str(response["id"])
@@ -193,6 +215,7 @@ class GitHubClient:
         response = await self._request(
             "POST",
             f"/repos/{repo_full_name}/pulls/{pull_request_number}/comments",
+            repo_full_name=repo_full_name,
             json={
                 "body": body,
                 "commit_id": commit_id,
@@ -203,12 +226,17 @@ class GitHubClient:
         )
         return str(response["id"])
 
-    async def _paginate(self, path: str) -> list[dict[str, Any]]:
+    async def _paginate(
+        self, path: str, *, repo_full_name: str | None = None
+    ) -> list[dict[str, Any]]:
         page = 1
         items: list[dict[str, Any]] = []
         while True:
             response = await self._request(
-                "GET", path, params={"per_page": 100, "page": page}
+                "GET",
+                path,
+                params={"per_page": 100, "page": page},
+                repo_full_name=repo_full_name,
             )
             if not isinstance(response, list):
                 raise GitHubClientError(f"GitHub response for {path} is not a list.")
@@ -224,13 +252,15 @@ class GitHubClient:
         *,
         json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        repo_full_name: str | None = None,
     ) -> Any:
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
+        token = await self.get_token(repo_full_name) if repo_full_name else self.token
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         try:
             async with httpx.AsyncClient(
                 base_url=self.api_base_url,
@@ -249,6 +279,33 @@ class GitHubClient:
                 f"GitHub request failed ({method} {path}): {exc}"
             ) from exc
         return response.json() if response.content else {}
+
+
+def create_github_client(settings: Any) -> GitHubClient:
+    app_id = getattr(settings, "github_app_id", None)
+    private_key_path = getattr(settings, "github_private_key_path", None)
+    if bool(app_id) != bool(private_key_path):
+        raise GitHubAuthenticationError(
+            "GITHUB_APP_ID and GITHUB_PRIVATE_KEY_PATH must be configured together."
+        )
+
+    if app_id and private_key_path:
+        token_provider: GitHubTokenProvider = GitHubAppTokenProvider(
+            app_id=app_id,
+            private_key_path=private_key_path,
+            api_base_url=settings.github_api_base_url,
+            installation_id=getattr(settings, "github_installation_id", None),
+        )
+    else:
+        token_provider = StaticGitHubTokenProvider(
+            getattr(settings, "github_installation_token", None)
+        )
+
+    return GitHubClient(
+        api_base_url=settings.github_api_base_url,
+        token_provider=token_provider,
+        timeout=settings.openhands_timeout_seconds,
+    )
 
 
 async def fetch_changed_files(

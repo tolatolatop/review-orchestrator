@@ -4,7 +4,16 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from review_orchestrator.config import Settings
+from review_orchestrator.db import create_engine, create_session_factory, init_models
 from review_orchestrator.main import create_app
+from review_orchestrator.schemas import WorkspacePrepareRequest
+from review_orchestrator.workspaces import (
+    WorkspacePaths,
+    _git_env,
+    _mask_secret,
+    _prepare_git_workspace,
+    prepare_workspace,
+)
 
 
 def make_client(tmp_path: Path) -> TestClient:
@@ -170,3 +179,114 @@ def test_prepare_workspace_returns_stable_failure_for_missing_head(
     assert response.status_code == 200
     assert response.json()["status"] == "failed"
     assert response.json()["failure_code"] == "head_missing"
+
+
+def test_dynamic_token_is_injected_only_through_temporary_git_config() -> None:
+    request = WorkspacePrepareRequest.model_validate(
+        {
+            "repository": {
+                "full_name": "acme/private-repo",
+                "clone_url": "https://github.example/acme/private-repo.git",
+            },
+            "pull_request": {
+                "number": 1,
+                "base_sha": "a" * 40,
+                "head_sha": "b" * 40,
+            },
+        }
+    )
+
+    env = _git_env(request, auth_token="installation-secret")
+
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_VALUE_0"] == "https://github.example/"
+    assert env["GIT_CONFIG_KEY_0"] == (
+        "url.https://x-access-token:installation-secret@github.example/.insteadOf"
+    )
+    assert env["REVIEW_GIT_TOKEN_MASK"] == "installation-secret"
+    assert "installation-secret" not in request.model_dump_json()
+
+
+def test_git_error_output_masks_dynamic_token() -> None:
+    env = {"REVIEW_GIT_TOKEN_MASK": "installation-secret"}
+    value = "fatal: authentication failed for installation-secret"
+
+    assert _mask_secret(value, env) == "fatal: authentication failed for ***"
+
+
+def test_prepare_git_workspace_passes_token_in_environment_only(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    request = WorkspacePrepareRequest.model_validate(
+        {
+            "repository": {
+                "full_name": "acme/private-repo",
+                "clone_url": "https://github.com/acme/private-repo.git",
+            },
+            "pull_request": {
+                "number": 1,
+                "base_sha": "a" * 40,
+                "head_sha": "b" * 40,
+            },
+            "options": {"use_git_cache": False},
+        }
+    )
+    paths = WorkspacePaths(
+        repo_hash="repo-hash",
+        repo_path=tmp_path / "workspace" / "repo",
+        cache_path=tmp_path / "cache.git",
+    )
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def record_git(command: list[str], *, env: dict[str, str]) -> None:
+        calls.append((command, env))
+
+    monkeypatch.setattr("review_orchestrator.workspaces._run_git", record_git)
+    _prepare_git_workspace(paths, request, "installation-secret")
+
+    assert calls
+    assert all("installation-secret" not in " ".join(command) for command, _ in calls)
+    assert all(
+        env["REVIEW_GIT_TOKEN_MASK"] == "installation-secret" for _, env in calls
+    )
+
+
+class FakeWorkspaceGitHubClient:
+    def __init__(self) -> None:
+        self.repositories: list[str] = []
+
+    async def get_token(self, repo_full_name: str) -> str:
+        self.repositories.append(repo_full_name)
+        return "installation-secret"
+
+
+async def test_prepare_workspace_resolves_dynamic_token_by_repository(
+    tmp_path: Path,
+) -> None:
+    source_repo, base_sha, head_sha = make_source_repo(tmp_path)
+    request = WorkspacePrepareRequest.model_validate(
+        workspace_payload(source_repo, base_sha, head_sha)
+    )
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/direct.db",
+        workspace_root=str(tmp_path / "direct-workspaces"),
+        git_cache_root=str(tmp_path / "direct-cache"),
+    )
+    engine = create_engine(settings)
+    await init_models(engine)
+    session_factory = create_session_factory(engine)
+    github_client = FakeWorkspaceGitHubClient()
+    try:
+        async with session_factory() as session:
+            result = await prepare_workspace(
+                session,
+                settings,
+                request,
+                github_client=github_client,
+            )
+    finally:
+        await engine.dispose()
+
+    assert result.status == "ready"
+    assert github_client.repositories == ["example/repo"]

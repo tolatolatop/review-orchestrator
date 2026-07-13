@@ -6,7 +6,7 @@ import socket
 
 from review_orchestrator.config import Settings, get_settings
 from review_orchestrator.db import create_engine, create_session_factory, init_models
-from review_orchestrator.github import GitHubClient
+from review_orchestrator.github import create_github_client
 from review_orchestrator.gitlab import GitLabClient
 from review_orchestrator.openhands import OpenHandsClient
 from review_orchestrator.worker import (
@@ -37,26 +37,23 @@ async def run_worker(
     worker_id: str | None = None,
 ) -> None:
     engine = create_engine(settings)
-    await init_models(engine)
-    session_factory = create_session_factory(engine)
-    resolved_worker_id = worker_id or f"worker-{socket.gethostname()}"
-    openhands_client = OpenHandsClient(
-        base_url=settings.openhands_base_url or "http://localhost:3000",
-        api_key=settings.openhands_api_token,
-        timeout=settings.openhands_timeout_seconds,
-    )
-    github_client = GitHubClient(
-        api_base_url=settings.github_api_base_url,
-        token=settings.github_installation_token,
-        timeout=settings.openhands_timeout_seconds,
-    )
-    gitlab_client = GitLabClient(
-        api_base_url=settings.gitlab_api_base_url,
-        token=settings.gitlab_api_token,
-        timeout=settings.openhands_timeout_seconds,
-    )
-
+    github_client = None
     try:
+        await init_models(engine)
+        session_factory = create_session_factory(engine)
+        resolved_worker_id = worker_id or f"worker-{socket.gethostname()}"
+        openhands_client = OpenHandsClient(
+            base_url=settings.openhands_base_url or "http://localhost:3000",
+            api_key=settings.openhands_api_token,
+            timeout=settings.openhands_timeout_seconds,
+        )
+        github_client = create_github_client(settings)
+        gitlab_client = GitLabClient(
+            api_base_url=settings.gitlab_api_base_url,
+            token=settings.gitlab_api_token,
+            timeout=settings.openhands_timeout_seconds,
+        )
+
         while True:
             async with session_factory() as session:
                 await process_review_run_timeouts(
@@ -87,7 +84,11 @@ async def run_worker(
             if agent_task is None and review_run is None:
                 await asyncio.sleep(settings.worker_poll_interval_seconds)
     finally:
-        await engine.dispose()
+        try:
+            if github_client is not None:
+                await github_client.aclose()
+        finally:
+            await engine.dispose()
 
 
 if __name__ == "__main__":

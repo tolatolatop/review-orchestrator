@@ -332,6 +332,9 @@ async def process_next_review_run(
                     session,
                     settings,
                     _workspace_request_from_context(context),
+                    github_client=(
+                        github_client if review_run.provider == "github" else None
+                    ),
                 )
             except Exception as exc:
                 review_run.status = "failed"

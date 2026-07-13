@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     )
     github_app_id: str | None = None
     github_private_key_path: str | None = None
+    github_installation_id: int | None = Field(default=None, gt=0)
     github_installation_token: str | None = Field(
         default=None,
         description=(
