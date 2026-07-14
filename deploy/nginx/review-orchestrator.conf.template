@@ -1,5 +1,15 @@
 map_hash_bucket_size 128;
 
+map "${REVIEW_PROXY_TOKEN}" $review_proxy_token_configured {
+    default 1;
+    "" 0;
+}
+
+map "${REVIEW_PROXY_TOKEN_ENABLED}" $review_proxy_token_enabled {
+    default 1;
+    "false" 0;
+}
+
 map $http_x_review_token $header_token_valid {
     default 0;
     "${REVIEW_PROXY_TOKEN}" 1;
@@ -10,9 +20,15 @@ map $arg_token $query_token_valid {
     "${REVIEW_PROXY_TOKEN}" 1;
 }
 
-map "$header_token_valid$query_token_valid" $review_token_valid {
+map "$review_proxy_token_configured$header_token_valid$query_token_valid" $review_token_valid {
     default 0;
-    ~1 1;
+    ~^1.*1 1;
+}
+
+map "$review_proxy_token_enabled$review_token_valid" $review_access_allowed {
+    default 0;
+    ~^0 1;
+    "11" 1;
 }
 
 # Docker's embedded DNS tracks container replacements. Using a variable in
@@ -45,7 +61,7 @@ server {
     }
 
     location / {
-        if ($review_token_valid = 0) {
+        if ($review_access_allowed = 0) {
             return 401;
         }
 

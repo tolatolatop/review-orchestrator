@@ -48,8 +48,8 @@ context route. Repository names containing `/` must be path-encoded by clients.
 
 ## Authentication And Authorization
 
-No observability route may be public. The initial guard is operator access at the
-deployment edge:
+Production observability routes should not be public. The default initial guard
+is operator access at the deployment edge:
 
 - `GET /health` remains public for load balancers.
 - `POST /api/v1/webhooks/{provider}` remains provider-authenticated by webhook
@@ -57,6 +57,11 @@ deployment edge:
 - Every other route, including all `/api/v1/observability/*` routes, requires an
   operator credential. The current nginx deployment enforces this with
   `X-Review-Token` or a `token` query parameter.
+
+Operators can explicitly set `REVIEW_PROXY_TOKEN_ENABLED=false` to remove this
+Nginx guard from every route. That mode is intentionally fully tokenless and
+must rely on a trusted network or an upstream authentication boundary instead.
+It does not add any in-process FastAPI authorization.
 
 When in-process auth is added, it must be implemented as a FastAPI dependency
 that is attached to the observability router. Do not add unauthenticated

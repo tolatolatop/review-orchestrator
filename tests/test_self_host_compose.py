@@ -25,6 +25,20 @@ def test_orchestrator_has_a_loopback_only_tokenless_local_port() -> None:
     assert "REVIEW_LOCAL_PORT=18000" in example_env
 
 
+def test_nginx_token_gate_defaults_on_and_allows_an_empty_disabled_token() -> None:
+    root = Path(__file__).parents[1]
+    compose = (root / "docker-compose.self_host.yaml").read_text()
+    example_env = (root / ".env.example").read_text()
+
+    assert (
+        'REVIEW_PROXY_TOKEN_ENABLED: "${REVIEW_PROXY_TOKEN_ENABLED:-true}"'
+        in compose
+    )
+    assert 'REVIEW_PROXY_TOKEN: "${REVIEW_PROXY_TOKEN:-}"' in compose
+    assert "REVIEW_PROXY_TOKEN:?" not in compose
+    assert "REVIEW_PROXY_TOKEN_ENABLED=true" in example_env
+
+
 def test_openhands_uses_a_separate_provisioned_postgres_database() -> None:
     root = Path(__file__).parents[1]
     compose = (root / "docker-compose.self_host.yaml").read_text()

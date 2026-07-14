@@ -161,7 +161,8 @@ services:
   nginx:
     image: nginx:1.27-alpine
     environment:
-      REVIEW_PROXY_TOKEN: ${REVIEW_PROXY_TOKEN:?REVIEW_PROXY_TOKEN must be set}
+      REVIEW_PROXY_TOKEN_ENABLED: "${REVIEW_PROXY_TOKEN_ENABLED:-true}"
+      REVIEW_PROXY_TOKEN: "${REVIEW_PROXY_TOKEN:-}"
     ports:
       - "${REVIEW_PROXY_PORT:-18080}:8080"
     volumes:
