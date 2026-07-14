@@ -20,8 +20,9 @@ observability APIs below from the same origin:
 | OpenHands by conversation | `GET /api/v1/observability/openhands-sessions/{conversation_id}` |
 
 The legacy paths without `/observability` remain compatible. Remote requests
-use the token-protected Nginx boundary; trusted requests from the deployment
-host may use the separate loopback-only FastAPI port without a token. See
+use the token-protected Nginx boundary by default; trusted requests from the
+deployment host may use the separate loopback-only FastAPI port without a token.
+The boundary can be explicitly disabled as described below. See
 [observability-api.md](observability-api.md) for the API and redaction contract.
 
 ## Recommended Self-host Topology
@@ -32,6 +33,7 @@ trusted local inspection. Before startup, set at least:
 
 ```dotenv
 APP_ENV=production
+REVIEW_PROXY_TOKEN_ENABLED=true
 REVIEW_PROXY_TOKEN=<strong-random-operator-token>
 GITHUB_WEBHOOK_SECRET=<github-webhook-secret>
 POSTGRES_PASSWORD=<strong-random-database-password>
@@ -52,6 +54,14 @@ The supplied Nginx template applies these boundaries:
   send it; the application verifies `X-Hub-Signature-256` when
   `GITHUB_WEBHOOK_SECRET` is configured.
 - Every other path requires `X-Review-Token` or the `token` query parameter.
+
+Set `REVIEW_PROXY_TOKEN_ENABLED=false` only when intentionally making the
+entire Nginx entrypoint tokenless. In that mode `REVIEW_PROXY_TOKEN` may be
+empty and all API, UI, and operational routes are accessible without either
+token form. This removes the Nginx authentication boundary completely, so the
+entrypoint must be limited to a trusted network or protected by an upstream
+authentication layer. With validation enabled, an empty configured token fails
+closed instead of authorizing an empty request token.
 
 Local operators bypass Nginx entirely and therefore do not need the token:
 
@@ -117,8 +127,12 @@ Run these checks from outside the private service network against Nginx/ingress.
 ### Authentication and network boundary
 
 - `/health` succeeds without a token.
-- Observability requests through Nginx with no token or an invalid token return
-  `401`; the same requests with `X-Review-Token` succeed.
+- With `REVIEW_PROXY_TOKEN_ENABLED=true`, observability requests through Nginx
+  with no token or an invalid token return `401`; the same requests with
+  `X-Review-Token` succeed.
+- With `REVIEW_PROXY_TOKEN_ENABLED=false`, all Nginx routes succeed without a
+  token; verify an equivalent trusted-network or upstream-authentication
+  boundary before using this mode.
 - Observability requests through `127.0.0.1:${REVIEW_LOCAL_PORT:-18000}` succeed
   without a token.
 - FastAPI, PostgreSQL, and OpenHands are blocked from untrusted networks; TLS is
@@ -159,7 +173,9 @@ or alter its response contract:
   `GITHUB_WEBHOOK_SECRET` is configured.
 - Required headers, duplicate-delivery idempotency, normalization, and
   review/task enqueue behavior remain unchanged.
-- Observability endpoints still require the operator token.
+- Observability endpoints require the operator token when
+  `REVIEW_PROXY_TOKEN_ENABLED=true` and are deliberately tokenless when it is
+  `false`.
 
 Use the signed smoke test in [deployment.md](deployment.md), then run:
 

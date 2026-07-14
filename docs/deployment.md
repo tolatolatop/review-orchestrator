@@ -52,7 +52,8 @@ passwords.
 | `PORT` | `8000` | no | Bind port for local `uvicorn` examples. |
 | `REVIEW_LOCAL_PORT` | `18000` | no | Self-host FastAPI port bound only to `127.0.0.1`; trusted local requests bypass Nginx token checks. |
 | `REVIEW_PROXY_PORT` | `18080` | no | Self-host Nginx port for remote or proxied operator access. |
-| `REVIEW_PROXY_TOKEN` | empty | self-host production yes | Token enforced by Nginx on protected routes; FastAPI does not validate it. |
+| `REVIEW_PROXY_TOKEN_ENABLED` | `true` | no | Enables Nginx token validation. Set to `false` only when the proxy is intentionally open: every route and feature then accepts requests without a token. |
+| `REVIEW_PROXY_TOKEN` | empty | when token validation is enabled | Token enforced by Nginx on protected routes; FastAPI does not validate it. An empty token fails closed while validation is enabled. |
 | `DATABASE_URL` | `sqlite+aiosqlite:///./review_orchestrator.db` | yes | SQLAlchemy async URL. `sqlite:///`, `postgres://`, and `postgresql://` are normalized to async drivers. |
 | `GITHUB_WEBHOOK_SECRET` | empty | production yes | Shared webhook secret. If unset, signature verification is skipped for local development. |
 | `GITHUB_APP_ID` | empty | with App auth | GitHub App ID. Configure it together with `GITHUB_PRIVATE_KEY_PATH`. |
@@ -262,6 +263,14 @@ browser history, proxy logs, and analytics systems. GitHub webhooks cannot send
 this custom header, so `/api/v1/webhooks/github` is allowed through Nginx and
 must be protected by setting `GITHUB_WEBHOOK_SECRET`.
 
+To intentionally expose every Review Orchestrator feature without the Nginx
+token gate, set `REVIEW_PROXY_TOKEN_ENABLED=false` and restart the Nginx
+service. `REVIEW_PROXY_TOKEN` may be empty in this mode, and neither the header
+nor query parameter is required on any route. This is a fully open proxy, not a
+development-only bypass; restrict it to a trusted network or place another
+authentication layer in front of it. Any value other than exactly `false`
+keeps validation enabled, and an empty token then rejects protected requests.
+
 The observability endpoints contain private repository and execution metadata.
 Read the dedicated [secure observability deployment and verification guide](observability-deployment.md)
 before exposing an operator UI or API. It documents the current route set,
@@ -273,8 +282,10 @@ Recommended production settings:
 - Set `APP_ENV=production`.
 - Use PostgreSQL with TLS and regular backups.
 - Set `GITHUB_WEBHOOK_SECRET` and reject unsigned webhook traffic.
-- Set `REVIEW_PROXY_TOKEN` to a strong random value and expose only the Nginx
-  port to non-loopback interfaces; keep the direct FastAPI mapping loopback-only.
+- Keep `REVIEW_PROXY_TOKEN_ENABLED=true`, set `REVIEW_PROXY_TOKEN` to a strong
+  random value, and expose only the Nginx port to non-loopback interfaces; keep
+  the direct FastAPI mapping loopback-only. Disable validation only behind an
+  equivalent trusted-network or upstream-authentication boundary.
 - Store `.env` values in the platform secret manager instead of the repository.
 - Put `WORKSPACE_ROOT` and `GIT_CACHE_ROOT` on a disk with enough space for the
   largest expected pull requests.
