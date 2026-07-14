@@ -50,6 +50,9 @@ passwords.
 | `LOG_LEVEL` | `INFO` | no | Logging verbosity for the process manager or ASGI server. |
 | `HOST` | `0.0.0.0` | no | Bind host for local `uvicorn` examples. |
 | `PORT` | `8000` | no | Bind port for local `uvicorn` examples. |
+| `REVIEW_LOCAL_PORT` | `18000` | no | Self-host FastAPI port bound only to `127.0.0.1`; trusted local requests bypass Nginx token checks. |
+| `REVIEW_PROXY_PORT` | `18080` | no | Self-host Nginx port for remote or proxied operator access. |
+| `REVIEW_PROXY_TOKEN` | empty | self-host production yes | Token enforced by Nginx on protected routes; FastAPI does not validate it. |
 | `DATABASE_URL` | `sqlite+aiosqlite:///./review_orchestrator.db` | yes | SQLAlchemy async URL. `sqlite:///`, `postgres://`, and `postgresql://` are normalized to async drivers. |
 | `GITHUB_WEBHOOK_SECRET` | empty | production yes | Shared webhook secret. If unset, signature verification is skipped for local development. |
 | `GITHUB_APP_ID` | empty | with App auth | GitHub App ID. Configure it together with `GITHUB_PRIVATE_KEY_PATH`. |
@@ -228,21 +231,25 @@ service, and restore the retained SQLite backup. Do not run SQLite and
 PostgreSQL-backed OpenHands concurrently against the same deployment.
 
 The self-host compose file runs separate `review-orchestrator` API and
-`review-orchestrator-worker` services. It publishes Nginx as the public Review
-Orchestrator entrypoint and keeps the FastAPI service on the private Docker
-network. OpenHands is also published only on the host loopback interface for
-local inspection:
+`review-orchestrator-worker` services. It publishes Nginx as the remote Review
+Orchestrator entrypoint and also binds FastAPI to a separate host-loopback port
+for trusted local access without a proxy token. Neither FastAPI nor OpenHands
+is bound to a non-loopback host interface:
 
 ```bash
+open http://127.0.0.1:${REVIEW_LOCAL_PORT:-18000}/reviews/
 open http://127.0.0.1:${OPENHANDS_FRONTEND_PORT:-3000}
 ```
 
+Use `REVIEW_LOCAL_PORT` to move the tokenless, loopback-only FastAPI port. Do
+not change its Compose binding from `127.0.0.1` to `0.0.0.0`; local access
+intentionally relies on the host boundary instead of application auth.
 Use `OPENHANDS_FRONTEND_PORT` to move this local-only OpenHands UI/API port.
 The legacy `OPENHANDS_PORT` variable is still accepted as a fallback when
 `OPENHANDS_FRONTEND_PORT` is not set.
 
-Requests
-outside `/health` and `/api/v1/webhooks/github` must include the fixed token:
+Requests sent through the Nginx port outside `/health` and
+`/api/v1/webhooks/github` must include the fixed token:
 
 ```bash
 curl -fsS http://localhost:${REVIEW_PROXY_PORT:-18080}/api/v1/review-runs/<review_run_id> \
@@ -267,7 +274,7 @@ Recommended production settings:
 - Use PostgreSQL with TLS and regular backups.
 - Set `GITHUB_WEBHOOK_SECRET` and reject unsigned webhook traffic.
 - Set `REVIEW_PROXY_TOKEN` to a strong random value and expose only the Nginx
-  port from the host or load balancer.
+  port to non-loopback interfaces; keep the direct FastAPI mapping loopback-only.
 - Store `.env` values in the platform secret manager instead of the repository.
 - Put `WORKSPACE_ROOT` and `GIT_CACHE_ROOT` on a disk with enough space for the
   largest expected pull requests.

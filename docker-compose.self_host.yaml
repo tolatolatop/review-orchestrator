@@ -108,6 +108,8 @@ services:
       OPENHANDS_BASE_URL: http://openhands:3000
     expose:
       - "8000"
+    ports:
+      - "127.0.0.1:${REVIEW_LOCAL_PORT:-18000}:8000"
     volumes:
       - review_orchestrator_data:/var/lib/review-orchestrator
       - ./secrets:/run/secrets:ro

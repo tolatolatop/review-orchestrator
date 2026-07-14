@@ -131,6 +131,7 @@ def test_review_ledger_dashboard_is_mounted(tmp_path: Path) -> None:
     assert "Review 执行台账" in response.text
     assert "/api/v1/observability/review-runs" in response.text
     assert "REFRESH_SECONDS=30" in response.text
+    assert "headers['X-Review-Token']=PROXY_TOKEN" in response.text
 
 
 def test_observability_list_aliases_are_available(tmp_path: Path) -> None:
