@@ -13,12 +13,9 @@ from review_orchestrator.models import (
     ReviewRun,
     utc_now,
 )
-from review_orchestrator.openhands import (
-    OpenHandsClientError,
-    OpenHandsConversation,
-    OpenHandsEventPage,
-    OpenHandsStartTask,
-    OpenHandsStartTaskStatus,
+from review_orchestrator.pi_agent import (
+    PiAgentClientError,
+    PiAgentSession,
 )
 from review_orchestrator.providers import ProviderOperationError, ProviderRegistry
 from review_orchestrator.review_results import parse_review_result
@@ -34,150 +31,116 @@ from review_orchestrator.worker import (
 )
 
 
-class FakeOpenHandsClient:
+class FakePiAgentClient:
     def __init__(self) -> None:
-        self.events = OpenHandsEventPage(items=[])
-        self.deleted_conversation_ids = []
-        self.start_task = OpenHandsStartTask(
-            id="task-1",
-            status=OpenHandsStartTaskStatus.ready,
-            app_conversation_id="conversation-1",
-            sandbox_id="sandbox-1",
-            agent_server_url="http://agent-server",
-        )
-        self.conversation = OpenHandsConversation(
-            id="conversation-1",
-            sandbox_status="RUNNING",
-            execution_status="RUNNING",
+        self.cancelled_session_ids: list[str] = []
+        self.started_inputs = []
+        self.session = PiAgentSession(
+            id="session-1",
+            status="running",
+            stage="analyzing",
+            provider="openai",
+            model="gpt-5.4",
+            thinking_level="high",
         )
 
-    async def start_conversation(self, review_input):
-        return self.start_task
+    async def start_session(self, review_input, **kwargs):
+        self.started_inputs.append((review_input, kwargs))
+        return self.session
 
-    async def get_start_task(self, task_id: str):
-        return self.start_task
+    async def get_session(self, session_id: str):
+        assert session_id == self.session.id
+        return self.session
 
-    async def get_conversation(self, conversation_id: str):
-        return self.conversation
-
-    async def list_events(self, conversation_id: str, *, page_id=None, limit=100):
-        return self.events
-
-    async def delete_conversation(self, conversation_id: str):
-        self.deleted_conversation_ids.append(conversation_id)
+    async def cancel_session(self, session_id: str):
+        self.cancelled_session_ids.append(session_id)
+        self.session = self.session.model_copy(
+            update={"status": "cancelled", "stage": "cancelled"}
+        )
+        return self.session
 
 
-class ResultOpenHandsClient(FakeOpenHandsClient):
+class ResultPiAgentClient(FakePiAgentClient):
     def __init__(self) -> None:
         super().__init__()
-        self.events = OpenHandsEventPage(
-            items=[
-                {
-                    "message": {
-                        "content": {
-                            "text": (
-                                '{"summary":"Done.",'
-                                '"findings":[{"file":"src/app.py","line":2,'
-                                '"severity":"high","message":"Bug.",'
-                                '"confidence":0.9}]}'
-                            )
-                        }
-                    }
-                }
-            ]
-        )
-
-
-class FencedThoughtResultOpenHandsClient(FakeOpenHandsClient):
-    def __init__(self) -> None:
-        super().__init__()
-        self.events = OpenHandsEventPage(
-            items=[
-                {
-                    "source": "agent",
-                    "thought": [
+        self.session = self.session.model_copy(
+            update={
+                "status": "completed",
+                "stage": "completed",
+                "result": {
+                    "summary": "Done.",
+                    "findings": [
                         {
-                            "text": (
-                                "Review complete.\n"
-                                "```json\n"
-                                "{\n"
-                                '  "summary": "No issues found.",\n'
-                                '  "findings": []\n'
-                                "}\n"
-                                "```"
-                            )
+                            "file": "src/app.py",
+                            "line": 2,
+                            "severity": "high",
+                            "message": "Bug.",
+                            "confidence": 0.9,
                         }
                     ],
-                }
-            ]
+                },
+            }
         )
 
 
-class PaginatedFencedThoughtResultOpenHandsClient(FakeOpenHandsClient):
-    async def list_events(self, conversation_id: str, *, page_id=None, limit=100):
-        if page_id is None:
-            return OpenHandsEventPage(
-                items=[{"message": {"content": {"text": "still reviewing"}}}],
-                next_page_id="next",
-            )
-        return FencedThoughtResultOpenHandsClient().events
-
-
-class InvalidResultOpenHandsClient(FakeOpenHandsClient):
+class NoFindingsPiAgentClient(FakePiAgentClient):
     def __init__(self) -> None:
         super().__init__()
-        self.events = OpenHandsEventPage(
-            items=[
-                {
-                    "message": {
-                        "content": {"text": '{"summary":"bad","findings":{}}'}
-                    }
-                }
-            ]
+        self.session = self.session.model_copy(
+            update={
+                "status": "completed",
+                "stage": "completed",
+                "result": {"summary": "No issues found.", "findings": []},
+            }
         )
 
 
-class StartFailingOpenHandsClient(FakeOpenHandsClient):
-    async def start_conversation(self, review_input):
-        raise OpenHandsClientError("OpenHands token invalid")
-
-
-class StartRequestFailingOpenHandsClient(FakeOpenHandsClient):
-    async def start_conversation(self, review_input):
-        raise OpenHandsClientError(
-            "OpenHands request failed (POST /api/v1/app-conversations): timeout"
-        )
-
-
-class InfrastructureFailingOpenHandsClient(FakeOpenHandsClient):
+class WaitingForHumanPiAgentClient(FakePiAgentClient):
     def __init__(self) -> None:
         super().__init__()
-        self.start_task = OpenHandsStartTask(
-            id="task-infra-failure",
-            status=OpenHandsStartTaskStatus.error,
-            detail="coroutine raised StopIteration",
+        self.session = self.session.model_copy(
+            update={
+                "status": "waiting_for_input",
+                "stage": "waiting_for_human",
+                "pending_input": {
+                    "id": "question-1",
+                    "question": "Is this behavior intentional?",
+                },
+            }
         )
 
 
-class SessionRequestFailingOpenHandsClient(FakeOpenHandsClient):
-    async def get_conversation(self, conversation_id: str):
-        raise OpenHandsClientError(
-            "OpenHands request failed (GET /api/v1/app-conversations): timeout"
+class InvalidResultPiAgentClient(FakePiAgentClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.session = self.session.model_copy(
+            update={
+                "status": "completed",
+                "stage": "completed",
+                "result": {"summary": "bad", "findings": {}},
+            }
         )
 
 
-class StartTaskPollFailingOpenHandsClient(FakeOpenHandsClient):
-    async def get_start_task(self, task_id: str):
-        raise OpenHandsClientError(
-            "OpenHands request failed "
-            "(GET /api/v1/app-conversations/start-tasks): timeout"
+class StartFailingPiAgentClient(FakePiAgentClient):
+    async def start_session(self, review_input, **kwargs):
+        raise PiAgentClientError(
+            "pi-agent token invalid",
+            status_code=401,
         )
 
 
-class EventRequestFailingOpenHandsClient(FakeOpenHandsClient):
-    async def list_events(self, conversation_id: str, *, page_id=None, limit=100):
-        raise OpenHandsClientError(
-            "OpenHands request failed (GET /api/v1/conversation/events): timeout"
+class InfrastructureFailingPiAgentClient(FakePiAgentClient):
+    async def start_session(self, review_input, **kwargs):
+        raise PiAgentClientError(
+            "pi-agent runtime request failed: connection refused"
+        )
+
+
+class SessionRequestFailingPiAgentClient(FakePiAgentClient):
+    async def get_session(self, session_id: str):
+        raise PiAgentClientError(
+            "pi-agent runtime request failed: timeout"
         )
 
 
@@ -677,7 +640,7 @@ async def test_agent_task_hydrate_failure_marks_failed_and_publishes_summary(
     assert "token [redacted]" in github_client.issue_comments[0].body
 
 
-async def test_review_worker_releases_lock_when_openhands_result_not_ready(
+async def test_review_worker_releases_lock_when_pi_agent_result_not_ready(
     session_factory,
     tmp_path: Path,
 ) -> None:
@@ -715,13 +678,13 @@ async def test_review_worker_releases_lock_when_openhands_result_not_ready(
         processed = await process_next_review_run(
             session,
             settings=settings,
-            openhands_client=FakeOpenHandsClient(),
+            pi_agent_client=FakePiAgentClient(),
             worker_id="worker-1",
         )
 
     assert processed is not None
     assert processed.status == "running"
-    assert processed.stage == "waiting_for_result"
+    assert processed.stage == "analyzing"
     assert processed.lock_owner is None
     assert processed.locked_until is not None
 
@@ -795,7 +758,7 @@ async def test_changed_files_failure_degrades_to_summary_only_collection(
         processed = await process_next_review_run(
             session,
             settings=settings,
-            openhands_client=ResultOpenHandsClient(),
+            pi_agent_client=ResultPiAgentClient(),
             worker_id="worker-1",
             github_client=FailingChangedFilesGitHubClient(),
         )
@@ -810,7 +773,7 @@ async def test_changed_files_failure_degrades_to_summary_only_collection(
     )
 
 
-async def test_worker_extracts_fenced_json_result_from_openhands_thought(
+async def test_worker_collects_structured_no_findings_result(
     session_factory,
     tmp_path: Path,
 ) -> None:
@@ -848,7 +811,7 @@ async def test_worker_extracts_fenced_json_result_from_openhands_thought(
         processed = await process_next_review_run(
             session,
             settings=settings,
-            openhands_client=FencedThoughtResultOpenHandsClient(),
+            pi_agent_client=NoFindingsPiAgentClient(),
             worker_id="worker-1",
             github_client=FakeGitHubClient(),
         )
@@ -859,7 +822,7 @@ async def test_worker_extracts_fenced_json_result_from_openhands_thought(
     assert processed.finding_count_by_severity == {}
 
 
-async def test_worker_extracts_result_from_paginated_openhands_events(
+async def test_worker_collects_structured_result_without_event_scraping(
     session_factory,
     tmp_path: Path,
 ) -> None:
@@ -897,7 +860,7 @@ async def test_worker_extracts_result_from_paginated_openhands_events(
         processed = await process_next_review_run(
             session,
             settings=settings,
-            openhands_client=PaginatedFencedThoughtResultOpenHandsClient(),
+            pi_agent_client=NoFindingsPiAgentClient(),
             worker_id="worker-1",
             github_client=FakeGitHubClient(),
         )
@@ -907,7 +870,7 @@ async def test_worker_extracts_result_from_paginated_openhands_events(
     assert processed.review_summary == "No issues found."
 
 
-async def test_review_worker_publishes_failed_summary_on_openhands_start_failure(
+async def test_review_worker_publishes_failed_summary_on_pi_agent_start_failure(
     session_factory,
     tmp_path: Path,
 ) -> None:
@@ -946,7 +909,7 @@ async def test_review_worker_publishes_failed_summary_on_openhands_start_failure
         processed = await process_next_review_run(
             session,
             settings=settings,
-            openhands_client=StartFailingOpenHandsClient(),
+            pi_agent_client=StartFailingPiAgentClient(),
             worker_id="worker-1",
             github_client=github_client,
         )
@@ -954,11 +917,11 @@ async def test_review_worker_publishes_failed_summary_on_openhands_start_failure
     assert processed is not None
     assert processed.status == "failed"
     assert "Review status: failed" in github_client.issue_comments[0].body
-    assert "Failure category: openhands_error" in github_client.issue_comments[0].body
+    assert "Failure category: pi_agent_error" in github_client.issue_comments[0].body
     assert "token [redacted]" in github_client.issue_comments[0].body
 
 
-async def test_review_worker_retries_transient_openhands_start_failure(
+async def test_review_worker_retries_transient_pi_agent_start_failure(
     session_factory,
     tmp_path: Path,
 ) -> None:
@@ -999,31 +962,30 @@ async def test_review_worker_retries_transient_openhands_start_failure(
         processed = await process_next_review_run(
             session,
             settings=settings,
-            openhands_client=InfrastructureFailingOpenHandsClient(),
+            pi_agent_client=InfrastructureFailingPiAgentClient(),
             worker_id="worker-1",
             github_client=github_client,
         )
 
     assert processed is not None
     assert processed.status == "running"
-    assert processed.stage == "retrying_openhands_start"
-    assert processed.openhands_start_task_id is None
+    assert processed.stage == "retrying_agent_start"
+    assert processed.agent_session_id is None
     assert processed.failure_code is None
     assert processed.lock_owner is None
     assert processed.locked_until is not None
     assert processed.validation_warnings_json == [
         {
-            "code": "openhands_start_retry",
-            "message": "coroutine raised StopIteration",
+            "code": "pi_agent_start_retry",
+            "message": "pi-agent runtime request failed: connection refused",
             "retry": 1,
-            "start_task_id": "task-infra-failure",
         }
     ]
     assert len(github_client.issue_comments) == 1
     assert "Review status: reviewing" in github_client.issue_comments[0].body
 
 
-async def test_review_worker_retries_transient_openhands_start_request(
+async def test_review_worker_retries_transient_pi_agent_start_request(
     session_factory,
     tmp_path: Path,
 ) -> None:
@@ -1062,20 +1024,20 @@ async def test_review_worker_retries_transient_openhands_start_request(
         processed = await process_next_review_run(
             session,
             settings=settings,
-            openhands_client=StartRequestFailingOpenHandsClient(),
+            pi_agent_client=InfrastructureFailingPiAgentClient(),
             worker_id="worker-1",
         )
 
     assert processed is not None
     assert processed.status == "running"
-    assert processed.stage == "retrying_openhands_start"
+    assert processed.stage == "retrying_agent_start"
     assert processed.failure_code is None
     assert processed.validation_warnings_json[0]["code"] == (
-        "openhands_start_retry"
+        "pi_agent_start_retry"
     )
 
 
-async def test_review_worker_fails_after_openhands_start_retries_are_exhausted(
+async def test_review_worker_fails_after_pi_agent_start_retries_are_exhausted(
     session_factory,
     tmp_path: Path,
 ) -> None:
@@ -1111,8 +1073,8 @@ async def test_review_worker_fails_after_openhands_start_retries_are_exhausted(
         review_run.pull_request_context_id = context.id
         review_run.workspace_path = str(tmp_path / "existing-workspace")
         review_run.validation_warnings_json = [
-            {"code": "openhands_start_retry", "retry": 1},
-            {"code": "openhands_start_retry", "retry": 2},
+            {"code": "pi_agent_start_retry", "retry": 1},
+            {"code": "pi_agent_start_retry", "retry": 2},
         ]
         session.add(review_run)
         await session.commit()
@@ -1120,24 +1082,24 @@ async def test_review_worker_fails_after_openhands_start_retries_are_exhausted(
         processed = await process_next_review_run(
             session,
             settings=settings,
-            openhands_client=InfrastructureFailingOpenHandsClient(),
+            pi_agent_client=InfrastructureFailingPiAgentClient(),
             worker_id="worker-1",
             github_client=github_client,
         )
 
     assert processed is not None
     assert processed.status == "failed"
-    assert processed.failure_code == "openhands_infrastructure_error"
-    assert processed.error == "coroutine raised StopIteration"
+    assert processed.failure_code == "pi_agent_infrastructure_error"
+    assert processed.error == "pi-agent runtime request failed: connection refused"
     assert len(github_client.issue_comments) == 1
     assert "Review status: failed" in github_client.issue_comments[0].body
     assert (
-        "Failure category: openhands_infrastructure_error"
+        "Failure category: pi_agent_infrastructure_error"
         in github_client.issue_comments[0].body
     )
 
 
-async def test_review_worker_retries_transient_openhands_session_request(
+async def test_review_worker_retries_transient_pi_agent_session_request(
     session_factory,
     tmp_path: Path,
 ) -> None:
@@ -1170,35 +1132,31 @@ async def test_review_worker_retries_transient_openhands_session_request(
         )
         review_run.pull_request_context_id = context.id
         review_run.workspace_path = str(tmp_path / "existing-workspace")
-        review_run.openhands_start_task_id = "task-1"
-        review_run.openhands_conversation_id = "conversation-1"
+        review_run.agent_session_id = "session-1"
         session.add(review_run)
         await session.commit()
 
         processed = await process_next_review_run(
             session,
             settings=settings,
-            openhands_client=SessionRequestFailingOpenHandsClient(),
+            pi_agent_client=SessionRequestFailingPiAgentClient(),
             worker_id="worker-1",
         )
 
     assert processed is not None
     assert processed.status == "running"
-    assert processed.stage == "waiting_for_result"
-    assert processed.openhands_conversation_id == "conversation-1"
+    assert processed.stage == "waiting_for_agent"
+    assert processed.agent_session_id == "session-1"
     assert processed.failure_code is None
     assert processed.validation_warnings_json == [
         {
-            "code": "openhands_session_retry",
-            "message": (
-                "OpenHands request failed "
-                "(GET /api/v1/app-conversations): timeout"
-            ),
+            "code": "pi_agent_session_retry",
+            "message": "pi-agent runtime request failed: timeout",
         }
     ]
 
 
-async def test_review_worker_preserves_start_task_on_poll_timeout(
+async def test_review_worker_reports_waiting_for_human(
     session_factory,
     tmp_path: Path,
 ) -> None:
@@ -1231,27 +1189,24 @@ async def test_review_worker_preserves_start_task_on_poll_timeout(
         )
         review_run.pull_request_context_id = context.id
         review_run.workspace_path = str(tmp_path / "existing-workspace")
-        review_run.openhands_start_task_id = "task-1"
         session.add(review_run)
         await session.commit()
 
         processed = await process_next_review_run(
             session,
             settings=settings,
-            openhands_client=StartTaskPollFailingOpenHandsClient(),
+            pi_agent_client=WaitingForHumanPiAgentClient(),
             worker_id="worker-1",
         )
 
     assert processed is not None
     assert processed.status == "running"
-    assert processed.stage == "waiting_for_openhands_start"
-    assert processed.openhands_start_task_id == "task-1"
-    assert processed.validation_warnings_json[0]["code"] == (
-        "openhands_start_task_poll_retry"
-    )
+    assert processed.stage == "waiting_for_human"
+    assert processed.agent_status == "waiting_for_input"
+    assert processed.agent_session_id == "session-1"
 
 
-async def test_review_worker_retries_transient_openhands_event_request(
+async def test_review_worker_keeps_agent_id_on_transient_status_failure(
     session_factory,
     tmp_path: Path,
 ) -> None:
@@ -1284,30 +1239,26 @@ async def test_review_worker_retries_transient_openhands_event_request(
         )
         review_run.pull_request_context_id = context.id
         review_run.workspace_path = str(tmp_path / "existing-workspace")
-        review_run.openhands_start_task_id = "task-1"
-        review_run.openhands_conversation_id = "conversation-1"
+        review_run.agent_session_id = "session-1"
         session.add(review_run)
         await session.commit()
 
         processed = await process_next_review_run(
             session,
             settings=settings,
-            openhands_client=EventRequestFailingOpenHandsClient(),
+            pi_agent_client=SessionRequestFailingPiAgentClient(),
             worker_id="worker-1",
         )
 
     assert processed is not None
     assert processed.status == "running"
-    assert processed.stage == "waiting_for_result"
-    assert processed.openhands_conversation_id == "conversation-1"
+    assert processed.stage == "waiting_for_agent"
+    assert processed.agent_session_id == "session-1"
     assert processed.failure_code is None
     assert processed.validation_warnings_json == [
         {
-            "code": "openhands_session_retry",
-            "message": (
-                "OpenHands request failed "
-                "(GET /api/v1/conversation/events): timeout"
-            ),
+            "code": "pi_agent_session_retry",
+            "message": "pi-agent runtime request failed: timeout",
         }
     ]
 
@@ -1351,7 +1302,7 @@ async def test_review_worker_publishes_failed_summary_on_invalid_result(
         processed = await process_next_review_run(
             session,
             settings=settings,
-            openhands_client=InvalidResultOpenHandsClient(),
+            pi_agent_client=InvalidResultPiAgentClient(),
             worker_id="worker-1",
             github_client=github_client,
         )
@@ -1411,7 +1362,7 @@ async def test_review_worker_marks_failed_on_unexpected_result_collection_error(
         processed = await process_next_review_run(
             session,
             settings=settings,
-            openhands_client=ResultOpenHandsClient(),
+            pi_agent_client=ResultPiAgentClient(),
             worker_id="worker-1",
             github_client=github_client,
         )
@@ -1424,7 +1375,7 @@ async def test_review_worker_marks_failed_on_unexpected_result_collection_error(
     assert "Failure category: worker_exception" in github_client.issue_comments[0].body
 
 
-async def test_review_run_timeouts_publish_summary_and_cancel_openhands(
+async def test_review_run_timeouts_publish_summary_and_cancel_pi_agent(
     session_factory,
     tmp_path: Path,
 ) -> None:
@@ -1434,7 +1385,7 @@ async def test_review_run_timeouts_publish_summary_and_cancel_openhands(
         review_run_timeout_seconds=20,
     )
     github_client = FakeGitHubClient()
-    openhands_client = FakeOpenHandsClient()
+    pi_agent_client = FakePiAgentClient()
     async with session_factory() as session:
         soft_run = ReviewRun(
             provider="github",
@@ -1453,7 +1404,7 @@ async def test_review_run_timeouts_publish_summary_and_cancel_openhands(
             head_sha="c" * 40,
             status="running",
             started_at=utc_now() - timedelta(seconds=21),
-            openhands_conversation_id="conversation-hard",
+            agent_session_id="session-1",
         )
         session.add_all([soft_run, hard_run])
         await session.commit()
@@ -1461,13 +1412,13 @@ async def test_review_run_timeouts_publish_summary_and_cancel_openhands(
         touched = await process_review_run_timeouts(
             session,
             settings=settings,
-            openhands_client=openhands_client,
+            pi_agent_client=pi_agent_client,
             github_client=github_client,
         )
 
     statuses = {run.pull_request_number: run.status for run in touched}
     assert statuses == {41: "running", 42: "failed"}
-    assert openhands_client.deleted_conversation_ids == ["conversation-hard"]
+    assert pi_agent_client.cancelled_session_ids == ["session-1"]
     bodies = [comment.body for comment in github_client.issue_comments]
     assert any("Review status: delayed" in body for body in bodies)
     assert any("Failure category: hard_timeout" in body for body in bodies)
@@ -1485,7 +1436,7 @@ async def test_soft_timeout_summary_is_not_overwritten_by_same_worker_pass(
         review_run_timeout_seconds=60,
     )
     github_client = FakeGitHubClient()
-    openhands_client = FakeOpenHandsClient()
+    pi_agent_client = FakePiAgentClient()
     async with session_factory() as session:
         context = PullRequestContext(
             provider="github",
@@ -1507,7 +1458,7 @@ async def test_soft_timeout_summary_is_not_overwritten_by_same_worker_pass(
             status="running",
             stage="waiting_for_result",
             workspace_path=str(tmp_path / "existing-workspace"),
-            openhands_conversation_id="conversation-1",
+            agent_session_id="session-1",
             started_at=utc_now() - timedelta(seconds=11),
         )
         session.add(review_run)
@@ -1516,13 +1467,13 @@ async def test_soft_timeout_summary_is_not_overwritten_by_same_worker_pass(
         await process_review_run_timeouts(
             session,
             settings=settings,
-            openhands_client=openhands_client,
+            pi_agent_client=pi_agent_client,
             github_client=github_client,
         )
         processed = await process_next_review_run(
             session,
             settings=settings,
-            openhands_client=openhands_client,
+            pi_agent_client=pi_agent_client,
             worker_id="worker-1",
             github_client=github_client,
         )

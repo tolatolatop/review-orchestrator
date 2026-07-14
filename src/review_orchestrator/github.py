@@ -420,7 +420,7 @@ def create_github_client(settings: Any) -> GitHubClient:
     return GitHubClient(
         api_base_url=settings.github_api_base_url,
         token_provider=token_provider,
-        timeout=settings.openhands_timeout_seconds,
+        timeout=settings.provider_api_timeout_seconds,
     )
 
 

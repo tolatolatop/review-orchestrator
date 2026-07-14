@@ -5,6 +5,7 @@ from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from review_orchestrator.config import Settings
 from review_orchestrator.github import (
     NormalizedGitHubEvent,
     parse_github_datetime,
@@ -23,10 +24,11 @@ from review_orchestrator.models import (
     utc_now,
 )
 from review_orchestrator.observability import DEFAULT_OBSERVABILITY_SORT, redact_value
-from review_orchestrator.openhands import (
-    OpenHandsClient,
-    OpenHandsClientError,
-    OpenHandsStartTaskStatus,
+from review_orchestrator.pi_agent import (
+    PiAgentClient,
+    PiAgentClientError,
+    PiAgentSession,
+    PiAgentSessionStatus,
 )
 from review_orchestrator.providers import ProviderWebhookEvent
 from review_orchestrator.reconciliation import persist_and_reconcile_findings
@@ -38,12 +40,12 @@ from review_orchestrator.review_results import (
     parse_review_result,
 )
 from review_orchestrator.schemas import (
+    AgentPendingInput,
     AgentTaskDetail,
     AgentTaskListResponse,
     AgentTaskQueueHealth,
     AgentTaskSummary,
-    OpenHandsPassthroughStatus,
-    OpenHandsSessionDiagnostics,
+    PiAgentSessionDiagnostics,
     ProviderEventInboxDetail,
     ProviderEventInboxListResponse,
     ProviderEventInboxSummary,
@@ -63,8 +65,6 @@ from review_orchestrator.schemas import (
     WebhookAccepted,
 )
 
-OPENHANDS_TERMINAL_SUCCESS_STATUSES = {"FINISHED", "COMPLETED", "STOPPED"}
-OPENHANDS_TERMINAL_FAILURE_STATUSES = {"ERROR", "STUCK", "FAILED"}
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "superseded"}
 CANCELLABLE_STATUSES = {"queued", "running"}
 class ReviewRunTransitionError(ValueError):
@@ -128,32 +128,39 @@ async def get_review_run(
     return await session.get(ReviewRun, review_run_id)
 
 
-async def get_openhands_session_diagnostics_for_review_run(
+async def get_pi_agent_session_diagnostics_for_review_run(
     session: AsyncSession,
     review_run: ReviewRun,
     *,
-    openhands_client: OpenHandsClient | None = None,
-    openhands_live_status_disabled_reason: str | None = None,
-    openhands_ui_base_url: str | None = None,
-) -> OpenHandsSessionDiagnostics:
+    pi_agent_client: PiAgentClient | None = None,
+    live_status_disabled_reason: str | None = None,
+) -> PiAgentSessionDiagnostics:
     agent_task_ids = await _get_agent_task_ids_for_review_run(session, review_run)
     execution_status: str | None = None
-    sandbox_status: str | None = None
-    live_status_error = openhands_live_status_disabled_reason
+    execution_stage: str | None = None
+    pending_input: AgentPendingInput | None = None
+    event_count = 0
+    live_status_error = live_status_disabled_reason
 
-    if review_run.openhands_conversation_id and openhands_client is not None:
+    if review_run.agent_session_id and pi_agent_client is not None:
         try:
-            conversation = await openhands_client.get_conversation(
-                review_run.openhands_conversation_id
+            runtime_session = await pi_agent_client.get_session(
+                review_run.agent_session_id
             )
-        except OpenHandsClientError as exc:
+        except PiAgentClientError as exc:
             live_status_error = str(exc)
         else:
-            execution_status = conversation.execution_status
-            sandbox_status = conversation.sandbox_status
+            execution_status = runtime_session.status
+            execution_stage = runtime_session.stage
+            event_count = len(runtime_session.events)
+            if runtime_session.pending_input is not None:
+                pending_input = AgentPendingInput.model_validate(
+                    runtime_session.pending_input,
+                    from_attributes=True,
+                )
             live_status_error = None
 
-    return OpenHandsSessionDiagnostics(
+    return PiAgentSessionDiagnostics(
         review_run_id=review_run.id,
         agent_task_ids=agent_task_ids,
         provider=review_run.provider,
@@ -161,49 +168,43 @@ async def get_openhands_session_diagnostics_for_review_run(
         pull_request_number=review_run.pull_request_number,
         status=review_run.status,
         stage=review_run.stage,
-        openhands_start_task_id=review_run.openhands_start_task_id,
-        openhands_conversation_id=review_run.openhands_conversation_id,
-        openhands_sandbox_id=review_run.openhands_sandbox_id,
-        openhands_agent_server_url=review_run.openhands_agent_server_url,
+        agent_session_id=review_run.agent_session_id,
+        agent_provider=review_run.agent_provider,
+        agent_model=review_run.agent_model,
+        agent_thinking_level=review_run.agent_thinking_level,
         execution_status=execution_status,
-        sandbox_status=sandbox_status,
-        session_available=bool(review_run.openhands_conversation_id),
-        live_status_available=(
-            execution_status is not None or sandbox_status is not None
-        ),
+        execution_stage=execution_stage,
+        pending_input=pending_input,
+        event_count=event_count,
+        session_available=bool(review_run.agent_session_id),
+        live_status_available=execution_status is not None,
         live_status_error=live_status_error,
-        passthrough=_build_openhands_passthrough_status(
-            conversation_id=review_run.openhands_conversation_id,
-            openhands_ui_base_url=openhands_ui_base_url,
-        ),
         created_at=review_run.created_at,
         updated_at=review_run.updated_at,
     )
 
 
-async def get_openhands_session_diagnostics_for_conversation(
+async def get_pi_agent_session_diagnostics_for_session(
     session: AsyncSession,
-    conversation_id: str,
+    agent_session_id: str,
     *,
-    openhands_client: OpenHandsClient | None = None,
-    openhands_live_status_disabled_reason: str | None = None,
-    openhands_ui_base_url: str | None = None,
-) -> OpenHandsSessionDiagnostics | None:
+    pi_agent_client: PiAgentClient | None = None,
+    live_status_disabled_reason: str | None = None,
+) -> PiAgentSessionDiagnostics | None:
     result = await session.execute(
         select(ReviewRun)
-        .where(ReviewRun.openhands_conversation_id == conversation_id)
+        .where(ReviewRun.agent_session_id == agent_session_id)
         .order_by(ReviewRun.created_at.desc(), ReviewRun.id.desc())
         .limit(1)
     )
     review_run = result.scalar_one_or_none()
     if review_run is None:
         return None
-    return await get_openhands_session_diagnostics_for_review_run(
+    return await get_pi_agent_session_diagnostics_for_review_run(
         session,
         review_run,
-        openhands_client=openhands_client,
-        openhands_live_status_disabled_reason=openhands_live_status_disabled_reason,
-        openhands_ui_base_url=openhands_ui_base_url,
+        pi_agent_client=pi_agent_client,
+        live_status_disabled_reason=live_status_disabled_reason,
     )
 
 
@@ -227,29 +228,6 @@ async def _get_agent_task_ids_for_review_run(
         ):
             task_ids.append(task.id)
     return task_ids
-
-
-def _build_openhands_passthrough_status(
-    *,
-    conversation_id: str | None,
-    openhands_ui_base_url: str | None,
-) -> OpenHandsPassthroughStatus:
-    if not conversation_id:
-        return OpenHandsPassthroughStatus(
-            enabled=False,
-            reason="OpenHands conversation id is not recorded for this review run.",
-        )
-    if not openhands_ui_base_url:
-        return OpenHandsPassthroughStatus(
-            enabled=False,
-            reason="OPENHANDS_UI_BASE_URL is not configured.",
-        )
-    return OpenHandsPassthroughStatus(
-        enabled=True,
-        conversation_url=(
-            f"{openhands_ui_base_url.rstrip('/')}/conversations/{conversation_id}"
-        ),
-    )
 
 
 async def list_review_runs(
@@ -345,8 +323,15 @@ async def start_review_session(
     session: AsyncSession,
     review_run: ReviewRun,
     *,
-    openhands_client: OpenHandsClient,
+    pi_agent_client: PiAgentClient,
+    settings: Settings,
     workspace_path: str | None = None,
+    skill: str | None = None,
+    profile: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    thinking_level: str | None = None,
+    model_base_url: str | None = None,
 ) -> ReviewRun:
     if review_run.status in {"cancelled", "superseded", "completed"}:
         raise ReviewRunTransitionError(
@@ -367,29 +352,59 @@ async def start_review_session(
         head_sha=review_run.head_sha,
         workspace_path=resolved_workspace_path,
     )
+    review_config = await get_or_create_review_config(
+        session,
+        provider=review_run.provider,
+        repo_full_name=review_run.repo_full_name,
+        default_skill=settings.pi_agent_review_skill,
+        default_profile=settings.pi_agent_review_profile,
+    )
+    resolved_skill = skill or review_config.default_review_skill
+    resolved_profile = profile or review_config.default_review_profile
+    resolved_provider = provider or settings.pi_agent_provider
+    resolved_model = model or settings.pi_agent_model
+    resolved_thinking = thinking_level or settings.pi_agent_thinking_level
     try:
-        task = await openhands_client.start_conversation(review_input)
-    except OpenHandsClientError as exc:
+        runtime_session = await pi_agent_client.start_session(
+            review_input,
+            skill=resolved_skill,
+            profile=resolved_profile,
+            provider=resolved_provider,
+            model=resolved_model,
+            thinking_level=resolved_thinking,
+            model_base_url=model_base_url or settings.pi_agent_model_base_url,
+        )
+    except PiAgentClientError as exc:
         review_run.status = "failed"
         review_run.failure_code = (
-            "openhands_infrastructure_error"
-            if _is_openhands_infrastructure_error(str(exc))
-            else "openhands_error"
+            "pi_agent_infrastructure_error"
+            if exc.infrastructure_failure
+            else "pi_agent_error"
         )
         review_run.error = str(exc)
+        review_run.completed_at = utc_now()
         await session.commit()
         await session.refresh(review_run)
         return review_run
 
     review_run.status = "running"
     review_run.started_at = utc_now()
+    review_run.completed_at = None
     review_run.workspace_path = resolved_workspace_path
-    review_run.openhands_start_task_id = task.id
-    review_run.openhands_conversation_id = task.app_conversation_id
-    review_run.openhands_sandbox_id = task.sandbox_id
-    review_run.openhands_agent_server_url = task.agent_server_url
+    _copy_pi_agent_state(review_run, runtime_session)
+    if runtime_session.result is not None:
+        review_run.result_raw_json = runtime_session.result
     review_run.failure_code = None
     review_run.error = None
+    review_session = await _review_session_for_run(session, review_run.id)
+    if review_session is None:
+        review_session = ReviewSession(review_run_id=review_run.id)
+        session.add(review_session)
+    review_session.agent_session_id = runtime_session.id
+    review_session.status = runtime_session.status
+    review_session.skill_name = resolved_skill
+    review_session.profile_name = resolved_profile
+    review_session.input_snapshot_json = review_input.model_dump()
     await session.commit()
     await session.refresh(review_run)
     return review_run
@@ -399,69 +414,65 @@ async def sync_review_session(
     session: AsyncSession,
     review_run: ReviewRun,
     *,
-    openhands_client: OpenHandsClient,
+    pi_agent_client: PiAgentClient,
 ) -> ReviewRun:
     if review_run.status in {"cancelled", "superseded", "completed", "failed"}:
         return review_run
 
-    if review_run.openhands_start_task_id and not review_run.openhands_conversation_id:
-        try:
-            task = await openhands_client.get_start_task(
-                review_run.openhands_start_task_id
-            )
-        except OpenHandsClientError as exc:
-            return await _mark_failed(
-                session,
-                review_run,
-                str(exc),
-                failure_code="openhands_infrastructure_error",
-            )
-        if task.status == OpenHandsStartTaskStatus.error:
-            return await _mark_failed(
-                session,
-                review_run,
-                task.detail or "OpenHands start task failed.",
-                failure_code=(
-                    "openhands_infrastructure_error"
-                    if _is_openhands_infrastructure_error(task.detail)
-                    else "openhands_error"
-                ),
-            )
-        if task.status == OpenHandsStartTaskStatus.ready:
-            review_run.openhands_conversation_id = task.app_conversation_id
-            review_run.openhands_sandbox_id = task.sandbox_id
-            review_run.openhands_agent_server_url = task.agent_server_url
-            review_run.status = "running"
+    if not review_run.agent_session_id:
+        return await _mark_failed(
+            session,
+            review_run,
+            "pi-agent session id is missing.",
+            failure_code="pi_agent_error",
+        )
+    try:
+        runtime_session = await pi_agent_client.get_session(
+            review_run.agent_session_id
+        )
+    except PiAgentClientError as exc:
+        return await _mark_failed(
+            session,
+            review_run,
+            str(exc),
+            failure_code=(
+                "pi_agent_infrastructure_error"
+                if exc.infrastructure_failure
+                else "pi_agent_error"
+            ),
+        )
 
-    if review_run.openhands_conversation_id:
-        try:
-            conversation = await openhands_client.get_conversation(
-                review_run.openhands_conversation_id
-            )
-        except OpenHandsClientError as exc:
-            return await _mark_failed(
-                session,
-                review_run,
-                str(exc),
-                failure_code="openhands_infrastructure_error",
-            )
+    _copy_pi_agent_state(review_run, runtime_session)
+    if runtime_session.result is not None:
+        review_run.result_raw_json = runtime_session.result
+    review_session = await _review_session_for_run(session, review_run.id)
+    if review_session is not None:
+        review_session.status = runtime_session.status
+        review_session.error_message = runtime_session.error
+        if runtime_session.result is not None:
+            review_session.result_ref = f"pi-agent:{runtime_session.id}:result"
+        session.add(review_session)
 
-        if conversation.sandbox_status in {"ERROR", "MISSING"}:
-            return await _mark_failed(
-                session,
-                review_run,
-                f"OpenHands sandbox is {conversation.sandbox_status}.",
-            )
-        execution_status = (conversation.execution_status or "").upper()
-        if execution_status in OPENHANDS_TERMINAL_FAILURE_STATUSES:
-            return await _mark_failed(
-                session,
-                review_run,
-                f"OpenHands conversation ended with {execution_status}.",
-                failure_code="openhands_error",
-            )
-        if execution_status in OPENHANDS_TERMINAL_SUCCESS_STATUSES:
-            review_run.status = "running"
+    if runtime_session.status == PiAgentSessionStatus.failed:
+        return await _mark_failed(
+            session,
+            review_run,
+            runtime_session.error or "pi-agent review failed.",
+            failure_code="pi_agent_error",
+        )
+    if runtime_session.status == PiAgentSessionStatus.cancelled:
+        review_run.status = "cancelled"
+        review_run.stage = "cancelled"
+        review_run.completed_at = utc_now()
+    elif runtime_session.status == PiAgentSessionStatus.waiting_for_input:
+        review_run.status = "running"
+        review_run.stage = "waiting_for_human"
+    elif runtime_session.status == PiAgentSessionStatus.completed:
+        review_run.status = "running"
+        review_run.stage = "agent_completed"
+    else:
+        review_run.status = "running"
+        review_run.stage = runtime_session.stage
 
     await session.commit()
     await session.refresh(review_run)
@@ -472,28 +483,47 @@ async def cancel_review_session(
     session: AsyncSession,
     review_run: ReviewRun,
     *,
-    openhands_client: OpenHandsClient,
+    pi_agent_client: PiAgentClient,
     reason: str,
 ) -> ReviewRun:
     if review_run.status in {"completed", "cancelled", "superseded"}:
         return review_run
 
-    if review_run.openhands_conversation_id:
+    if review_run.agent_session_id:
         try:
-            await openhands_client.delete_conversation(
-                review_run.openhands_conversation_id
+            runtime_session = await pi_agent_client.cancel_session(
+                review_run.agent_session_id
             )
-        except OpenHandsClientError as exc:
-            review_run.error = f"Cancel requested; OpenHands cleanup failed: {exc}"
+        except PiAgentClientError as exc:
+            review_run.error = f"Cancel requested; pi-agent cleanup failed: {exc}"
         else:
+            _copy_pi_agent_state(review_run, runtime_session)
             review_run.error = reason
     else:
         review_run.error = reason
 
     review_run.status = "cancelled"
+    review_run.stage = "cancelled"
+    review_run.completed_at = utc_now()
+    review_session = await _review_session_for_run(session, review_run.id)
+    if review_session is not None:
+        review_session.status = "cancelled"
+        review_session.error_message = review_run.error
+        session.add(review_session)
     await session.commit()
     await session.refresh(review_run)
     return review_run
+
+
+def _copy_pi_agent_state(
+    review_run: ReviewRun,
+    runtime_session: PiAgentSession,
+) -> None:
+    review_run.agent_session_id = runtime_session.id
+    review_run.agent_status = runtime_session.status
+    review_run.agent_provider = runtime_session.provider
+    review_run.agent_model = runtime_session.model
+    review_run.agent_thinking_level = runtime_session.thinking_level
 
 
 async def collect_review_result(
@@ -530,6 +560,12 @@ async def collect_review_result(
     review_run.failure_code = None
     review_run.error = None
     review_run.completed_at = utc_now()
+    review_session = await _review_session_for_run(session, review_run.id)
+    if review_session is not None:
+        review_session.status = "completed"
+        review_session.result_ref = f"review-run:{review_run.id}:result"
+        review_session.error_message = None
+        session.add(review_session)
     await session.commit()
     await session.refresh(review_run)
     return parsed
@@ -1253,10 +1289,10 @@ def _worker_state(review_run: ReviewRun) -> str:
         return "worker_lock_expired"
     if review_run.status == "queued":
         return "waiting_for_worker"
-    if review_run.status == "running" and not review_run.openhands_conversation_id:
-        return "waiting_for_openhands"
+    if review_run.status == "running" and not review_run.agent_session_id:
+        return "waiting_for_agent"
     if review_run.status == "running":
-        return "running_in_openhands"
+        return "running_in_pi_agent"
     return review_run.status
 
 
@@ -1515,7 +1551,7 @@ def _review_session_summary(
     return ReviewRunSessionSummary(
         id=review_session.id,
         status=review_session.status,
-        openhands_conversation_id=review_session.openhands_conversation_id,
+        agent_session_id=review_session.agent_session_id,
         skill_name=review_session.skill_name,
         profile_name=review_session.profile_name,
         result_ref=review_session.result_ref,
@@ -1690,6 +1726,8 @@ async def get_or_create_review_config(
     *,
     provider: str,
     repo_full_name: str,
+    default_skill: str = "code-review",
+    default_profile: str = "default",
 ) -> ReviewConfig:
     result = await session.execute(
         select(ReviewConfig).where(
@@ -1701,7 +1739,12 @@ async def get_or_create_review_config(
     if config is not None:
         return config
 
-    config = ReviewConfig(provider=provider, repo_full_name=repo_full_name)
+    config = ReviewConfig(
+        provider=provider,
+        repo_full_name=repo_full_name,
+        default_review_skill=default_skill,
+        default_review_profile=default_profile,
+    )
     session.add(config)
     await session.commit()
     await session.refresh(config)
@@ -1856,25 +1899,15 @@ async def _mark_failed(
     review_run.status = "failed"
     review_run.failure_code = failure_code
     review_run.error = error
+    review_run.completed_at = utc_now()
+    review_session = await _review_session_for_run(session, review_run.id)
+    if review_session is not None:
+        review_session.status = "failed"
+        review_session.error_message = error
+        session.add(review_session)
     await session.commit()
     await session.refresh(review_run)
     return review_run
-
-
-def _is_openhands_infrastructure_error(detail: str | None) -> bool:
-    if not detail:
-        return False
-    normalized = detail.lower()
-    return any(
-        marker in normalized
-        for marker in (
-            "coroutine raised stopiteration",
-            "sandbox server not running",
-            "failed to start container",
-            "port is already allocated",
-            "openhands request failed",
-        )
-    )
 
 
 def _finding_count_by_severity(findings: list[Any]) -> dict[str, int]:

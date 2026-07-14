@@ -1,5 +1,6 @@
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -40,10 +41,11 @@ class ReviewRunRead(BaseModel):
     stage: str | None
     summary_comment_id: str | None
     workspace_path: str | None
-    openhands_start_task_id: str | None
-    openhands_conversation_id: str | None
-    openhands_sandbox_id: str | None
-    openhands_agent_server_url: str | None
+    agent_session_id: str | None
+    agent_status: str | None
+    agent_provider: str | None
+    agent_model: str | None
+    agent_thinking_level: str | None
     review_summary: str | None
     review_conclusion: str | None
     risk_level: str | None
@@ -122,7 +124,7 @@ class ReviewRunWorkspaceSummary(BaseModel):
 class ReviewRunSessionSummary(BaseModel):
     id: str
     status: str
-    openhands_conversation_id: str | None
+    agent_session_id: str | None
     skill_name: str | None
     profile_name: str | None
     result_ref: str | None
@@ -173,10 +175,29 @@ class ReviewRunDetail(ReviewRunListItem):
 
 class ReviewSessionStart(BaseModel):
     workspace_path: str | None = Field(default=None, min_length=1)
+    skill: str | None = Field(
+        default=None,
+        pattern=r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
+    )
+    profile: str | None = Field(default=None, min_length=1, max_length=128)
+    provider: str | None = Field(default=None, min_length=1, max_length=64)
+    model: str | None = Field(default=None, min_length=1, max_length=128)
+    thinking_level: str | None = Field(
+        default=None,
+        pattern="^(minimal|low|medium|high|xhigh)$",
+    )
+    model_base_url: str | None = Field(default=None, min_length=1, max_length=2048)
 
 
 class ReviewSessionCancel(BaseModel):
     reason: str = Field(default="cancelled", min_length=1, max_length=1000)
+
+
+class ReviewSessionMessage(BaseModel):
+    message: str = Field(min_length=1, max_length=8000)
+    delivery: Literal["answer", "steer", "follow_up"] = Field(
+        default="steer",
+    )
 
 
 class ReviewResultCollect(BaseModel):
@@ -309,13 +330,13 @@ class ReviewRunActionResult(BaseModel):
     status: ReviewRunStatus
 
 
-class OpenHandsPassthroughStatus(BaseModel):
-    enabled: bool
-    conversation_url: str | None = None
-    reason: str | None = None
+class AgentPendingInput(BaseModel):
+    id: str
+    question: str
+    choices: list[str] | None = None
 
 
-class OpenHandsSessionDiagnostics(BaseModel):
+class PiAgentSessionDiagnostics(BaseModel):
     review_run_id: str | None = None
     agent_task_ids: list[str] = Field(default_factory=list)
     provider: str | None = None
@@ -323,16 +344,17 @@ class OpenHandsSessionDiagnostics(BaseModel):
     pull_request_number: int | None = None
     status: ReviewRunStatus | None = None
     stage: str | None = None
-    openhands_start_task_id: str | None = None
-    openhands_conversation_id: str | None = None
-    openhands_sandbox_id: str | None = None
-    openhands_agent_server_url: str | None = None
+    agent_session_id: str | None = None
+    agent_provider: str | None = None
+    agent_model: str | None = None
+    agent_thinking_level: str | None = None
     execution_status: str | None = None
-    sandbox_status: str | None = None
+    execution_stage: str | None = None
+    pending_input: AgentPendingInput | None = None
+    event_count: int = 0
     session_available: bool = False
     live_status_available: bool = False
     live_status_error: str | None = None
-    passthrough: OpenHandsPassthroughStatus
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

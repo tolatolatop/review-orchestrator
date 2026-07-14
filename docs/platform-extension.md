@@ -7,7 +7,7 @@ adapters. This guide describes how to add Azure DevOps, Bitbucket, GitCode, or
 another code-hosting platform without weakening the existing providers.
 
 The target shape is a small provider adapter boundary around external platform
-behavior. Review run lifecycle, OpenHands session orchestration, workspace
+behavior. Review run lifecycle, pi-agent session orchestration, workspace
 preparation, result parsing, finding reconciliation, and retry policy should stay
 provider-agnostic.
 
@@ -67,7 +67,7 @@ The orchestrator core owns shared behavior:
 - `PullRequestContext`, `ReviewRun`, `Finding`, `ReviewCommentRef`,
   `ReviewConfig`, and `Workspace` persistence.
 - Review run retry, cancellation, superseding, timeout, and lifecycle state.
-- OpenHands session start/sync/cancel.
+- pi-agent session start/sync/cancel and human steering.
 - Review result schema validation and fingerprint generation.
 - Summary-only fallback for findings that cannot be line-commented.
 

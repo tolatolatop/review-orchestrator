@@ -66,7 +66,7 @@ async def test_worker_builds_and_reuses_one_provider_registry(monkeypatch) -> No
     )
     monkeypatch.setattr(
         worker_cli,
-        "OpenHandsClient",
+        "PiAgentClient",
         lambda **kwargs: object(),
     )
     monkeypatch.setattr(

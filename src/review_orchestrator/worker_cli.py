@@ -8,7 +8,7 @@ from review_orchestrator.config import Settings, get_settings
 from review_orchestrator.db import create_engine, create_session_factory, init_models
 from review_orchestrator.github import create_github_client
 from review_orchestrator.gitlab import GitLabClient
-from review_orchestrator.openhands import OpenHandsClient
+from review_orchestrator.pi_agent import PiAgentClient
 from review_orchestrator.worker import (
     build_worker_provider_registry,
     process_next_agent_task,
@@ -43,16 +43,16 @@ async def run_worker(
         await init_models(engine)
         session_factory = create_session_factory(engine)
         resolved_worker_id = worker_id or f"worker-{socket.gethostname()}"
-        openhands_client = OpenHandsClient(
-            base_url=settings.openhands_base_url or "http://localhost:3000",
-            api_key=settings.openhands_api_token,
-            timeout=settings.openhands_timeout_seconds,
+        pi_agent_client = PiAgentClient(
+            base_url=settings.pi_agent_base_url or "http://localhost:3210",
+            api_token=settings.pi_agent_runtime_token,
+            timeout=settings.pi_agent_timeout_seconds,
         )
         github_client = create_github_client(settings)
         gitlab_client = GitLabClient(
             api_base_url=settings.gitlab_api_base_url,
             token=settings.gitlab_api_token,
-            timeout=settings.openhands_timeout_seconds,
+            timeout=settings.provider_api_timeout_seconds,
         )
         provider_registry = build_worker_provider_registry(
             github_client=github_client,
@@ -64,7 +64,7 @@ async def run_worker(
                 await process_review_run_timeouts(
                     session,
                     settings=settings,
-                    openhands_client=openhands_client,
+                    pi_agent_client=pi_agent_client,
                     provider_registry=provider_registry,
                 )
             async with session_factory() as session:
@@ -77,7 +77,7 @@ async def run_worker(
                 review_run = await process_next_review_run(
                     session,
                     settings=settings,
-                    openhands_client=openhands_client,
+                    pi_agent_client=pi_agent_client,
                     worker_id=resolved_worker_id,
                     github_client=github_client,
                     provider_registry=provider_registry,

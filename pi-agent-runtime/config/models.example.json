@@ -1,0 +1,25 @@
+{
+  "providers": {
+    "company-openai": {
+      "baseUrl": "https://llm-gateway.example/v1",
+      "apiKey": "$PI_AGENT_LLM_API_KEY",
+      "api": "openai-responses",
+      "models": [
+        {
+          "id": "review-model",
+          "name": "Company review model",
+          "reasoning": true,
+          "input": ["text"],
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "contextWindow": 200000,
+          "maxTokens": 32000
+        }
+      ]
+    }
+  }
+}

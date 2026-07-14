@@ -1,7 +1,7 @@
 # Review Orchestrator
 
 MVP backend for PR review orchestration. The service owns webhook ingestion,
-review-run lifecycle state, and integration points for OpenHands-backed review
+review-run lifecycle state, isolated workspaces, and pi-agent-backed review
 sessions.
 
 ## Stack
@@ -12,6 +12,8 @@ sessions.
 - SQLAlchemy async
 - SQLite for local development
 - PostgreSQL via asyncpg for production
+- `@earendil-works/pi-coding-agent` 0.80.7 runtime
+- Node.js 22 for the isolated agent service
 - ruff
 - pytest
 
@@ -23,12 +25,15 @@ cp .env.example .env
 uv run uvicorn review_orchestrator.main:app --reload
 uv run ruff check .
 uv run pytest
+npm --prefix pi-agent-runtime ci
+npm --prefix pi-agent-runtime test
+npm --prefix pi-agent-runtime audit --audit-level=high
 ```
 
 The BDD/E2E scenario matrix and local-only fixture strategy are documented in
 [`docs/bdd-e2e.md`](docs/bdd-e2e.md). The default E2E tests use SQLite, a
-temporary git repository, fixture GitHub payloads, and a fake OpenHands client;
-optional real PostgreSQL/OpenHands/GitHub integration tests are intentionally not
+temporary git repository, fixture GitHub payloads, and a fake pi-agent client;
+optional real PostgreSQL/LLM/GitHub integration tests are intentionally not
 part of the default command.
 
 Deployment guidance for local, test, and production environments is documented
@@ -70,10 +75,13 @@ locally:
 - `GET /api/v1/review-runs/{review_run_id}`
 - `POST /api/v1/review-runs/{review_run_id}/session/start`
 - `POST /api/v1/review-runs/{review_run_id}/session/sync`
+- `POST /api/v1/review-runs/{review_run_id}/session/messages`
 - `POST /api/v1/review-runs/{review_run_id}/session/cancel`
 - `POST /api/v1/review-runs/{review_run_id}/result`
 - `POST /api/v1/review-runs/{review_run_id}/retry`
 - `POST /api/v1/review-runs/{review_run_id}/cancel`
+- `GET /api/v1/observability/review-runs/{review_run_id}/agent-session`
+- `GET /api/v1/observability/agent-sessions/{agent_session_id}`
 
 The operator observability API contract and shared redaction rules are defined
 in [`docs/observability-api.md`](docs/observability-api.md).
@@ -182,28 +190,39 @@ Workspace storage defaults:
 - `WORKSPACE_ROOT=./.workspaces`
 - `GIT_CACHE_ROOT=./.git-cache`
 
-OpenHands App Server integration:
+pi-agent runtime integration:
 
-- `OPENHANDS_BASE_URL=http://localhost:3000`
-- self-host OpenHands UI: `http://127.0.0.1:${OPENHANDS_FRONTEND_PORT:-3000}`
-- `OPENHANDS_API_TOKEN=optional-service-token`
-- `OPENHANDS_TIMEOUT_SECONDS=30`
+- `PI_AGENT_BASE_URL=http://localhost:3210`
+- `PI_AGENT_RUNTIME_TOKEN=strong-service-token`
+- `PI_AGENT_PROVIDER=openai`
+- `PI_AGENT_MODEL=gpt-5.4`
+- `PI_AGENT_THINKING_LEVEL=high`
+- `PI_AGENT_TIMEOUT_SECONDS=30`
 
-### OpenHands Integration
+### pi-agent Integration
 
-The Review Orchestrator owns `review_run` state. OpenHands is treated as the
-execution backend for a single review session:
+The Review Orchestrator owns `review_run` state. A dedicated service embeds the
+pi-agent SDK as the execution backend for each review session:
 
 1. `session/start` converts an existing `review_run` plus a workspace path into a
-   small `ReviewSkillInput` commit-range reference and creates an OpenHands app
-   conversation.
-2. `session/sync` polls OpenHands start-task/conversation state and maps hard
-   failures back to the review run.
-3. `session/cancel` marks the run cancelled and best-effort deletes the
-   OpenHands conversation.
-4. `result` accepts the final OpenHands JSON output, validates it with
+   small `ReviewSkillInput` commit-range reference and creates a persisted
+   pi-agent session.
+2. The runtime exposes only path-confined, read-only code tools plus
+   `request_human_input` and the terminating `submit_review` tool. It has no
+   Docker socket, Linux capabilities, or writable repository mount.
+3. `session/sync` polls runtime state, including `waiting_for_input`; operators
+   answer or steer through `session/messages`.
+4. `session/cancel` marks the run cancelled and aborts the pi-agent session.
+5. The worker collects the structured `submit_review` result, validates it with
    `review_orchestrator.review_results`, stores the summary, and marks the run
    completed.
+
+The bundled runtime discovers Agent Skills from `PI_AGENT_SKILLS_PATH`. The
+repository includes `pi-agent-runtime/skills/code-review/SKILL.md`; add another
+`<skill-name>/SKILL.md` directory and select it through repository review config
+or the `session/start` request. Custom model definitions can be placed in
+`${PI_AGENT_CONFIG_PATH}/models.json`; see
+`pi-agent-runtime/config/models.example.json`.
 
 ### Workspace MVP Contract
 
@@ -269,7 +288,7 @@ github:{repo_hash}:pr:{pr_number}:head:{head_sha}
 
 ## Review Skill Contract
 
-The OpenHands review skill receives only a small commit-range reference:
+The pi-agent review skill receives only a small commit-range reference:
 
 ```json
 {
@@ -310,8 +329,8 @@ orchestrator instead of trusting model-provided IDs.
 
 ### Review Result Parser
 
-`parse_review_result` is an internal contract used by the orchestrator after an
-OpenHands session finishes. It accepts either a JSON string or decoded object and
+`parse_review_result` is an internal contract used by the orchestrator after a
+pi-agent session finishes. It accepts either a JSON string or decoded object and
 returns:
 
 ```json

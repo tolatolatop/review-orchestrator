@@ -166,7 +166,7 @@ const PAGE_SIZE=25;
 const REFRESH_SECONDS=30;
 const PROXY_TOKEN=new URLSearchParams(window.location.search).get('token')||'';
 const statusNames={queued:'排队中',running:'运行中',completed:'已完成',failed:'失败',cancelled:'已取消',superseded:'已替代'};
-const stageNames={start:'准备执行',waiting_for_openhands_start:'等待执行器',retrying_openhands_start:'重试执行器',waiting_for_result:'等待审查结果',collecting_result:'收集审查结果',publishing_summary:'发布审查摘要',cleanup:'清理工作区',completed:'执行完成'};
+const stageNames={start:'准备执行',starting:'启动 pi-agent',retrying_agent_start:'重试执行器',waiting_for_agent:'等待执行器',waiting_for_human:'等待人工输入',agent_completed:'收集审查结果',collecting_result:'收集审查结果',publishing_summary:'发布审查摘要',cleanup:'清理工作区',completed:'执行完成'};
 const state={status:'',provider:'',repo_full_name:'',pull_request_number:'',page:1,total:0,loading:false,controller:null,remaining:REFRESH_SECONDS};
 const $=selector=>document.querySelector(selector);
 const esc=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
-import re
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
@@ -25,7 +23,7 @@ from review_orchestrator.models import (
     ReviewRun,
     utc_now,
 )
-from review_orchestrator.openhands import OpenHandsClient, OpenHandsClientError
+from review_orchestrator.pi_agent import PiAgentClient, PiAgentClientError
 from review_orchestrator.providers import (
     ProviderAdapter,
     ProviderError,
@@ -295,7 +293,7 @@ async def process_next_review_run(
     session: AsyncSession,
     *,
     settings: Settings,
-    openhands_client: OpenHandsClient,
+    pi_agent_client: PiAgentClient,
     worker_id: str,
     github_client: GitHubClient | None = None,
     gitlab_client: GitLabClient | None = None,
@@ -391,19 +389,16 @@ async def process_next_review_run(
             await session.commit()
             await session.refresh(review_run)
 
-        _restore_openhands_start_task_after_poll_failure(review_run)
-        if (
-            not review_run.openhands_start_task_id
-            and not review_run.openhands_conversation_id
-        ):
+        if not review_run.agent_session_id:
             review_run = await start_review_session(
                 session,
                 review_run,
-                openhands_client=openhands_client,
+                pi_agent_client=pi_agent_client,
+                settings=settings,
                 workspace_path=review_run.workspace_path,
             )
             if review_run.status == "failed":
-                if await _schedule_openhands_start_retry(
+                if await _schedule_pi_agent_retry(
                     session,
                     review_run,
                     settings=settings,
@@ -422,10 +417,10 @@ async def process_next_review_run(
         review_run = await sync_review_session(
             session,
             review_run,
-            openhands_client=openhands_client,
+            pi_agent_client=pi_agent_client,
         )
         if review_run.status == "failed":
-            if await _schedule_openhands_start_retry(
+            if await _schedule_pi_agent_retry(
                 session,
                 review_run,
                 settings=settings,
@@ -441,36 +436,16 @@ async def process_next_review_run(
                 status_text="failed",
             )
             return review_run
-        try:
-            raw_result = await _extract_openhands_json_result(
-                openhands_client,
-                review_run.openhands_conversation_id,
-            )
-        except OpenHandsClientError as exc:
-            review_run.status = "failed"
-            review_run.failure_code = "openhands_infrastructure_error"
-            review_run.error = str(exc)
-            session.add(review_run)
-            await session.commit()
-            await session.refresh(review_run)
-            if await _schedule_openhands_start_retry(
-                session,
-                review_run,
-                settings=settings,
-            ):
-                release_lock = False
-                return review_run
-            await publish_review_run_status_comment(
-                session,
-                review_run,
-                github_client=github_client,
-                gitlab_client=gitlab_client,
-                provider_registry=registry,
-                status_text="failed",
-            )
+        if review_run.status == "cancelled":
             return review_run
+        raw_result = (
+            review_run.result_raw_json
+            if review_run.agent_status == "completed"
+            else None
+        )
         if raw_result is None:
-            review_run.stage = "waiting_for_result"
+            if review_run.stage != "waiting_for_human":
+                review_run.stage = review_run.stage or "waiting_for_agent"
             review_run.lock_owner = None
             review_run.locked_until = utc_now() + timedelta(
                 seconds=settings.worker_poll_interval_seconds
@@ -566,7 +541,7 @@ async def process_review_run_timeouts(
     session: AsyncSession,
     *,
     settings: Settings,
-    openhands_client: OpenHandsClient,
+    pi_agent_client: PiAgentClient,
     github_client: GitHubClient | None = None,
     gitlab_client: GitLabClient | None = None,
     provider_registry: ProviderRegistry | None = None,
@@ -599,10 +574,10 @@ async def process_review_run_timeouts(
             refreshed = await session.get(ReviewRun, review_run.id)
             if refreshed is None:
                 continue
-            await _cancel_openhands_after_hard_timeout(
+            await _cancel_pi_agent_after_hard_timeout(
                 session,
                 refreshed,
-                openhands_client=openhands_client,
+                pi_agent_client=pi_agent_client,
             )
             await publish_review_run_status_comment(
                 session,
@@ -682,20 +657,20 @@ async def publish_review_run_status_comment(
         await session.refresh(review_run)
 
 
-async def _cancel_openhands_after_hard_timeout(
+async def _cancel_pi_agent_after_hard_timeout(
     session: AsyncSession,
     review_run: ReviewRun,
     *,
-    openhands_client: OpenHandsClient,
+    pi_agent_client: PiAgentClient,
 ) -> None:
-    if not review_run.openhands_conversation_id:
+    if not review_run.agent_session_id:
         return
     try:
-        await openhands_client.delete_conversation(review_run.openhands_conversation_id)
-    except OpenHandsClientError as exc:
+        await pi_agent_client.cancel_session(review_run.agent_session_id)
+    except PiAgentClientError as exc:
         review_run.error = (
             f"{review_run.error or 'Review run exceeded hard timeout.'} "
-            f"OpenHands cleanup failed: {exc}"
+            f"pi-agent cleanup failed: {exc}"
         )
         session.add(review_run)
         await session.commit()
@@ -925,90 +900,34 @@ async def _fetch_changed_files(
     return []
 
 
-async def _extract_openhands_json_result(
-    openhands_client: OpenHandsClient,
-    conversation_id: str | None,
-) -> dict[str, Any] | None:
-    if not conversation_id:
-        return None
-    events: list[dict[str, Any]] = []
-    page_id: str | None = None
-    for _ in range(20):
-        page = await openhands_client.list_events(
-            conversation_id,
-            page_id=page_id,
-            limit=100,
-        )
-        events.extend(page.items)
-        if not page.next_page_id:
-            break
-        page_id = page.next_page_id
-    for event in reversed(events):
-        for candidate in _extract_text_candidates(event):
-            parsed = _try_json(candidate)
-            if _is_review_result_payload(parsed):
-                return parsed
-    return None
-
-
-async def _schedule_openhands_start_retry(
+async def _schedule_pi_agent_retry(
     session: AsyncSession,
     review_run: ReviewRun,
     *,
     settings: Settings,
 ) -> bool:
-    if review_run.failure_code != "openhands_infrastructure_error":
+    if review_run.failure_code != "pi_agent_infrastructure_error":
         return False
 
     warnings = list(review_run.validation_warnings_json or [])
-    if (
-        review_run.openhands_start_task_id
-        and review_run.error
-        and "GET /api/v1/app-conversations/start-tasks" in review_run.error
-    ):
+    if review_run.agent_session_id:
         if not any(
             isinstance(warning, dict)
-            and warning.get("code") == "openhands_start_task_poll_retry"
+            and warning.get("code") == "pi_agent_session_retry"
             for warning in warnings
         ):
             warnings.append(
                 {
-                    "code": "openhands_start_task_poll_retry",
-                    "message": review_run.error,
-                    "start_task_id": review_run.openhands_start_task_id,
-                }
-            )
-        review_run.status = "running"
-        review_run.stage = "waiting_for_openhands_start"
-        review_run.failure_code = None
-        review_run.error = None
-        review_run.validation_warnings_json = warnings
-        review_run.lock_owner = None
-        review_run.locked_until = utc_now() + timedelta(
-            seconds=settings.worker_poll_interval_seconds
-        )
-        session.add(review_run)
-        await session.commit()
-        await session.refresh(review_run)
-        return True
-
-    if review_run.openhands_conversation_id:
-        if not any(
-            isinstance(warning, dict)
-            and warning.get("code") == "openhands_session_retry"
-            for warning in warnings
-        ):
-            warnings.append(
-                {
-                    "code": "openhands_session_retry",
+                    "code": "pi_agent_session_retry",
                     "message": review_run.error
-                    or "OpenHands session request temporarily failed.",
+                    or "pi-agent session request temporarily failed.",
                 }
             )
         review_run.status = "running"
-        review_run.stage = "waiting_for_result"
+        review_run.stage = "waiting_for_agent"
         review_run.failure_code = None
         review_run.error = None
+        review_run.completed_at = None
         review_run.validation_warnings_json = warnings
         review_run.lock_owner = None
         review_run.locked_until = utc_now() + timedelta(
@@ -1023,7 +942,7 @@ async def _schedule_openhands_start_retry(
         1
         for warning in warnings
         if isinstance(warning, dict)
-        and warning.get("code") == "openhands_start_retry"
+        and warning.get("code") == "pi_agent_start_retry"
     )
     if retry_count >= settings.retry_max_attempts:
         return False
@@ -1032,20 +951,22 @@ async def _schedule_openhands_start_retry(
     delay_seconds = settings.retry_initial_delay_seconds * (2**retry_count)
     warnings.append(
         {
-            "code": "openhands_start_retry",
-            "message": review_run.error or "OpenHands infrastructure start failure.",
+            "code": "pi_agent_start_retry",
+            "message": review_run.error
+            or "pi-agent runtime infrastructure start failure.",
             "retry": retry_number,
-            "start_task_id": review_run.openhands_start_task_id,
         }
     )
     review_run.status = "running"
-    review_run.stage = "retrying_openhands_start"
-    review_run.openhands_start_task_id = None
-    review_run.openhands_conversation_id = None
-    review_run.openhands_sandbox_id = None
-    review_run.openhands_agent_server_url = None
+    review_run.stage = "retrying_agent_start"
+    review_run.agent_session_id = None
+    review_run.agent_status = None
+    review_run.agent_provider = None
+    review_run.agent_model = None
+    review_run.agent_thinking_level = None
     review_run.failure_code = None
     review_run.error = None
+    review_run.completed_at = None
     review_run.validation_warnings_json = warnings
     review_run.lock_owner = None
     review_run.locked_until = utc_now() + timedelta(seconds=delay_seconds)
@@ -1053,85 +974,6 @@ async def _schedule_openhands_start_retry(
     await session.commit()
     await session.refresh(review_run)
     return True
-
-
-def _restore_openhands_start_task_after_poll_failure(
-    review_run: ReviewRun,
-) -> None:
-    if review_run.openhands_start_task_id or review_run.openhands_conversation_id:
-        return
-    for warning in reversed(review_run.validation_warnings_json or []):
-        if not isinstance(warning, dict):
-            continue
-        if warning.get("code") != "openhands_start_retry":
-            continue
-        message = warning.get("message")
-        start_task_id = warning.get("start_task_id")
-        if (
-            isinstance(message, str)
-            and "GET /api/v1/app-conversations/start-tasks" in message
-            and isinstance(start_task_id, str)
-            and start_task_id
-        ):
-            review_run.openhands_start_task_id = start_task_id
-            review_run.stage = "waiting_for_openhands_start"
-            return
-
-
-def _is_review_result_payload(value: Any) -> bool:
-    return isinstance(value, dict) and "summary" in value and "findings" in value
-
-
-def _extract_text_candidates(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, dict):
-        candidates: list[str] = []
-        for key in ("text", "content", "message", "thought", "observation"):
-            candidates.extend(_extract_text_candidates(value.get(key)))
-        for key, item in value.items():
-            if key not in {"text", "content", "message", "thought", "observation"}:
-                candidates.extend(_extract_text_candidates(item))
-        return candidates
-    if isinstance(value, list):
-        candidates = []
-        for item in value:
-            candidates.extend(_extract_text_candidates(item))
-        return candidates
-    return []
-
-
-def _try_json(text: str) -> Any:
-    stripped = text.strip()
-    candidates = [stripped]
-    candidates.extend(
-        match.group("json").strip() for match in _FENCED_JSON_RE.finditer(stripped)
-    )
-    for candidate in candidates:
-        parsed = _loads_json(candidate)
-        if parsed is not None:
-            return parsed
-    return None
-
-
-_FENCED_JSON_RE = re.compile(
-    r"```(?:json|JSON)?\s*(?P<json>.*?)```",
-    re.DOTALL,
-)
-
-
-def _loads_json(text: str) -> Any:
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return None
 
 
 def _str_or_none(value: Any) -> str | None:

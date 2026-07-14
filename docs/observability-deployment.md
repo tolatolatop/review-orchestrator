@@ -1,7 +1,7 @@
 # Observability Dashboard: Secure Deployment and Verification
 
 The observability endpoints expose repository names, pull request metadata,
-execution failures, task inputs/results, and OpenHands identifiers. Treat them
+execution failures, task inputs/results, and pi-agent identifiers. Treat them
 as an operator console. **Never expose them to an untrusted network without
 authentication and TLS.**
 
@@ -16,8 +16,8 @@ observability APIs below from the same origin:
 | Provider events | `GET /api/v1/observability/provider-events[/{event_id}]` |
 | Agent tasks | `GET /api/v1/observability/agent-tasks[/{task_id}]` |
 | Review runs | `GET /api/v1/observability/review-runs[/{review_run_id}]` |
-| OpenHands by run | `GET /api/v1/observability/review-runs/{review_run_id}/openhands-session` |
-| OpenHands by conversation | `GET /api/v1/observability/openhands-sessions/{conversation_id}` |
+| pi-agent by run | `GET /api/v1/observability/review-runs/{review_run_id}/agent-session` |
+| pi-agent by session | `GET /api/v1/observability/agent-sessions/{agent_session_id}` |
 
 The legacy paths without `/observability` remain compatible. Remote requests
 use the token-protected Nginx boundary by default; trusted requests from the
@@ -105,9 +105,10 @@ GET /api/v1/provider-events/{event_id}?include_payload=true
 
 The redactor removes sensitive key values and common credential shapes such as
 authorization headers, cookies, signatures, tokens, private keys, JWTs, and
-stack traces. Agent task input/result data is also redacted. OpenHands
-diagnostics expose identifiers and status only, not the OpenHands API token,
-raw events, logs, or container internals.
+stack traces. Agent task input/result data is also redacted. pi-agent
+diagnostics expose safe identifiers, model metadata, status, and a pending
+question only—not LLM/runtime tokens, reasoning, raw tool output, logs, or
+container internals.
 
 Redaction is risk reduction, not access control. New payload shapes may carry
 sensitive values under unfamiliar keys, and payloads may contain user data or
@@ -116,9 +117,9 @@ the action conspicuous, avoid client-side persistence, and review responses
 before copying them to tickets or chat. Protect database backups and service
 logs with the same operator boundary.
 
-Set `OPENHANDS_UI_BASE_URL` only to an operator-protected URL. Generated links
-do not carry `OPENHANDS_API_TOKEN`; OpenHands must enforce its own auth. Leave
-the variable empty if no safe URL exists, and passthrough remains disabled.
+Human answers and steering messages use the token-protected orchestrator
+`session/messages` endpoint. The pi-agent runtime port is loopback-only and is
+not an operator UI; do not expose it directly to untrusted networks.
 
 ## Verification Checklist
 
@@ -135,7 +136,7 @@ Run these checks from outside the private service network against Nginx/ingress.
   boundary before using this mode.
 - Observability requests through `127.0.0.1:${REVIEW_LOCAL_PORT:-18000}` succeed
   without a token.
-- FastAPI, PostgreSQL, and OpenHands are blocked from untrusted networks; TLS is
+- FastAPI, PostgreSQL, and pi-agent are blocked from untrusted networks; TLS is
   valid on remote entrypoints; logs contain no token or response body.
 
 ### API and redaction
@@ -145,7 +146,7 @@ Run these checks from outside the private service network against Nginx/ingress.
 - A test event containing authorization, token, signature, JWT, private-key,
   and stack-trace values returns redaction markers, not originals.
 - Agent task input/result values are redacted.
-- OpenHands diagnostics contain no API credential or raw log/event data.
+- pi-agent diagnostics contain no API credential, reasoning, or raw tool data.
 - Error responses expose no full stack trace or infrastructure secret.
 
 ```bash

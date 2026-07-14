@@ -139,14 +139,15 @@ class ReviewRun(Base):
     stage: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     summary_comment_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     workspace_path: Mapped[str | None] = mapped_column(Text, nullable=True)
-    openhands_start_task_id: Mapped[str | None] = mapped_column(
-        String(80), nullable=True
+    agent_session_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, index=True
     )
-    openhands_conversation_id: Mapped[str | None] = mapped_column(
-        String(80), nullable=True, index=True
+    agent_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    agent_provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    agent_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    agent_thinking_level: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
     )
-    openhands_sandbox_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    openhands_agent_server_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     review_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     review_conclusion: Mapped[str | None] = mapped_column(String(32), nullable=True)
     risk_level: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -191,7 +192,7 @@ class ReviewSession(Base):
     review_run_id: Mapped[str] = mapped_column(
         ForeignKey("review_run.id"), nullable=False, unique=True, index=True
     )
-    openhands_conversation_id: Mapped[str | None] = mapped_column(
+    agent_session_id: Mapped[str | None] = mapped_column(
         String(128), nullable=True, index=True
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="created")

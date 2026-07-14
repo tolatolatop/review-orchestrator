@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from review_orchestrator.db import get_session
 from review_orchestrator.github import GitHubAdapter
 from review_orchestrator.gitlab import GitLabAdapter
-from review_orchestrator.openhands import OpenHandsClient
+from review_orchestrator.pi_agent import PiAgentClient, PiAgentClientError
 from review_orchestrator.platform_diagnostics import diagnose_platform_permissions
 from review_orchestrator.providers import ProviderRegistry, ProviderWebhookError
 from review_orchestrator.review_results import ReviewResultError
@@ -14,7 +14,7 @@ from review_orchestrator.schemas import (
     AgentTaskDetail,
     AgentTaskListResponse,
     CleanupSummary,
-    OpenHandsSessionDiagnostics,
+    PiAgentSessionDiagnostics,
     PlatformPermissionDiagnosticRequest,
     PlatformPermissionDiagnosticResponse,
     ProviderEventInboxDetail,
@@ -28,6 +28,7 @@ from review_orchestrator.schemas import (
     ReviewRunListResponse,
     ReviewRunRead,
     ReviewSessionCancel,
+    ReviewSessionMessage,
     ReviewSessionStart,
     WebhookAccepted,
     WorkspaceCleanupRequest,
@@ -45,8 +46,8 @@ from review_orchestrator.services import (
     collect_review_result,
     create_review_run,
     get_agent_task_detail,
-    get_openhands_session_diagnostics_for_conversation,
-    get_openhands_session_diagnostics_for_review_run,
+    get_pi_agent_session_diagnostics_for_review_run,
+    get_pi_agent_session_diagnostics_for_session,
     get_provider_event_inbox_detail,
     get_review_run,
     get_review_run_detail,
@@ -90,42 +91,42 @@ async def diagnose_platform_permissions_endpoint(
     )
 
 
-def get_openhands_client(request: Request) -> OpenHandsClient:
-    injected = getattr(request.app.state, "openhands_client", None)
+def get_pi_agent_client(request: Request) -> PiAgentClient:
+    injected = getattr(request.app.state, "pi_agent_client", None)
     if injected is not None:
         return injected
 
     settings = request.app.state.settings
-    if not settings.openhands_base_url:
+    if not settings.pi_agent_base_url:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="OpenHands base URL is not configured.",
+            detail="pi-agent runtime base URL is not configured.",
         )
-    return OpenHandsClient(
-        base_url=settings.openhands_base_url,
-        api_key=settings.openhands_api_token,
-        timeout=settings.openhands_timeout_seconds,
+    return PiAgentClient(
+        base_url=settings.pi_agent_base_url,
+        api_token=settings.pi_agent_runtime_token,
+        timeout=settings.pi_agent_timeout_seconds,
     )
 
 
-openhands_client_dependency = Depends(get_openhands_client)
+pi_agent_client_dependency = Depends(get_pi_agent_client)
 
 
-def get_optional_openhands_client(
+def get_optional_pi_agent_client(
     request: Request,
-) -> tuple[OpenHandsClient | None, str | None]:
-    injected = getattr(request.app.state, "openhands_client", None)
+) -> tuple[PiAgentClient | None, str | None]:
+    injected = getattr(request.app.state, "pi_agent_client", None)
     if injected is not None:
         return injected, None
 
     settings = request.app.state.settings
-    if not settings.openhands_base_url:
-        return None, "OpenHands base URL is not configured."
+    if not settings.pi_agent_base_url:
+        return None, "pi-agent runtime base URL is not configured."
     return (
-        OpenHandsClient(
-            base_url=settings.openhands_base_url,
-            api_key=settings.openhands_api_token,
-            timeout=settings.openhands_timeout_seconds,
+        PiAgentClient(
+            base_url=settings.pi_agent_base_url,
+            api_token=settings.pi_agent_runtime_token,
+            timeout=settings.pi_agent_timeout_seconds,
         ),
         None,
     )
@@ -335,43 +336,41 @@ async def get_review_run_endpoint(
 
 
 @router.get(
-    "/observability/review-runs/{review_run_id}/openhands-session",
-    response_model=OpenHandsSessionDiagnostics,
+    "/observability/review-runs/{review_run_id}/agent-session",
+    response_model=PiAgentSessionDiagnostics,
 )
-async def get_review_run_openhands_session_endpoint(
+async def get_review_run_agent_session_endpoint(
     review_run_id: str,
     request: Request,
     session: AsyncSession = session_dependency,
-) -> OpenHandsSessionDiagnostics:
+) -> PiAgentSessionDiagnostics:
     review_run = await get_review_run(session, review_run_id)
     if review_run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    openhands_client, disabled_reason = get_optional_openhands_client(request)
-    return await get_openhands_session_diagnostics_for_review_run(
+    pi_agent_client, disabled_reason = get_optional_pi_agent_client(request)
+    return await get_pi_agent_session_diagnostics_for_review_run(
         session,
         review_run,
-        openhands_client=openhands_client,
-        openhands_live_status_disabled_reason=disabled_reason,
-        openhands_ui_base_url=request.app.state.settings.openhands_ui_base_url,
+        pi_agent_client=pi_agent_client,
+        live_status_disabled_reason=disabled_reason,
     )
 
 
 @router.get(
-    "/observability/openhands-sessions/{conversation_id}",
-    response_model=OpenHandsSessionDiagnostics,
+    "/observability/agent-sessions/{agent_session_id}",
+    response_model=PiAgentSessionDiagnostics,
 )
-async def get_openhands_session_endpoint(
-    conversation_id: str,
+async def get_pi_agent_session_endpoint(
+    agent_session_id: str,
     request: Request,
     session: AsyncSession = session_dependency,
-) -> OpenHandsSessionDiagnostics:
-    openhands_client, disabled_reason = get_optional_openhands_client(request)
-    diagnostics = await get_openhands_session_diagnostics_for_conversation(
+) -> PiAgentSessionDiagnostics:
+    pi_agent_client, disabled_reason = get_optional_pi_agent_client(request)
+    diagnostics = await get_pi_agent_session_diagnostics_for_session(
         session,
-        conversation_id,
-        openhands_client=openhands_client,
-        openhands_live_status_disabled_reason=disabled_reason,
-        openhands_ui_base_url=request.app.state.settings.openhands_ui_base_url,
+        agent_session_id,
+        pi_agent_client=pi_agent_client,
+        live_status_disabled_reason=disabled_reason,
     )
     if diagnostics is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
@@ -382,8 +381,9 @@ async def get_openhands_session_endpoint(
 async def start_review_session_endpoint(
     review_run_id: str,
     payload: ReviewSessionStart,
+    request: Request,
     session: AsyncSession = session_dependency,
-    openhands_client: OpenHandsClient = openhands_client_dependency,
+    pi_agent_client: PiAgentClient = pi_agent_client_dependency,
 ) -> ReviewRunRead:
     review_run = await get_review_run(session, review_run_id)
     if review_run is None:
@@ -392,8 +392,15 @@ async def start_review_session_endpoint(
         return await start_review_session(
             session,
             review_run,
-            openhands_client=openhands_client,
+            pi_agent_client=pi_agent_client,
+            settings=request.app.state.settings,
             workspace_path=payload.workspace_path,
+            skill=payload.skill,
+            profile=payload.profile,
+            provider=payload.provider,
+            model=payload.model,
+            thinking_level=payload.thinking_level,
+            model_base_url=payload.model_base_url,
         )
     except ReviewRunTransitionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
@@ -403,7 +410,7 @@ async def start_review_session_endpoint(
 async def sync_review_session_endpoint(
     review_run_id: str,
     session: AsyncSession = session_dependency,
-    openhands_client: OpenHandsClient = openhands_client_dependency,
+    pi_agent_client: PiAgentClient = pi_agent_client_dependency,
 ) -> ReviewRunRead:
     review_run = await get_review_run(session, review_run_id)
     if review_run is None:
@@ -411,7 +418,7 @@ async def sync_review_session_endpoint(
     return await sync_review_session(
         session,
         review_run,
-        openhands_client=openhands_client,
+        pi_agent_client=pi_agent_client,
     )
 
 
@@ -423,7 +430,7 @@ async def cancel_review_session_endpoint(
     review_run_id: str,
     payload: ReviewSessionCancel,
     session: AsyncSession = session_dependency,
-    openhands_client: OpenHandsClient = openhands_client_dependency,
+    pi_agent_client: PiAgentClient = pi_agent_client_dependency,
 ) -> ReviewRunRead:
     review_run = await get_review_run(session, review_run_id)
     if review_run is None:
@@ -431,8 +438,45 @@ async def cancel_review_session_endpoint(
     return await cancel_review_session(
         session,
         review_run,
-        openhands_client=openhands_client,
+        pi_agent_client=pi_agent_client,
         reason=payload.reason,
+    )
+
+
+@router.post(
+    "/review-runs/{review_run_id}/session/messages",
+    response_model=ReviewRunRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def send_review_session_message_endpoint(
+    review_run_id: str,
+    payload: ReviewSessionMessage,
+    session: AsyncSession = session_dependency,
+    pi_agent_client: PiAgentClient = pi_agent_client_dependency,
+) -> ReviewRunRead:
+    review_run = await get_review_run(session, review_run_id)
+    if review_run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    if not review_run.agent_session_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Review run has no active pi-agent session.",
+        )
+    try:
+        await pi_agent_client.send_message(
+            review_run.agent_session_id,
+            payload.message,
+            delivery=payload.delivery,
+        )
+    except PiAgentClientError as exc:
+        raise HTTPException(
+            status_code=exc.status_code or status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    return await sync_review_session(
+        session,
+        review_run,
+        pi_agent_client=pi_agent_client,
     )
 
 

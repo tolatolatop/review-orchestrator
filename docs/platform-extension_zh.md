@@ -6,7 +6,7 @@ provider adapter 路由平台行为。本文说明如何在不破坏现有 provi
 扩展到 Azure DevOps、Bitbucket、GitCode 或其他代码托管平台。
 
 目标形态是在外部平台行为周围建立一个小而清晰的 provider adapter 边界。Review
-run 生命周期、OpenHands session 编排、workspace 准备、结果解析、finding 对账和
+run 生命周期、pi-agent session 编排、workspace 准备、结果解析、finding 对账和
 重试策略应继续保持 provider-agnostic。
 
 ## 当前 GitHub MVP
@@ -64,7 +64,7 @@ Orchestrator core 负责共享行为：
 - `PullRequestContext`、`ReviewRun`、`Finding`、`ReviewCommentRef`、
   `ReviewConfig` 和 `Workspace` 持久化。
 - Review run retry、cancel、supersede、timeout 和生命周期状态。
-- OpenHands session start/sync/cancel。
+- pi-agent session start/sync/cancel 与人工输入。
 - Review result schema 校验和 fingerprint 生成。
 - 对无法发布为 line comment 的 finding 执行 summary-only 降级。
 

@@ -20,44 +20,51 @@ from review_orchestrator.models import (
     ReviewSession,
     Workspace,
 )
-from review_orchestrator.openhands import (
-    OpenHandsConversation,
-    OpenHandsStartTask,
-    OpenHandsStartTaskStatus,
+from review_orchestrator.pi_agent import (
+    PiAgentSession,
 )
 
 
-class FakeOpenHandsClient:
+class FakePiAgentClient:
     def __init__(self) -> None:
         self.started_inputs: list[Any] = []
-        self.deleted_conversation_ids: list[str] = []
-        self.start_task = OpenHandsStartTask(
-            id="task-1",
-            status=OpenHandsStartTaskStatus.ready,
-            app_conversation_id="conversation-1",
-            sandbox_id="sandbox-1",
-            agent_server_url="http://agent-server",
-        )
-        self.conversation = OpenHandsConversation(
-            id="conversation-1",
-            sandbox_status="RUNNING",
-            execution_status="RUNNING",
+        self.started_options: list[dict[str, Any]] = []
+        self.cancelled_session_ids: list[str] = []
+        self.sent_messages: list[tuple[str, str, str]] = []
+        self.session = PiAgentSession(
+            id="session-1",
+            status="running",
+            stage="analyzing",
+            provider="openai",
+            model="gpt-5.4",
+            thinking_level="high",
         )
 
-    async def start_conversation(self, review_input: Any) -> OpenHandsStartTask:
+    async def start_session(self, review_input: Any, **kwargs: Any) -> PiAgentSession:
         self.started_inputs.append(review_input)
-        return self.start_task
+        self.started_options.append(kwargs)
+        return self.session
 
-    async def get_start_task(self, task_id: str) -> OpenHandsStartTask:
-        assert task_id == self.start_task.id
-        return self.start_task
+    async def get_session(self, session_id: str) -> PiAgentSession:
+        assert session_id == self.session.id
+        return self.session
 
-    async def get_conversation(self, conversation_id: str) -> OpenHandsConversation:
-        assert conversation_id == self.conversation.id
-        return self.conversation
+    async def cancel_session(self, session_id: str) -> PiAgentSession:
+        self.cancelled_session_ids.append(session_id)
+        self.session = self.session.model_copy(
+            update={"status": "cancelled", "stage": "cancelled"}
+        )
+        return self.session
 
-    async def delete_conversation(self, conversation_id: str) -> None:
-        self.deleted_conversation_ids.append(conversation_id)
+    async def send_message(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        delivery: str,
+    ) -> PiAgentSession:
+        self.sent_messages.append((session_id, message, delivery))
+        return self.session
 
 
 def make_client(tmp_path: Path) -> TestClient:
@@ -569,7 +576,7 @@ def test_get_review_run_detail_exposes_operator_context(tmp_path: Path) -> None:
             review_run.status = "failed"
             review_run.stage = "publishing_summary"
             review_run.workspace_path = "/workspaces/example-repo/pr-42/bbbbbbb"
-            review_run.openhands_conversation_id = "conversation-1"
+            review_run.agent_session_id = "session-1"
             review_run.failure_code = "invalid_result"
             review_run.error = "invalid result\nraw provider payload"
             review_run.hard_timeout_emitted_at = datetime.now(UTC)
@@ -596,7 +603,7 @@ def test_get_review_run_detail_exposes_operator_context(tmp_path: Path) -> None:
             session.add(
                 ReviewSession(
                     review_run_id=review_run_id,
-                    openhands_conversation_id="conversation-1",
+                    agent_session_id="session-1",
                     status="failed",
                     skill_name="code-review",
                     profile_name="default",
@@ -1075,7 +1082,7 @@ async def test_get_agent_task_detail_returns_redacted_metadata(tmp_path: Path) -
     assert missing_response.status_code == 404
 
 
-def test_start_review_session_records_openhands_identifiers(tmp_path: Path) -> None:
+def test_start_review_session_records_pi_agent_identifiers(tmp_path: Path) -> None:
     payload = {
         "provider": "github",
         "repo_full_name": "example/repo",
@@ -1083,10 +1090,10 @@ def test_start_review_session_records_openhands_identifiers(tmp_path: Path) -> N
         "base_sha": "a" * 40,
         "head_sha": "b" * 40,
     }
-    fake_openhands = FakeOpenHandsClient()
+    fake_pi_agent = FakePiAgentClient()
 
     with make_client(tmp_path) as client:
-        client.app.state.openhands_client = fake_openhands
+        client.app.state.pi_agent_client = fake_pi_agent
         create_response = client.post("/api/v1/review-runs", json=payload)
         review_run = create_response.json()
 
@@ -1099,11 +1106,13 @@ def test_start_review_session_records_openhands_identifiers(tmp_path: Path) -> N
     data = start_response.json()
     assert data["status"] == "running"
     assert data["workspace_path"] == "/workspaces/example-repo/pr-42/bbbbbbb"
-    assert data["openhands_start_task_id"] == "task-1"
-    assert data["openhands_conversation_id"] == "conversation-1"
-    assert data["openhands_sandbox_id"] == "sandbox-1"
-    assert fake_openhands.started_inputs[0].repo_full_name == "example/repo"
-    assert fake_openhands.started_inputs[0].base_sha == "a" * 40
+    assert data["agent_session_id"] == "session-1"
+    assert data["agent_status"] == "running"
+    assert data["agent_provider"] == "openai"
+    assert data["agent_model"] == "gpt-5.4"
+    assert data["agent_thinking_level"] == "high"
+    assert fake_pi_agent.started_inputs[0].repo_full_name == "example/repo"
+    assert fake_pi_agent.started_inputs[0].base_sha == "a" * 40
 
 
 def test_start_review_session_requires_workspace_path(tmp_path: Path) -> None:
@@ -1116,7 +1125,7 @@ def test_start_review_session_requires_workspace_path(tmp_path: Path) -> None:
     }
 
     with make_client(tmp_path) as client:
-        client.app.state.openhands_client = FakeOpenHandsClient()
+        client.app.state.pi_agent_client = FakePiAgentClient()
         create_response = client.post("/api/v1/review-runs", json=payload)
         review_run = create_response.json()
         start_response = client.post(
@@ -1128,7 +1137,10 @@ def test_start_review_session_requires_workspace_path(tmp_path: Path) -> None:
     assert "workspace_path" in start_response.json()["detail"]
 
 
-def test_sync_review_session_marks_openhands_failure(tmp_path: Path) -> None:
+def test_start_review_session_forwards_model_skill_and_profile_overrides(
+    tmp_path: Path,
+) -> None:
+    fake_pi_agent = FakePiAgentClient()
     payload = {
         "provider": "github",
         "repo_full_name": "example/repo",
@@ -1136,15 +1148,51 @@ def test_sync_review_session_marks_openhands_failure(tmp_path: Path) -> None:
         "base_sha": "a" * 40,
         "head_sha": "b" * 40,
     }
-    fake_openhands = FakeOpenHandsClient()
-    fake_openhands.conversation = OpenHandsConversation(
-        id="conversation-1",
-        sandbox_status="RUNNING",
-        execution_status="ERROR",
+
+    with make_client(tmp_path) as client:
+        client.app.state.pi_agent_client = fake_pi_agent
+        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        response = client.post(
+            f"/api/v1/review-runs/{review_run['id']}/session/start",
+            json={
+                "workspace_path": "/workspaces/example/repo/pr-42/bbbbbbb",
+                "skill": "security-review",
+                "profile": "strict",
+                "provider": "company-openai",
+                "model": "review-model",
+                "thinking_level": "xhigh",
+                "model_base_url": "https://llm-gateway.example/v1",
+            },
+        )
+
+    assert response.status_code == 200
+    assert fake_pi_agent.started_options == [
+        {
+            "skill": "security-review",
+            "profile": "strict",
+            "provider": "company-openai",
+            "model": "review-model",
+            "thinking_level": "xhigh",
+            "model_base_url": "https://llm-gateway.example/v1",
+        }
+    ]
+
+
+def test_sync_review_session_marks_pi_agent_failure(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+    fake_pi_agent = FakePiAgentClient()
+    fake_pi_agent.session = fake_pi_agent.session.model_copy(
+        update={"status": "failed", "stage": "failed", "error": "model error"}
     )
 
     with make_client(tmp_path) as client:
-        client.app.state.openhands_client = fake_openhands
+        client.app.state.pi_agent_client = fake_pi_agent
         review_run = client.post("/api/v1/review-runs", json=payload).json()
         started = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
@@ -1156,10 +1204,11 @@ def test_sync_review_session_marks_openhands_failure(tmp_path: Path) -> None:
 
     assert sync_response.status_code == 200
     assert sync_response.json()["status"] == "failed"
-    assert "ERROR" in sync_response.json()["error"]
+    assert sync_response.json()["failure_code"] == "pi_agent_error"
+    assert sync_response.json()["error"] == "model error"
 
 
-def test_observability_openhands_session_returns_safe_metadata(
+def test_observability_pi_agent_session_returns_safe_metadata(
     tmp_path: Path,
 ) -> None:
     payload = {
@@ -1169,13 +1218,10 @@ def test_observability_openhands_session_returns_safe_metadata(
         "base_sha": "a" * 40,
         "head_sha": "b" * 40,
     }
-    fake_openhands = FakeOpenHandsClient()
+    fake_pi_agent = FakePiAgentClient()
 
-    with make_client_with_settings(
-        tmp_path,
-        openhands_ui_base_url="https://openhands.example.test",
-    ) as client:
-        client.app.state.openhands_client = fake_openhands
+    with make_client(tmp_path) as client:
+        client.app.state.pi_agent_client = fake_pi_agent
         review_run = client.post("/api/v1/review-runs", json=payload).json()
         started = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
@@ -1184,34 +1230,30 @@ def test_observability_openhands_session_returns_safe_metadata(
 
         by_run = client.get(
             "/api/v1/observability/review-runs/"
-            f"{started['id']}/openhands-session"
+            f"{started['id']}/agent-session"
         )
-        by_conversation = client.get(
-            "/api/v1/observability/openhands-sessions/conversation-1"
+        by_session = client.get(
+            "/api/v1/observability/agent-sessions/session-1"
         )
 
     assert by_run.status_code == 200
     data = by_run.json()
     assert data["review_run_id"] == started["id"]
-    assert data["openhands_start_task_id"] == "task-1"
-    assert data["openhands_conversation_id"] == "conversation-1"
-    assert data["openhands_sandbox_id"] == "sandbox-1"
-    assert data["openhands_agent_server_url"] == "http://agent-server"
-    assert data["execution_status"] == "RUNNING"
-    assert data["sandbox_status"] == "RUNNING"
+    assert data["agent_session_id"] == "session-1"
+    assert data["agent_provider"] == "openai"
+    assert data["agent_model"] == "gpt-5.4"
+    assert data["agent_thinking_level"] == "high"
+    assert data["execution_status"] == "running"
+    assert data["execution_stage"] == "analyzing"
+    assert data["event_count"] == 0
     assert data["session_available"] is True
     assert data["live_status_available"] is True
     assert data["live_status_error"] is None
-    assert data["passthrough"] == {
-        "enabled": True,
-        "conversation_url": "https://openhands.example.test/conversations/conversation-1",
-        "reason": None,
-    }
-    assert by_conversation.status_code == 200
-    assert by_conversation.json()["review_run_id"] == started["id"]
+    assert by_session.status_code == 200
+    assert by_session.json()["review_run_id"] == started["id"]
 
 
-def test_observability_openhands_session_reports_disabled_configuration(
+def test_observability_pi_agent_session_reports_disabled_configuration(
     tmp_path: Path,
 ) -> None:
     payload = {
@@ -1224,33 +1266,29 @@ def test_observability_openhands_session_reports_disabled_configuration(
 
     with make_client_with_settings(
         tmp_path,
-        openhands_base_url=None,
-        openhands_ui_base_url=None,
+        pi_agent_base_url=None,
     ) as client:
         review_run = client.post("/api/v1/review-runs", json=payload).json()
         response = client.get(
             "/api/v1/observability/review-runs/"
-            f"{review_run['id']}/openhands-session"
+            f"{review_run['id']}/agent-session"
         )
 
     assert response.status_code == 200
     data = response.json()
     assert data["session_available"] is False
     assert data["live_status_available"] is False
-    assert data["live_status_error"] == "OpenHands base URL is not configured."
-    assert data["passthrough"] == {
-        "enabled": False,
-        "conversation_url": None,
-        "reason": "OpenHands conversation id is not recorded for this review run.",
-    }
+    assert data["live_status_error"] == (
+        "pi-agent runtime base URL is not configured."
+    )
 
 
-def test_observability_openhands_session_returns_404_for_unknown_conversation(
+def test_observability_pi_agent_session_returns_404_for_unknown_session(
     tmp_path: Path,
 ) -> None:
     with make_client(tmp_path) as client:
         response = client.get(
-            "/api/v1/observability/openhands-sessions/missing-conversation"
+            "/api/v1/observability/agent-sessions/missing-session"
         )
 
     assert response.status_code == 404
@@ -1296,7 +1334,7 @@ def test_collect_review_result_completes_review_run(tmp_path: Path) -> None:
     assert data["parsed"]["findings"][0]["publish_as_line_comment"] is True
 
 
-def test_cancel_review_session_deletes_openhands_conversation(tmp_path: Path) -> None:
+def test_cancel_review_session_cancels_pi_agent_session(tmp_path: Path) -> None:
     payload = {
         "provider": "github",
         "repo_full_name": "example/repo",
@@ -1304,10 +1342,10 @@ def test_cancel_review_session_deletes_openhands_conversation(tmp_path: Path) ->
         "base_sha": "a" * 40,
         "head_sha": "b" * 40,
     }
-    fake_openhands = FakeOpenHandsClient()
+    fake_pi_agent = FakePiAgentClient()
 
     with make_client(tmp_path) as client:
-        client.app.state.openhands_client = fake_openhands
+        client.app.state.pi_agent_client = fake_pi_agent
         review_run = client.post("/api/v1/review-runs", json=payload).json()
         started = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
@@ -1320,4 +1358,32 @@ def test_cancel_review_session_deletes_openhands_conversation(tmp_path: Path) ->
 
     assert cancel_response.status_code == 200
     assert cancel_response.json()["status"] == "cancelled"
-    assert fake_openhands.deleted_conversation_ids == ["conversation-1"]
+    assert fake_pi_agent.cancelled_session_ids == ["session-1"]
+
+
+def test_human_message_is_forwarded_to_pi_agent_session(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+    fake_pi_agent = FakePiAgentClient()
+
+    with make_client(tmp_path) as client:
+        client.app.state.pi_agent_client = fake_pi_agent
+        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        started = client.post(
+            f"/api/v1/review-runs/{review_run['id']}/session/start",
+            json={"workspace_path": "/workspaces/example-repo/pr-42/bbbbbbb"},
+        ).json()
+        response = client.post(
+            f"/api/v1/review-runs/{started['id']}/session/messages",
+            json={"message": "Yes, this is intentional.", "delivery": "answer"},
+        )
+
+    assert response.status_code == 202
+    assert fake_pi_agent.sent_messages == [
+        ("session-1", "Yes, this is intentional.", "answer")
+    ]

@@ -26,25 +26,27 @@ class Settings(BaseSettings):
             "skipped for local development."
         ),
     )
-    openhands_base_url: str | None = Field(
-        default="http://localhost:3000",
-        description="Base URL for the OpenHands App Server API.",
+    pi_agent_base_url: str | None = Field(
+        default="http://localhost:3210",
+        description="Base URL for the isolated pi-agent runtime API.",
     )
-    openhands_ui_base_url: str | None = Field(
+    pi_agent_runtime_token: str | None = Field(
         default=None,
-        description=(
-            "Operator-facing OpenHands UI base URL used to build safe "
-            "conversation links. If unset, observability responses make that "
-            "disabled state explicit."
-        ),
+        description="Bearer token used to authenticate to the pi-agent runtime.",
     )
-    openhands_api_token: str | None = None
-    openhands_review_skill: str = "code-review"
-    openhands_review_profile: str = "default"
-    openhands_timeout_seconds: float = Field(
-        default=120.0,
+    pi_agent_review_skill: str = "code-review"
+    pi_agent_review_profile: str = "default"
+    pi_agent_provider: str = "openai"
+    pi_agent_model: str = "gpt-5.4"
+    pi_agent_thinking_level: str = Field(
+        default="high",
+        pattern="^(minimal|low|medium|high|xhigh)$",
+    )
+    pi_agent_model_base_url: str | None = None
+    pi_agent_timeout_seconds: float = Field(
+        default=30.0,
         gt=0,
-        description="HTTP timeout for OpenHands App Server requests.",
+        description="HTTP timeout for pi-agent runtime requests.",
     )
     github_app_id: str | None = None
     github_private_key_path: str | None = None
@@ -73,6 +75,11 @@ class Settings(BaseSettings):
         default=10.0,
         gt=0,
         description="HTTP timeout for read-only provider permission diagnostics.",
+    )
+    provider_api_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        description="HTTP timeout for GitHub and GitLab API requests.",
     )
     workspace_root: str = "./.workspaces"
     git_cache_root: str = "./.git-cache"
