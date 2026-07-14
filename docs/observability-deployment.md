@@ -19,15 +19,16 @@ observability APIs below from the same origin:
 | OpenHands by run | `GET /api/v1/observability/review-runs/{review_run_id}/openhands-session` |
 | OpenHands by conversation | `GET /api/v1/observability/openhands-sessions/{conversation_id}` |
 
-The legacy paths without `/observability` remain compatible. Protect the
-dashboard and every API route with the same operator authentication boundary.
-See [observability-api.md](observability-api.md) for the API and redaction contract.
+The legacy paths without `/observability` remain compatible. Remote requests
+use the token-protected Nginx boundary; trusted requests from the deployment
+host may use the separate loopback-only FastAPI port without a token. See
+[observability-api.md](observability-api.md) for the API and redaction contract.
 
 ## Recommended Self-host Topology
 
-Use `docker-compose.self_host.yaml`. It keeps FastAPI on the private Compose
-network and exposes Nginx as the only Review Orchestrator entrypoint. Before
-startup, set at least:
+Use `docker-compose.self_host.yaml`. It exposes Nginx for remote access and
+publishes FastAPI separately as `127.0.0.1:${REVIEW_LOCAL_PORT:-18000}` for
+trusted local inspection. Before startup, set at least:
 
 ```dotenv
 APP_ENV=production
@@ -52,6 +53,16 @@ The supplied Nginx template applies these boundaries:
   `GITHUB_WEBHOOK_SECRET` is configured.
 - Every other path requires `X-Review-Token` or the `token` query parameter.
 
+Local operators bypass Nginx entirely and therefore do not need the token:
+
+```bash
+open http://127.0.0.1:${REVIEW_LOCAL_PORT:-18000}/reviews/
+curl -fsS http://127.0.0.1:${REVIEW_LOCAL_PORT:-18000}/api/v1/observability/review-runs
+```
+
+The Compose binding is explicitly loopback-only. Do not publish this port on
+`0.0.0.0` or forward it from an untrusted network.
+
 Prefer the header:
 
 ```bash
@@ -65,9 +76,10 @@ it for shared links. Terminate TLS, prefer a VPN/private network or
 identity-aware proxy, rate-limit authentication failures, and avoid logging
 credentials or response bodies.
 
-The application currently relies on edge authentication; FastAPI does not
-enforce an in-process operator identity or roles. Do not publish port `8000`,
-route around Nginx, or permit untrusted services to bypass the proxy. Per-user
+The application currently relies on the Nginx edge for remote authentication;
+FastAPI does not enforce an in-process operator identity or roles. The direct
+FastAPI mapping is safe only while bound to host loopback. Do not make it
+remotely reachable or permit untrusted services to bypass the proxy. Per-user
 authorization and audit records require an identity-aware proxy or application
 auth layer.
 
@@ -105,10 +117,12 @@ Run these checks from outside the private service network against Nginx/ingress.
 ### Authentication and network boundary
 
 - `/health` succeeds without a token.
-- Observability requests with no token or an invalid token return `401`.
-- The same requests with `X-Review-Token` succeed.
-- FastAPI port `8000`, PostgreSQL, and OpenHands are blocked from untrusted
-  networks; TLS is valid; logs contain no token or response body.
+- Observability requests through Nginx with no token or an invalid token return
+  `401`; the same requests with `X-Review-Token` succeed.
+- Observability requests through `127.0.0.1:${REVIEW_LOCAL_PORT:-18000}` succeed
+  without a token.
+- FastAPI, PostgreSQL, and OpenHands are blocked from untrusted networks; TLS is
+  valid on remote entrypoints; logs contain no token or response body.
 
 ### API and redaction
 
@@ -126,7 +140,8 @@ uv run pytest tests/test_observability.py tests/test_api.py
 
 ### UI
 
-- The route is `401` without auth and loads only after authentication.
+- Through Nginx the route is `401` without auth; through the loopback FastAPI
+  port it loads without a token.
 - Overview, event, run, task, and session views handle loading, empty, API
   error, `401`/`403`, and not-found states.
 - Raw payload is hidden initially and requires a deliberate action.

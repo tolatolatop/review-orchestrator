@@ -15,6 +15,16 @@ def test_openhands_state_uses_the_configured_file_store_path() -> None:
     assert "subnet: 192.168.176.0/24" in compose
 
 
+def test_orchestrator_has_a_loopback_only_tokenless_local_port() -> None:
+    root = Path(__file__).parents[1]
+    compose = (root / "docker-compose.self_host.yaml").read_text()
+    example_env = (root / ".env.example").read_text()
+
+    assert '"127.0.0.1:${REVIEW_LOCAL_PORT:-18000}:8000"' in compose
+    assert '"${REVIEW_LOCAL_PORT:-18000}:8000"' not in compose
+    assert "REVIEW_LOCAL_PORT=18000" in example_env
+
+
 def test_openhands_uses_a_separate_provisioned_postgres_database() -> None:
     root = Path(__file__).parents[1]
     compose = (root / "docker-compose.self_host.yaml").read_text()
