@@ -27,7 +27,7 @@ Runtime 不负责 Provider 事件、Git clone/fetch、业务重试、Task 调度
 
 ## 2. 启动契约与 preset
 
-`POST /v1/sessions` 的可配置选择量只有：
+Orchestrator 调用 `POST /v1/sessions` 时始终发送三个基础选择量：
 
 ```json
 {
@@ -40,16 +40,72 @@ Runtime 不负责 Provider 事件、Git clone/fetch、业务重试、Task 调度
 }
 ```
 
-请求不能提交 `agent_version`、`profile`、`model`、`base_url` 或任意 `skills`
-覆盖。模型及 Base URL 是 Runtime 部署配置；Task Type 只能映射到 Agent 内已经安装
-的命名 preset。
+Operator 可以通过 `/api/v1/agent-presets` 创建数据库 Preset 资源。Preset 支持：
+
+- `global` 或 `repository` 作用域，Repository 作用域优先；
+- Agent ID、Task Type、Primary/Supporting Repository Skills；
+- Provider、Model、Thinking Level 的可选覆盖；
+- Agent Tool allow-list 的子集；
+- turn、Tool call、结果字节数限制。
+
+Orchestrator 将资源身份放入 `preset_resource`，将可选覆盖放入
+`preset_overrides`。Runtime 会再次校验模型策略、Tool 子集与正整数限制。调用方仍不能
+提交 `agent_version`、`profile`、`base_url`、Tool 实现、输入输出 Schema 或系统提示词。
+Task Type 也只能映射到 Agent 内已经安装的命名 preset。
 
 解析使用字段级所有权：
 
 1. Agent definition 提供 system instructions、默认 Skill、Tool、模型规则、预算和结果 Schema；
 2. Repository Skills 只改变 Skill refs；
-3. Task Type 选择 Agent 内部命名 preset，并对该 preset 拥有的 Tool、预算等字段取最终值；
-4. Skill 不增加 Tool，Tool 之间的依赖也不由框架推断。
+3. Task Type 选择 Agent 内部命名 preset；
+4. 数据库 Preset 对显式声明的模型、Tool 子集和预算字段取最终值，并受 Agent policy 约束；
+5. Skill 不增加 Tool，Tool 之间的依赖也不由框架推断。
+
+数据库资源接口：
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| `POST` | `/api/v1/agent-presets` | 创建 Preset |
+| `GET` | `/api/v1/agent-presets` | 按任务、作用域、仓库、状态分页查询 |
+| `GET` | `/api/v1/agent-presets/{id}` | 读取单个 Preset |
+| `PATCH` | `/api/v1/agent-presets/{id}` | 局部更新并递增 revision |
+| `DELETE` | `/api/v1/agent-presets/{id}` | 删除 Preset |
+
+数据库首次初始化会创建 `default-review` 和 `default-agent-task` 两个全局资源。
+同一个 `task_kind + scope` 只允许一个资源，避免运行期选择歧义。
+
+Repository Preset 示例：
+
+```json
+{
+  "name": "owner-repo-security-review",
+  "description": "owner/repo 的安全增强审查",
+  "task_kind": "review",
+  "scope": "repository",
+  "provider": "github",
+  "repo_full_name": "owner/repo",
+  "agent_id": "code-review",
+  "task_type": "code-review",
+  "repository_skills": ["code-review", "security-analysis"],
+  "model": {
+    "provider": "company-openai",
+    "id": "review-model",
+    "thinking_level": "high"
+  },
+  "tools": [
+    "repository.list-files",
+    "repository.read-file",
+    "repository.search-code",
+    "repository.git-diff"
+  ],
+  "limits": {
+    "max_turns": 24,
+    "max_tool_calls": 80,
+    "max_result_bytes": 250000
+  },
+  "enabled": true
+}
+```
 
 Runtime 返回并持久化 `resolved_preset`，包含：
 

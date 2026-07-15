@@ -83,6 +83,9 @@ locally:
 ### MVP Endpoints
 
 - `GET /health`
+- `GET /dashboard/`
+- `GET /reviews/`
+- `GET /presets/`
 - `POST /api/v1/diagnostics/platform-permissions`
 - `POST /api/v1/webhooks/{provider}`
 - `GET /api/v1/review-runs`
@@ -90,6 +93,11 @@ locally:
 - `POST /v1/git/{provider}/resolve-checkout`
 - `POST /v1/comments/{provider}/publish`
 - `POST /v1/query/{provider}`
+- `POST /api/v1/agent-presets`
+- `GET /api/v1/agent-presets`
+- `GET /api/v1/agent-presets/{preset_id}`
+- `PATCH /api/v1/agent-presets/{preset_id}`
+- `DELETE /api/v1/agent-presets/{preset_id}`
 - `GET /api/v1/review-runs/{review_run_id}`
 - `POST /api/v1/review-runs/{review_run_id}/session/start`
 - `POST /api/v1/review-runs/{review_run_id}/session/sync`
@@ -250,10 +258,13 @@ pi-agent SDK behind installed Agent definitions:
 1. `session/start` converts an existing `review_run` plus a workspace path into a
    small `ReviewSkillInput` commit-range reference and creates a persisted
    pi-agent session.
-2. The control plane sends only `agent_id + repository_skills + task_type`.
-   Runtime resolves the installed Agent base, Repository Skills and named Task
-   Type preset into a frozen `resolved_preset`; requests cannot override model,
-   Base URL, profile, Tool implementations, or Agent version.
+2. The control plane resolves an enabled database-backed Agent Preset, preferring
+   an exact Repository scope over the global scope. It sends
+   `agent_id + repository_skills + task_type` and optional trusted model, Tool
+   subset, and execution-limit overrides. Runtime validates those overrides
+   against the installed Agent policy and produces a frozen `resolved_preset`.
+   Requests still cannot override Base URL, profile, Tool implementations,
+   schemas, prompts, or Agent version.
 3. Each run receives a writable Task Workspace and a disposable dependency
    overlay cloned from builtin/prebuilt content. Skills may be installed with
    npm, while Tools remain independently and explicitly configured.
@@ -267,6 +278,15 @@ definitions are installed code, not dynamically version-routed request data.
 Custom model definitions can be placed in
 `${PI_AGENT_CONFIG_PATH}/models.json`; see
 `pi-agent-runtime/config/models.example.json`.
+
+Agent Presets are operator-managed resources under `/api/v1/agent-presets`.
+On first database initialization, the service creates `default-review` and
+`default-agent-task`. A Preset has either global or Repository scope, and only
+one resource may exist for each `task_kind + scope`. Updates increment its
+revision; the resource ID, name, and revision are copied into each Task's
+resolved Preset snapshot. Disabling or deleting a Repository Preset falls back
+to the enabled global Preset, then to the legacy per-Repository/deployment
+defaults if none exists.
 
 ### `@bot` message commands
 

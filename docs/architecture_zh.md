@@ -24,7 +24,7 @@ src/review_orchestrator/
 
 - `main.py`：构造 FastAPI 应用，管理数据库和平台客户端生命周期。
 - `api.py`：HTTP 路由、依赖注入以及领域错误到 HTTP 状态码的映射。
-- `dashboard.py`、`reviews_dashboard.py`：无外部依赖的运维页面资源。
+- `dashboard.py`、`reviews_dashboard.py`、`presets_dashboard.py`：无外部依赖的运维与配置页面资源。
 
 ### `application`
 

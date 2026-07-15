@@ -83,12 +83,63 @@ class AgentTaskResult(BaseModel):
     references: list[AgentTaskReference] = Field(default_factory=list, max_length=50)
 
 
+class AgentPresetResourceReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=36)
+    name: str = Field(min_length=1, max_length=128)
+    revision: int = Field(gt=0)
+
+
+class AgentDomainPresetModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str | None = Field(default=None, min_length=1, max_length=64)
+    id: str | None = Field(default=None, min_length=1, max_length=128)
+    thinking_level: Literal["minimal", "low", "medium", "high", "xhigh"] | None = (
+        None
+    )
+
+
+class AgentDomainPresetLimits(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    max_turns: int | None = Field(
+        default=None, gt=0, validation_alias="max_turns", serialization_alias="maxTurns"
+    )
+    max_tool_calls: int | None = Field(
+        default=None,
+        gt=0,
+        validation_alias="max_tool_calls",
+        serialization_alias="maxToolCalls",
+    )
+    max_result_bytes: int | None = Field(
+        default=None,
+        gt=0,
+        validation_alias="max_result_bytes",
+        serialization_alias="maxResultBytes",
+    )
+
+
+class AgentDomainPresetOverrides(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: AgentDomainPresetModel | None = None
+    tools: list[str] | None = None
+    limits: AgentDomainPresetLimits | None = None
+
+
 class AgentDomainPreset(BaseModel):
     """Only domain-owned selectors accepted by the thin Runtime."""
 
     agent_id: str = Field(min_length=1, max_length=128)
     task_type: str = Field(min_length=1, max_length=128)
     repository_skills: list[str] = Field(default_factory=list)
+    # These fields are deliberately excluded from the legacy three-selector
+    # model_dump contract; PiAgentClient serializes them into trusted nested
+    # request fields explicitly.
+    resource: AgentPresetResourceReference | None = Field(default=None, exclude=True)
+    overrides: AgentDomainPresetOverrides | None = Field(default=None, exclude=True)
 
 
 class PiAgentRuntimeEvent(BaseModel):
@@ -273,6 +324,13 @@ class PiAgentClient:
             "workspace_path": workspace_path,
             "input": input_data,
         }
+        if preset.resource is not None:
+            payload["preset_resource"] = preset.resource.model_dump()
+        if preset.overrides is not None:
+            payload["preset_overrides"] = preset.overrides.model_dump(
+                by_alias=True,
+                exclude_none=True,
+            )
         if idempotency_key:
             payload["idempotency_key"] = idempotency_key
         if title:

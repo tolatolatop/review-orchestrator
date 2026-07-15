@@ -24,7 +24,10 @@ import { AgentRunner } from "./agent/runner.js";
 import { restoreWorkspaceOwnership } from "./agent/environment.js";
 import type {
   AgentDefinition,
+  AgentExecutionLimits,
   AgentToolContext,
+  DomainPresetOverrides,
+  DomainPresetResourceReference,
   JsonObject,
   LegacySessionKind,
   RuntimeEvent,
@@ -46,12 +49,19 @@ const MAX_EVENTS = 200;
 const AGENT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const COMMIT_PATTERN = /^[0-9a-f]{7,64}$/i;
 const THINKING_LEVELS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
+const PRESET_LIMIT_MAXIMUMS = {
+  maxTurns: 1_000,
+  maxToolCalls: 10_000,
+  maxResultBytes: 10_000_000,
+} as const;
 
 interface StartSessionRequest {
   kind: SessionKind;
   agent_id: string;
   task_type: string;
   repository_skills: string[];
+  preset_resource?: DomainPresetResourceReference;
+  preset_overrides?: DomainPresetOverrides;
   idempotency_key?: string;
   title?: string;
   workspace_path: string;
@@ -409,6 +419,12 @@ export function validateStartRequest(value: unknown): StartSessionRequest {
   let kind: SessionKind;
   let taskType: string;
   let repositorySkills: string[];
+  const presetResource = value.preset_resource === undefined
+    ? undefined
+    : validatePresetResource(value.preset_resource);
+  const presetOverrides = value.preset_overrides === undefined
+    ? undefined
+    : validatePresetOverrides(value.preset_overrides);
 
   try {
     if (value.agent_id !== undefined) {
@@ -471,6 +487,8 @@ export function validateStartRequest(value: unknown): StartSessionRequest {
     agent_id: definition.id,
     task_type: taskType,
     repository_skills: repositorySkills,
+    ...(presetResource === undefined ? {} : { preset_resource: presetResource }),
+    ...(presetOverrides === undefined ? {} : { preset_overrides: presetOverrides }),
     workspace_path: workspacePath,
     input,
   };
@@ -494,6 +512,115 @@ function validateRepositorySkills(value: unknown): string[] {
     }
     return reference;
   });
+}
+
+function validatePresetResource(value: unknown): DomainPresetResourceReference {
+  assertObject(value, "preset_resource");
+  rejectUnknownFields(value, "preset_resource", ["id", "name", "revision"]);
+  const revision = Number(value.revision);
+  if (!Number.isInteger(revision) || revision <= 0) {
+    throw new HttpError(422, "preset_resource.revision must be a positive integer.");
+  }
+  const id = requireString(value.id, "preset_resource.id");
+  const name = requireString(value.name, "preset_resource.name");
+  if (id.length > 128 || name.length > 128) {
+    throw new HttpError(422, "preset_resource id and name are too long.");
+  }
+  return {
+    id,
+    name,
+    revision,
+  };
+}
+
+function validatePresetOverrides(value: unknown): DomainPresetOverrides {
+  assertObject(value, "preset_overrides");
+  rejectUnknownFields(value, "preset_overrides", ["model", "tools", "limits"]);
+  const overrides: DomainPresetOverrides = {};
+  if (value.model !== undefined) {
+    assertObject(value.model, "preset_overrides.model");
+    rejectUnknownFields(value.model, "preset_overrides.model", [
+      "provider", "id", "thinking_level",
+    ]);
+    const model: NonNullable<DomainPresetOverrides["model"]> = {};
+    if (value.model.provider !== undefined) {
+      model.provider = requireString(value.model.provider, "preset_overrides.model.provider");
+    }
+    if (value.model.id !== undefined) {
+      model.id = requireString(value.model.id, "preset_overrides.model.id");
+    }
+    if (value.model.thinking_level !== undefined) {
+      const thinking = requireString(
+        value.model.thinking_level,
+        "preset_overrides.model.thinking_level",
+      );
+      if (!THINKING_LEVELS.has(thinking)) {
+        throw new HttpError(422, `Unsupported thinking level: ${thinking}`);
+      }
+      model.thinking_level = thinking as ThinkingLevel;
+    }
+    if (Object.keys(model).length === 0) {
+      throw new HttpError(422, "preset_overrides.model must not be empty.");
+    }
+    overrides.model = model;
+  }
+  if (value.tools !== undefined) {
+    if (!Array.isArray(value.tools)) {
+      throw new HttpError(422, "preset_overrides.tools must be an array.");
+    }
+    if (value.tools.length > 64) {
+      throw new HttpError(422, "preset_overrides.tools may contain at most 64 items.");
+    }
+    overrides.tools = value.tools.map((item, index) => {
+      const tool = requireString(item, `preset_overrides.tools[${index}]`);
+      if (tool.length > 512) {
+        throw new HttpError(422, `preset_overrides.tools[${index}] is too long.`);
+      }
+      return tool;
+    });
+  }
+  if (value.limits !== undefined) {
+    assertObject(value.limits, "preset_overrides.limits");
+    rejectUnknownFields(value.limits, "preset_overrides.limits", [
+      "maxTurns", "maxToolCalls", "maxResultBytes",
+    ]);
+    const limits: Partial<AgentExecutionLimits> = {};
+    for (const field of ["maxTurns", "maxToolCalls", "maxResultBytes"] as const) {
+      if (value.limits[field] === undefined) continue;
+      const parsed = Number(value.limits[field]);
+      if (
+        !Number.isInteger(parsed)
+        || parsed <= 0
+        || parsed > PRESET_LIMIT_MAXIMUMS[field]
+      ) {
+        throw new HttpError(
+          422,
+          `preset_overrides.limits.${field} must be an integer between 1 and ${PRESET_LIMIT_MAXIMUMS[field]}.`,
+        );
+      }
+      limits[field] = parsed;
+    }
+    if (Object.keys(limits).length === 0) {
+      throw new HttpError(422, "preset_overrides.limits must not be empty.");
+    }
+    overrides.limits = limits;
+  }
+  if (Object.keys(overrides).length === 0) {
+    throw new HttpError(422, "preset_overrides must not be empty.");
+  }
+  return overrides;
+}
+
+function rejectUnknownFields(
+  value: Record<string, unknown>,
+  name: string,
+  allowed: string[],
+): void {
+  const allowedSet = new Set(allowed);
+  const unknown = Object.keys(value).find((field) => !allowedSet.has(field));
+  if (unknown !== undefined) {
+    throw new HttpError(422, `${name}.${unknown} is not supported.`);
+  }
 }
 
 async function validateWorkspace(workspacePath: string): Promise<string> {
@@ -531,6 +658,12 @@ export async function startSession(request: StartSessionRequest): Promise<Sessio
         agentId: request.agent_id,
         taskType: request.task_type,
         repositorySkills: request.repository_skills,
+        ...(request.preset_resource === undefined
+          ? {}
+          : { resource: request.preset_resource }),
+        ...(request.preset_overrides === undefined
+          ? {}
+          : { overrides: request.preset_overrides }),
       },
       definition,
       {
