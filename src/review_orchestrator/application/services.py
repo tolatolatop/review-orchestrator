@@ -439,6 +439,7 @@ async def start_review_session(
             model=resolved_model,
             thinking_level=resolved_thinking,
             model_base_url=model_base_url or settings.pi_agent_model_base_url,
+            agent_id=settings.pi_agent_review_agent,
         )
     except PiAgentClientError as exc:
         review_run.status = "failed"

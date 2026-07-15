@@ -206,18 +206,21 @@ pi-agent runtime integration:
 - `PI_AGENT_PROVIDER=openai`
 - `PI_AGENT_MODEL=gpt-5.4`
 - `PI_AGENT_THINKING_LEVEL=high`
+- `PI_AGENT_REVIEW_AGENT=code-review`
+- `AGENT_COMMAND_AGENT=pr-assistant`
 - `PI_AGENT_TIMEOUT_SECONDS=30`
 
 ### pi-agent Integration
 
 The Review Orchestrator owns `review_run` state. A dedicated service embeds the
-pi-agent SDK as the execution backend for each review session:
+pi-agent SDK behind a versioned Agent Definition/Registry/Runner framework:
 
 1. `session/start` converts an existing `review_run` plus a workspace path into a
    small `ReviewSkillInput` commit-range reference and creates a persisted
    pi-agent session.
-2. The runtime exposes only path-confined, read-only code tools plus
-   `request_human_input` and the terminating `submit_review` tool. It has no
+2. The selected Agent definition composes its profiles, skills, tool allow-list,
+   model policy, interaction policy, execution limits, and structured result schema.
+   The runtime has no
    Docker socket, Linux capabilities, or writable repository mount.
 3. `session/sync` polls runtime state, including `waiting_for_input`; operators
    answer or steer through `session/messages`.
@@ -226,10 +229,11 @@ pi-agent SDK as the execution backend for each review session:
    `review_orchestrator.review_results`, stores the summary, and marks the run
    completed.
 
-The bundled runtime discovers Agent Skills from `PI_AGENT_SKILLS_PATH`. The
-repository includes `code-review` and the read-only `pr-assistant` command
-skill; add another `<skill-name>/SKILL.md` directory and select it through
-repository review config or a session request. Custom model definitions can be placed in
+The bundled runtime includes the versioned `code-review`, `pr-assistant`, and
+`change-summary` agents. It supports a primary skill plus ordered supporting skills,
+real named profiles, per-agent tools and completion schemas, and a generic
+`agent_id + agent_version + input` start contract. See
+`docs/pi-agent-framework_zh.md`. Custom model definitions can be placed in
 `${PI_AGENT_CONFIG_PATH}/models.json`; see
 `pi-agent-runtime/config/models.example.json`.
 

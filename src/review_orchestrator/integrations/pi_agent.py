@@ -23,8 +23,10 @@ class PiAgentClientError(RuntimeError):
 
 class PiAgentSessionStatus(StrEnum):
     starting = "starting"
+    preparing = "preparing"
     running = "running"
     waiting_for_input = "waiting_for_input"
+    validating_result = "validating_result"
     completed = "completed"
     failed = "failed"
     cancelled = "cancelled"
@@ -100,7 +102,9 @@ class PiAgentSession(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     id: str
-    kind: Literal["review", "instruction"] | None = None
+    kind: Literal["review", "instruction", "agent"] | None = None
+    agent_id: str | None = None
+    agent_version: str | None = None
     title: str | None = None
     status: PiAgentSessionStatus
     stage: str
@@ -109,7 +113,12 @@ class PiAgentSession(BaseModel):
     model: str | None = None
     thinking_level: str | None = None
     skills: list[str] = Field(default_factory=list)
+    skill_digests: dict[str, str] = Field(default_factory=dict)
     profile: str | None = None
+    tools: list[str] = Field(default_factory=list)
+    execution_limits: dict[str, int] = Field(default_factory=dict)
+    execution_counters: dict[str, int] = Field(default_factory=dict)
+    interaction_policy: dict[str, bool] = Field(default_factory=dict)
     result: dict[str, Any] | None = None
     error: str | None = None
     session_file: str | None = None
@@ -141,21 +150,24 @@ class PiAgentClient:
         model: str,
         thinking_level: str,
         model_base_url: str | None = None,
+        agent_id: str = "code-review",
+        agent_version: str | None = None,
     ) -> PiAgentSession:
-        response = await self._request(
-            "POST",
-            "/v1/sessions",
-            json=self._start_payload(
-                review_input,
-                skill=skill,
-                profile=profile,
-                provider=provider,
-                model=model,
-                thinking_level=thinking_level,
-                model_base_url=model_base_url,
+        return await self.start_agent_session(
+            agent_id=agent_id,
+            agent_version=agent_version,
+            workspace_path=review_input.workspace_path,
+            input_data=review_input.model_dump(),
+            title=(
+                f"Review PR #{review_input.pr_number}: {review_input.repo_full_name}"
             ),
+            skills=[skill],
+            profile=profile,
+            provider=provider,
+            model=model,
+            thinking_level=thinking_level,
+            model_base_url=model_base_url,
         )
-        return PiAgentSession.model_validate(response)
 
     async def start_instruction_session(
         self,
@@ -167,13 +179,64 @@ class PiAgentClient:
         model: str,
         thinking_level: str,
         model_base_url: str | None = None,
+        agent_id: str = "pr-assistant",
+        agent_version: str | None = None,
+    ) -> PiAgentSession:
+        instruction_payload: dict[str, Any] = {
+            "text": instruction.text,
+            "author_login": instruction.author_login,
+            "history": [item.model_dump() for item in instruction.history],
+        }
+        if instruction.source_url:
+            instruction_payload["source_url"] = instruction.source_url
+        return await self.start_agent_session(
+            agent_id=agent_id,
+            agent_version=agent_version,
+            workspace_path=instruction.workspace_path,
+            input_data={
+                "repository_context": instruction.repository_context.model_dump(),
+                "instruction": instruction_payload,
+            },
+            idempotency_key=instruction.idempotency_key,
+            title=(
+                f"PR #{instruction.repository_context.pr_number} command from "
+                f"{instruction.author_login}"
+            ),
+            skills=[skill],
+            profile=profile,
+            provider=provider,
+            model=model,
+            thinking_level=thinking_level,
+            model_base_url=model_base_url,
+        )
+
+    async def start_agent_session(
+        self,
+        *,
+        agent_id: str,
+        workspace_path: str,
+        input_data: dict[str, Any],
+        agent_version: str | None = None,
+        idempotency_key: str | None = None,
+        title: str | None = None,
+        skills: list[str] | None = None,
+        profile: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        thinking_level: str | None = None,
+        model_base_url: str | None = None,
     ) -> PiAgentSession:
         response = await self._request(
             "POST",
             "/v1/sessions",
-            json=self._instruction_start_payload(
-                instruction,
-                skill=skill,
+            json=self._agent_start_payload(
+                agent_id=agent_id,
+                agent_version=agent_version,
+                workspace_path=workspace_path,
+                input_data=input_data,
+                idempotency_key=idempotency_key,
+                title=title,
+                skills=skills,
                 profile=profile,
                 provider=provider,
                 model=model,
@@ -216,23 +279,20 @@ class PiAgentClient:
         thinking_level: str,
         model_base_url: str | None,
     ) -> dict[str, Any]:
-        model_config = {
-            "provider": provider,
-            "id": model,
-            "thinking_level": thinking_level,
-        }
-        if model_base_url:
-            model_config["base_url"] = model_base_url
-        return {
-            "title": (
+        return self._agent_start_payload(
+            agent_id="code-review",
+            workspace_path=review_input.workspace_path,
+            input_data=review_input.model_dump(),
+            title=(
                 f"Review PR #{review_input.pr_number}: {review_input.repo_full_name}"
             ),
-            "workspace_path": review_input.workspace_path,
-            "review": review_input.model_dump(),
-            "model": model_config,
-            "skills": [skill],
-            "profile": profile,
-        }
+            skills=[skill],
+            profile=profile,
+            provider=provider,
+            model=model,
+            thinking_level=thinking_level,
+            model_base_url=model_base_url,
+        )
 
     def _instruction_start_payload(
         self,
@@ -245,13 +305,6 @@ class PiAgentClient:
         thinking_level: str,
         model_base_url: str | None,
     ) -> dict[str, Any]:
-        model_config = {
-            "provider": provider,
-            "id": model,
-            "thinking_level": thinking_level,
-        }
-        if model_base_url:
-            model_config["base_url"] = model_base_url
         instruction_payload: dict[str, Any] = {
             "text": instruction.text,
             "author_login": instruction.author_login,
@@ -259,20 +312,69 @@ class PiAgentClient:
         }
         if instruction.source_url:
             instruction_payload["source_url"] = instruction.source_url
-        return {
-            "kind": "instruction",
-            "idempotency_key": instruction.idempotency_key,
-            "title": (
+        return self._agent_start_payload(
+            agent_id="pr-assistant",
+            workspace_path=instruction.workspace_path,
+            input_data={
+                "repository_context": instruction.repository_context.model_dump(),
+                "instruction": instruction_payload,
+            },
+            idempotency_key=instruction.idempotency_key,
+            title=(
                 f"PR #{instruction.repository_context.pr_number} command from "
                 f"{instruction.author_login}"
             ),
-            "workspace_path": instruction.workspace_path,
-            "repository_context": instruction.repository_context.model_dump(),
-            "instruction": instruction_payload,
-            "model": model_config,
-            "skills": [skill],
-            "profile": profile,
+            skills=[skill],
+            profile=profile,
+            provider=provider,
+            model=model,
+            thinking_level=thinking_level,
+            model_base_url=model_base_url,
+        )
+
+    def _agent_start_payload(
+        self,
+        *,
+        agent_id: str,
+        workspace_path: str,
+        input_data: dict[str, Any],
+        agent_version: str | None = None,
+        idempotency_key: str | None = None,
+        title: str | None = None,
+        skills: list[str] | None = None,
+        profile: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        thinking_level: str | None = None,
+        model_base_url: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "agent_id": agent_id,
+            "workspace_path": workspace_path,
+            "input": input_data,
         }
+        if agent_version:
+            payload["agent_version"] = agent_version
+        if idempotency_key:
+            payload["idempotency_key"] = idempotency_key
+        if title:
+            payload["title"] = title
+        if skills is not None:
+            payload["skills"] = skills
+        if profile:
+            payload["profile"] = profile
+        model_config: dict[str, str] = {}
+        if provider:
+            model_config["provider"] = provider
+        if model:
+            model_config["id"] = model
+        if thinking_level:
+            model_config["thinking_level"] = thinking_level
+        if model_base_url:
+            model_config["base_url"] = model_base_url
+        if model_config:
+            payload["model"] = model_config
+        return payload
 
     async def _request(
         self,

@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     )
     pi_agent_review_skill: str = "code-review"
     pi_agent_review_profile: str = "default"
+    pi_agent_review_agent: str = "code-review"
     pi_agent_provider: str = "openai"
     pi_agent_model: str = "gpt-5.4"
     pi_agent_thinking_level: str = Field(
@@ -65,6 +66,7 @@ class Settings(BaseSettings):
     agent_command_enabled: bool = True
     agent_command_skill: str = "pr-assistant"
     agent_command_profile: str = "default"
+    agent_command_agent: str = "pr-assistant"
     agent_task_soft_timeout_seconds: int = Field(default=120, gt=0)
     agent_task_timeout_seconds: int = Field(default=600, gt=0)
     agent_task_max_history_turns: int = Field(default=6, ge=0, le=20)

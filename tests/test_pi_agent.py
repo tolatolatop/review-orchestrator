@@ -47,8 +47,9 @@ def test_start_payload_keeps_isolated_workspace_and_llm_configuration() -> None:
     )
 
     assert payload["workspace_path"] == review_input().workspace_path
-    assert payload["review"]["base_sha"] == "a" * 40
-    assert payload["review"]["head_sha"] == "b" * 40
+    assert payload["agent_id"] == "code-review"
+    assert payload["input"]["base_sha"] == "a" * 40
+    assert payload["input"]["head_sha"] == "b" * 40
     assert payload["skills"] == ["security-review"]
     assert payload["profile"] == "strict"
     assert payload["model"] == {
@@ -95,12 +96,16 @@ def test_instruction_payload_keeps_command_context_history_and_idempotency() -> 
         model_base_url=None,
     )
 
-    assert payload["kind"] == "instruction"
+    assert payload["agent_id"] == "pr-assistant"
     assert payload["idempotency_key"] == "agent-task:task-1:attempt:1"
     assert payload["workspace_path"] == instruction.workspace_path
-    assert payload["repository_context"]["head_sha"] == "b" * 40
-    assert payload["instruction"]["text"] == "Explain why this retry is safe."
-    assert payload["instruction"]["history"][0]["answer"] == "In src/retry.py."
+    assert payload["input"]["repository_context"]["head_sha"] == "b" * 40
+    assert payload["input"]["instruction"]["text"] == (
+        "Explain why this retry is safe."
+    )
+    assert payload["input"]["instruction"]["history"][0]["answer"] == (
+        "In src/retry.py."
+    )
     assert payload["skills"] == ["pr-assistant"]
 
 
@@ -151,9 +156,56 @@ async def test_client_starts_instruction_session() -> None:
 
     assert session.id == "instruction-session-1"
     assert session.kind == "instruction"
-    assert json.loads(requests[0].content)["instruction"]["text"] == (
+    assert json.loads(requests[0].content)["input"]["instruction"]["text"] == (
         "Explain the retry."
     )
+
+
+@pytest.mark.asyncio
+async def test_client_starts_a_generic_versioned_agent() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            202,
+            json={
+                "id": "summary-session-1",
+                "kind": "agent",
+                "agent_id": "change-summary",
+                "agent_version": "1.0.0",
+                "status": "preparing",
+                "stage": "preparing",
+            },
+        )
+
+    client = PiAgentClient(
+        base_url="http://pi-agent:3210",
+        transport=httpx.MockTransport(handler),
+    )
+    session = await client.start_agent_session(
+        agent_id="change-summary",
+        agent_version="1.0.0",
+        workspace_path="/workspaces/example/repo",
+        input_data={
+            "repository_context": {
+                "provider": "github",
+                "repo_full_name": "example/repo",
+                "pr_number": 42,
+                "base_sha": "a" * 40,
+                "head_sha": "b" * 40,
+            },
+            "audience": "release-manager",
+        },
+        profile="deep",
+        skills=["change-summary"],
+    )
+
+    assert session.kind == "agent"
+    assert session.agent_id == "change-summary"
+    payload = json.loads(requests[0].content)
+    assert payload["agent_version"] == "1.0.0"
+    assert payload["input"]["audience"] == "release-manager"
 
 
 @pytest.mark.asyncio

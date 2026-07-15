@@ -1491,6 +1491,7 @@ def test_start_review_session_forwards_model_skill_and_profile_overrides(
             "model": "review-model",
             "thinking_level": "xhigh",
             "model_base_url": "https://llm-gateway.example/v1",
+            "agent_id": "code-review",
         }
     ]
 

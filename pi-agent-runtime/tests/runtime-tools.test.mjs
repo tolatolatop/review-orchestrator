@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 
 import {
@@ -21,6 +21,9 @@ const stateRoot = await mkdtemp(join(tmpdir(), "pi-agent-state-"));
 const workspaceRoot = await mkdtemp(join(tmpdir(), "pi-agent-workspaces-"));
 process.env.PI_AGENT_STATE_ROOT = stateRoot;
 process.env.PI_AGENT_WORKSPACE_ROOT = workspaceRoot;
+process.env.PI_AGENT_SKILLS_ROOT = resolve("skills");
+process.env.PI_CODING_AGENT_DIR = join(stateRoot, "config");
+process.env.PI_AGENT_MODELS_FILE = join(stateRoot, "models.json");
 const {
   createInstructionTools,
   createReviewTools,
@@ -150,7 +153,7 @@ test("request_human_input pauses and resumes the same session", async () => {
 
     const result = await execution;
     assert.equal(state.status, "running");
-    assert.equal(state.stage, "analyzing");
+    assert.equal(state.stage, "running");
     assert.equal(result.content[0].text, "Operator answer: yes");
   } finally {
     await rm(workspace, { recursive: true, force: true });
@@ -254,6 +257,41 @@ test("instruction session start is idempotent for one agent task attempt", async
 
   assert.equal(duplicate.id, first.id);
   assert.equal(duplicate.idempotency_key, "agent-task:idempotent-task:attempt:1");
+});
+
+test("generic session start resolves a non-legacy agent and real profile", async () => {
+  const workspace = await mkdtemp(join(workspaceRoot, "summary-"));
+  const request = validateStartRequest({
+    agent_id: "change-summary",
+    agent_version: "1.0.0",
+    workspace_path: workspace,
+    profile: "deep",
+    model: { provider: "missing-provider", id: "missing-model" },
+    input: {
+      repository_context: {
+        provider: "github",
+        repo_full_name: "example/repo",
+        pr_number: 1,
+        base_sha: "aaaaaaaa",
+        head_sha: "bbbbbbbb",
+      },
+      audience: "release-manager",
+    },
+  });
+
+  const session = await startSession(request);
+
+  assert.equal(session.kind, "agent");
+  assert.equal(session.agent_id, "change-summary");
+  assert.equal(session.agent_version, "1.0.0");
+  assert.equal(session.profile, "deep");
+  assert.equal(session.thinking_level, "high");
+  assert.deepEqual(session.skills, ["change-summary"]);
+  for (let attempt = 0; attempt < 100 && session.status !== "failed"; attempt += 1) {
+    await new Promise((resolveTick) => setImmediate(resolveTick));
+  }
+  assert.equal(session.status, "failed");
+  assert.match(session.error, /Unknown pi model/);
 });
 
 test("pi SDK completes a review through submit_review", async () => {

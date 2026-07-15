@@ -73,9 +73,11 @@ parameter for browser pages.
 | `PI_AGENT_LLM_API_KEY` | empty | Generic runtime-only key for the selected provider. |
 | `OPENAI_API_KEY` | empty | Standard key discovered by pi's OpenAI provider. |
 | `ANTHROPIC_API_KEY` | empty | Standard key discovered by pi's Anthropic provider. |
+| `PI_AGENT_REVIEW_AGENT` | `code-review` | Versioned Agent selected for automatic reviews. |
 | `PI_AGENT_REVIEW_SKILL` | `code-review` | Default Agent Skill name. |
-| `PI_AGENT_REVIEW_PROFILE` | `default` | Default profile metadata. |
+| `PI_AGENT_REVIEW_PROFILE` | `default` | Executable Agent profile controlling skills, model policy, tools, and limits. |
 | `AGENT_COMMAND_ENABLED` | `true` | Enable trusted `@bot` PR message commands. |
+| `AGENT_COMMAND_AGENT` | `pr-assistant` | Versioned Agent selected for PR message commands. |
 | `AGENT_COMMAND_SKILL` | `pr-assistant` | Read-only skill for message commands. |
 | `AGENT_COMMAND_PROFILE` | `default` | Message-command profile metadata. |
 | `AGENT_TASK_SOFT_TIMEOUT_SECONDS` | `120` | Refresh a delayed command placeholder once. |
@@ -94,7 +96,13 @@ For an OpenAI-compatible or company provider, copy
 provider/model data, then select it with `PI_AGENT_PROVIDER` and
 `PI_AGENT_MODEL`. The runtime never returns API keys in session state or events.
 
-## Skills
+## Agents and Skills
+
+The runtime resolves every session through a versioned Agent registry. Use
+`GET /v1/agents` to inspect available agents, profiles, input/output schemas,
+tools, interaction policy, and execution limits. New clients can start any agent
+with `agent_id`, optional `agent_version`, and schema-validated `input`; the
+legacy review and instruction payloads remain compatibility adapters.
 
 Skills use the Agent Skills `SKILL.md` convention:
 
@@ -105,10 +113,11 @@ pi-agent-runtime/skills/
 ```
 
 To add a skill, create `${PI_AGENT_SKILLS_PATH}/security-review/SKILL.md` with
-frontmatter whose `name` matches the directory. Set the repository's
-`default_review_skill`, change `PI_AGENT_REVIEW_SKILL`, or pass
-`{"skill":"security-review"}` to `session/start`. The runtime validates skill
-names and loads only files beneath its configured skill root.
+frontmatter whose `name` matches the directory. Agent definitions select one
+primary and ordered supporting skills; a session may override them only when the
+Agent permits it. The runtime composes every selected skill, validates names and
+frontmatter, and records content digests. See `docs/pi-agent-framework_zh.md` for
+the Agent Definition and extension contract.
 
 ## Isolation Model
 

@@ -447,6 +447,7 @@ async def _process_command_agent_task(
                 model=settings.pi_agent_model,
                 thinking_level=settings.pi_agent_thinking_level,
                 model_base_url=settings.pi_agent_model_base_url,
+                agent_id=settings.agent_command_agent,
             )
         except PiAgentClientError as exc:
             if (
