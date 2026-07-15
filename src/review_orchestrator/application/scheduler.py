@@ -148,7 +148,10 @@ async def claim_next_task(
         .limit(policy.scan_limit)
     )
     if session.get_bind().dialect.name == "postgresql":
-        statement = statement.with_for_update(skip_locked=True)
+        statement = statement.with_for_update(
+            of=Task.__table__,
+            skip_locked=True,
+        )
 
     candidate_ids = list((await session.execute(statement)).scalars())
     expires_at = now + timedelta(seconds=lock_seconds)

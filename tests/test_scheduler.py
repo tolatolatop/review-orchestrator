@@ -1,8 +1,10 @@
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.dialects import postgresql
 
 from review_orchestrator.application.scheduler import (
     SchedulerPolicy,
@@ -46,6 +48,41 @@ def _task(
         resource_context_json=resource_context,
         created_at=created_at or utc_now(),
     )
+
+
+async def test_scheduler_postgres_locks_only_the_task_base_table() -> None:
+    class EmptyResult:
+        def scalars(self):
+            return []
+
+    class RecordingSession:
+        def __init__(self) -> None:
+            self.statements = []
+
+        def get_bind(self):
+            return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+        async def execute(self, statement):
+            self.statements.append(statement)
+            return EmptyResult()
+
+        async def commit(self) -> None:
+            return None
+
+    session = RecordingSession()
+
+    claimed = await claim_next_task(session, worker_id="worker-1")  # type: ignore[arg-type]
+
+    assert claimed is None
+    sql = str(
+        session.statements[-1].compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    assert "FOR UPDATE OF task SKIP LOCKED" in sql
+    assert "FOR UPDATE OF review_run" not in sql
+    assert "FOR UPDATE OF agent_task" not in sql
 
 
 async def test_scheduler_claims_highest_priority_task(tmp_path: Path) -> None:
