@@ -212,3 +212,17 @@ def test_platform_permission_diagnostic_rejects_unsafe_repository_path(
         )
 
     assert response.status_code == 422
+
+
+def test_platform_permission_diagnostic_rejects_unregistered_provider(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db")
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            "/api/v1/diagnostics/platform-permissions",
+            json={"provider": "forge", "repo_full_name": "group/repo"},
+        )
+
+    assert response.status_code == 404
+    assert "diagnose_permissions" in response.json()["detail"]

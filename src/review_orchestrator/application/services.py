@@ -57,11 +57,6 @@ from review_orchestrator.infrastructure.observability import (
     DEFAULT_OBSERVABILITY_SORT,
     redact_value,
 )
-from review_orchestrator.integrations.github import (
-    NormalizedGitHubEvent,
-    parse_github_datetime,
-    payload_digest,
-)
 from review_orchestrator.integrations.pi_agent import (
     PiAgentClient,
     PiAgentClientError,
@@ -70,7 +65,12 @@ from review_orchestrator.integrations.pi_agent import (
 )
 from review_orchestrator.integrations.providers import (
     AgentCommand,
+    AgentTaskCommentsCapability,
+    ProviderRegistry,
     ProviderWebhookEvent,
+    PullRequestSnapshot,
+    ResourceLinksCapability,
+    payload_digest,
 )
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "superseded"}
@@ -765,7 +765,15 @@ async def accept_provider_webhook(
     agent_task_id: str | None = None
     context: PullRequestContext | None = None
     if normalized_event.should_update_context:
-        context = await upsert_pull_request_context(session, event, payload)
+        if normalized_event.pull_request is None:
+            raise ValueError(
+                f"Provider {provider!r} did not supply normalized PR context."
+            )
+        context = await upsert_pull_request_context(
+            session,
+            event,
+            normalized_event.pull_request,
+        )
 
     if normalized_event.internal_event in {"pr_closed", "pr_merged"}:
         await cancel_active_review_runs_for_pr(
@@ -784,10 +792,14 @@ async def accept_provider_webhook(
         )
 
     if normalized_event.should_create_review_run:
-        review_run = await create_review_run_from_provider_payload(
+        if normalized_event.pull_request is None:
+            raise ValueError(
+                f"Provider {provider!r} did not supply normalized PR context."
+            )
+        review_run = await create_review_run_from_snapshot(
             session,
             event.provider,
-            payload,
+            normalized_event.pull_request,
             trigger_event_id=event.id,
         )
         await supersede_older_review_runs(session, review_run)
@@ -821,25 +833,6 @@ async def accept_provider_webhook(
         internal_event=event.internal_event,
         review_run_id=review_run_id,
         agent_task_id=agent_task_id,
-    )
-
-
-async def accept_github_webhook(
-    session: AsyncSession,
-    *,
-    delivery_id: str,
-    provider_event: str,
-    normalized_event: NormalizedGitHubEvent,
-    payload: dict[str, Any],
-    raw_body: bytes,
-) -> WebhookAccepted:
-    return await accept_provider_webhook(
-        session,
-        delivery_id=delivery_id,
-        provider_event=provider_event,
-        normalized_event=normalized_event.to_provider_event(),
-        payload=payload,
-        raw_body=raw_body,
     )
 
 
@@ -929,16 +922,10 @@ async def get_provider_event_inbox_detail(
 async def upsert_pull_request_context(
     session: AsyncSession,
     event: ProviderEventInbox,
-    payload: dict[str, Any],
+    snapshot: PullRequestSnapshot,
 ) -> PullRequestContext | None:
-    identity = _pull_request_identity(event.provider, payload)
-    if identity is None:
-        return None
-
-    repository_name = identity["repository"]
-    pull_request_number = identity["number"]
-    if not repository_name or not isinstance(pull_request_number, int):
-        return None
+    repository_name = snapshot.repository
+    pull_request_number = snapshot.number
 
     result = await session.execute(
         select(PullRequestContext).where(
@@ -953,28 +940,28 @@ async def upsert_pull_request_context(
             provider=event.provider,
             repo_full_name=repository_name,
             pull_request_number=pull_request_number,
-            head_sha=identity["head_sha"] or "",
+            head_sha=snapshot.head_sha,
         )
         session.add(context)
 
-    context.provider_repo_id = identity["provider_repo_id"]
-    context.provider_pr_id = identity["provider_pr_id"]
-    context.title = identity["title"]
-    context.author_login = identity["author_login"]
-    context.base_ref = identity["base_ref"]
-    context.base_sha = identity["base_sha"]
-    context.head_ref = identity["head_ref"]
-    context.head_sha = identity["head_sha"] or context.head_sha
-    context.head_repo_full_name = identity["head_repo_full_name"]
+    context.provider_repo_id = snapshot.provider_repo_id
+    context.provider_pr_id = snapshot.provider_pr_id
+    context.title = snapshot.title
+    context.author_login = snapshot.author_login
+    context.base_ref = snapshot.base_ref
+    context.base_sha = snapshot.base_sha
+    context.head_ref = snapshot.head_ref
+    context.head_sha = snapshot.head_sha
+    context.head_repo_full_name = snapshot.head_repo_full_name
     context.is_fork = bool(
         context.head_repo_full_name
-        and context.head_repo_full_name != identity["base_repo_full_name"]
+        and context.head_repo_full_name != snapshot.base_repo_full_name
     )
-    context.status = identity["status"]
-    context.html_url = identity["html_url"]
+    context.status = snapshot.status
+    context.html_url = snapshot.html_url
     context.latest_event_id = event.id
-    context.closed_at = identity["closed_at"]
-    context.merged_at = identity["merged_at"]
+    context.closed_at = snapshot.closed_at
+    context.merged_at = snapshot.merged_at
 
     return context
 
@@ -1029,6 +1016,7 @@ async def create_agent_task_from_event(
 async def list_agent_tasks(
     session: AsyncSession,
     *,
+    provider_registry: ProviderRegistry | None = None,
     status: str | None = None,
     provider: str | None = None,
     repo_full_name: str | None = None,
@@ -1072,7 +1060,10 @@ async def list_agent_tasks(
         created_to=created_to,
     )
     return AgentTaskListResponse(
-        items=[_agent_task_summary(task) for task in tasks],
+        items=[
+            _agent_task_summary(task, provider_registry=provider_registry)
+            for task in tasks
+        ],
         total=total,
         limit=limit,
         offset=offset,
@@ -1083,12 +1074,17 @@ async def list_agent_tasks(
 async def get_agent_task_detail(
     session: AsyncSession,
     task_id: str,
+    *,
+    provider_registry: ProviderRegistry | None = None,
 ) -> AgentTaskDetail | None:
     task = await session.get(AgentTask, task_id)
     if task is None:
         return None
     return AgentTaskDetail(
-        **_agent_task_summary(task).model_dump(),
+        **_agent_task_summary(
+            task,
+            provider_registry=provider_registry,
+        ).model_dump(),
         input_metadata=redact_value(task.input_json),
         result_json=task.result_json,
     )
@@ -1099,7 +1095,7 @@ async def cancel_agent_task(
     task_id: str,
     *,
     pi_agent_client: PiAgentClient,
-    provider_registry: Any,
+    provider_registry: ProviderRegistry,
 ) -> AgentTask | None:
     task = await session.get(AgentTask, task_id)
     if task is None:
@@ -1119,8 +1115,11 @@ async def cancel_agent_task(
             await pi_agent_client.cancel_session(task.agent_session_id)
         except PiAgentClientError:
             pass
-    adapter = provider_registry.get(task.provider)
-    if adapter is None or not hasattr(adapter, "publish_agent_task_comment"):
+    adapter = provider_registry.capability(
+        task.provider,
+        AgentTaskCommentsCapability,
+    )
+    if adapter is None:
         raise ReviewRunTransitionError(
             f"Provider {task.provider} cannot publish agent task comments.",
             status_code=503,
@@ -1275,7 +1274,16 @@ async def _agent_task_queue_health(
     )
 
 
-def _agent_task_summary(task: AgentTask) -> AgentTaskSummary:
+def _agent_task_summary(
+    task: AgentTask,
+    *,
+    provider_registry: ProviderRegistry | None = None,
+) -> AgentTaskSummary:
+    link_builder = (
+        provider_registry.capability(task.provider, ResourceLinksCapability)
+        if provider_registry is not None
+        else None
+    )
     return AgentTaskSummary(
         id=task.id,
         provider=task.provider,
@@ -1292,9 +1300,8 @@ def _agent_task_summary(task: AgentTask) -> AgentTaskSummary:
         head_sha=task.head_sha,
         response_comment_id=task.response_comment_id,
         response_comment_url=(
-            f"https://github.com/{task.repo_full_name}/pull/"
-            f"{task.pull_request_number}#issuecomment-{task.response_comment_id}"
-            if task.provider == "github" and task.response_comment_id
+            link_builder.agent_task_comment_url(task)
+            if link_builder is not None
             else None
         ),
         agent_session_id=task.agent_session_id,
@@ -1891,60 +1898,21 @@ async def supersede_older_review_runs(
     return older_runs
 
 
-async def create_review_run_from_github_payload(
-    session: AsyncSession,
-    payload: dict[str, Any],
-    *,
-    trigger_event_id: str | None = None,
-) -> ReviewRun:
-    pull_request = payload.get("pull_request")
-    repository = payload.get("repository")
-    if not isinstance(pull_request, dict) or not isinstance(repository, dict):
-        raise ValueError("GitHub pull_request payload is missing required objects.")
-
-    repository_name = _str_or_none(repository.get("full_name"))
-    pull_request_number = pull_request.get("number")
-    head_sha = _head_sha(pull_request)
-    if not repository_name or not isinstance(pull_request_number, int) or not head_sha:
-        raise ValueError("GitHub pull_request payload is missing PR identity fields.")
-
-    return await create_review_run(
-        session,
-        ReviewRunCreate(
-            provider="github",
-            repo_full_name=repository_name,
-            pull_request_number=pull_request_number,
-            base_sha=_base_sha(pull_request),
-            head_sha=head_sha,
-        ),
-        trigger_type="webhook",
-        trigger_event_id=trigger_event_id,
-    )
-
-
-async def create_review_run_from_provider_payload(
+async def create_review_run_from_snapshot(
     session: AsyncSession,
     provider: str,
-    payload: dict[str, Any],
+    snapshot: PullRequestSnapshot,
     *,
     trigger_event_id: str | None = None,
 ) -> ReviewRun:
-    if provider == "github":
-        return await create_review_run_from_github_payload(
-            session, payload, trigger_event_id=trigger_event_id
-        )
-
-    identity = _pull_request_identity(provider, payload)
-    if identity is None:
-        raise ValueError(f"{provider} payload is missing PR identity fields.")
     return await create_review_run(
         session,
         ReviewRunCreate(
             provider=provider,
-            repo_full_name=identity["repository"],
-            pull_request_number=identity["number"],
-            base_sha=identity["base_sha"],
-            head_sha=identity["head_sha"],
+            repo_full_name=snapshot.repository,
+            pull_request_number=snapshot.number,
+            base_sha=snapshot.base_sha,
+            head_sha=snapshot.head_sha,
         ),
         trigger_type="webhook",
         trigger_event_id=trigger_event_id,
@@ -1994,129 +1962,6 @@ def _build_coalesce_key(
     return f"{provider}:{repo_full_name}:{pull_request_number}:lifecycle"
 
 
-def _pull_request_identity(
-    provider: str,
-    payload: dict[str, Any],
-) -> dict[str, Any] | None:
-    if provider == "github":
-        pull_request = payload.get("pull_request")
-        repository = payload.get("repository")
-        if not isinstance(pull_request, dict) or not isinstance(repository, dict):
-            return None
-        repository_name = _str_or_none(repository.get("full_name"))
-        pull_request_number = pull_request.get("number")
-        if not repository_name or not isinstance(pull_request_number, int):
-            return None
-        base = pull_request.get("base")
-        head = pull_request.get("head")
-        base_repo = base.get("repo") if isinstance(base, dict) else None
-        head_repo = head.get("repo") if isinstance(head, dict) else None
-        return {
-            "repository": repository_name,
-            "number": pull_request_number,
-            "provider_repo_id": _id_to_str(repository.get("id")),
-            "provider_pr_id": _id_to_str(pull_request.get("id")),
-            "title": _str_or_none(pull_request.get("title")),
-            "author_login": _login(pull_request.get("user")),
-            "base_ref": _ref(base),
-            "base_sha": _sha(base),
-            "head_ref": _ref(head),
-            "head_sha": _head_sha(pull_request),
-            "base_repo_full_name": _repo_full_name(base_repo),
-            "head_repo_full_name": _repo_full_name(head_repo),
-            "status": _pull_request_status(pull_request),
-            "html_url": _str_or_none(pull_request.get("html_url")),
-            "closed_at": parse_github_datetime(pull_request.get("closed_at")),
-            "merged_at": parse_github_datetime(pull_request.get("merged_at")),
-        }
-
-    if provider == "gitlab":
-        attrs = payload.get("object_attributes")
-        project = payload.get("project")
-        if not isinstance(attrs, dict) or not isinstance(project, dict):
-            return None
-        repository_name = _str_or_none(project.get("path_with_namespace"))
-        pull_request_number = attrs.get("iid")
-        head_sha = None
-        last_commit = attrs.get("last_commit")
-        if isinstance(last_commit, dict):
-            head_sha = _str_or_none(last_commit.get("id"))
-        head_sha = head_sha or _str_or_none(attrs.get("last_commit_id"))
-        if (
-            not repository_name
-            or not isinstance(pull_request_number, int)
-            or not head_sha
-        ):
-            return None
-        target = attrs.get("target")
-        source = attrs.get("source")
-        return {
-            "repository": repository_name,
-            "number": pull_request_number,
-            "provider_repo_id": _id_to_str(project.get("id")),
-            "provider_pr_id": _id_to_str(attrs.get("id")),
-            "title": _str_or_none(attrs.get("title")),
-            "author_login": _gitlab_username(payload.get("user")),
-            "base_ref": _str_or_none(attrs.get("target_branch")),
-            "base_sha": _str_or_none(attrs.get("target_branch_sha")),
-            "head_ref": _str_or_none(attrs.get("source_branch")),
-            "head_sha": head_sha,
-            "base_repo_full_name": _gitlab_project_path(target),
-            "head_repo_full_name": _gitlab_project_path(source),
-            "status": _str_or_none(attrs.get("state")) or "open",
-            "html_url": _str_or_none(attrs.get("url")),
-            "closed_at": parse_github_datetime(attrs.get("closed_at")),
-            "merged_at": parse_github_datetime(attrs.get("merged_at")),
-        }
-
-    return None
-
-
-def _pull_request_status(pull_request: dict[str, Any]) -> str:
-    if pull_request.get("merged") is True:
-        return "merged"
-    state = pull_request.get("state")
-    return state if isinstance(state, str) and state else "open"
-
-
-def _base_sha(pull_request: dict[str, Any]) -> str | None:
-    base = pull_request.get("base")
-    return _sha(base)
-
-
-def _head_sha(pull_request: dict[str, Any]) -> str | None:
-    head = pull_request.get("head")
-    return _sha(head)
-
-
-def _sha(ref_object: Any) -> str | None:
-    if not isinstance(ref_object, dict):
-        return None
-    return _str_or_none(ref_object.get("sha"))
-
-
-def _ref(ref_object: Any) -> str | None:
-    if not isinstance(ref_object, dict):
-        return None
-    return _str_or_none(ref_object.get("ref"))
-
-
-def _repo_full_name(repo: Any) -> str | None:
-    if not isinstance(repo, dict):
-        return None
-    return _str_or_none(repo.get("full_name"))
-
-
-def _gitlab_project_path(project: Any) -> str | None:
-    if not isinstance(project, dict):
-        return None
-    return _str_or_none(project.get("path_with_namespace"))
-
-
-def _gitlab_username(user: Any) -> str | None:
-    if not isinstance(user, dict):
-        return None
-    return _str_or_none(user.get("username")) or _str_or_none(user.get("name"))
 
 
 async def _mark_failed(
@@ -2146,19 +1991,3 @@ def _finding_count_by_severity(findings: list[Any]) -> dict[str, int]:
         severity = str(getattr(finding, "severity", "unknown"))
         counts[severity] = counts.get(severity, 0) + 1
     return counts
-
-
-def _login(user: Any) -> str | None:
-    if not isinstance(user, dict):
-        return None
-    return _str_or_none(user.get("login"))
-
-
-def _id_to_str(value: Any) -> str | None:
-    if value is None:
-        return None
-    return str(value)
-
-
-def _str_or_none(value: Any) -> str | None:
-    return value if isinstance(value, str) and value else None

@@ -12,7 +12,7 @@ from review_orchestrator.infrastructure.db import (
     create_session_factory,
     init_models,
 )
-from review_orchestrator.integrations.github import create_github_client
+from review_orchestrator.integrations.provider_plugins import create_provider_registry
 from review_orchestrator.presentation.api import router
 from review_orchestrator.presentation.dashboard import DASHBOARD_HTML
 from review_orchestrator.presentation.reviews_dashboard import REVIEWS_DASHBOARD_HTML
@@ -24,19 +24,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         engine = create_engine(settings)
-        github_client = None
+        provider_registry = None
         try:
             app.state.settings = settings
             app.state.engine = engine
             app.state.session_factory = create_session_factory(engine)
-            github_client = create_github_client(settings)
-            app.state.github_client = github_client
+            provider_registry = create_provider_registry(settings)
+            app.state.provider_registry = provider_registry
             await init_models(engine)
             yield
         finally:
             try:
-                if github_client is not None:
-                    await github_client.aclose()
+                if provider_registry is not None:
+                    await provider_registry.aclose()
             finally:
                 await engine.dispose()
 

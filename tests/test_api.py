@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from review_orchestrator.config import Settings
+from review_orchestrator.github import GitHubAdapter
 from review_orchestrator.main import create_app
 from review_orchestrator.models import (
     AgentTask,
@@ -23,6 +24,7 @@ from review_orchestrator.models import (
 from review_orchestrator.pi_agent import (
     PiAgentSession,
 )
+from review_orchestrator.providers import ProviderRegistry
 
 
 class FakePiAgentClient:
@@ -1303,7 +1305,9 @@ async def test_cancel_agent_task_cancels_runtime_and_updates_placeholder(
     github_client = FakeTaskCommentGitHubClient()
     with make_client(tmp_path) as client:
         client.app.state.pi_agent_client = pi_agent_client
-        client.app.state.github_client = github_client
+        client.app.state.provider_registry = ProviderRegistry(
+            [GitHubAdapter(github_client)]
+        )
         task = await create_agent_task_record(
             client,
             status="running",

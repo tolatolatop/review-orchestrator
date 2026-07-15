@@ -22,7 +22,13 @@ from review_orchestrator.domain.schemas import (
     WorkspacePrepareResponse,
 )
 from review_orchestrator.infrastructure.config import Settings
-from review_orchestrator.integrations.github import GitHubClient, GitHubClientError
+from review_orchestrator.integrations.providers import (
+    ProviderCapabilityError,
+    ProviderError,
+    ProviderRegistry,
+    ProviderWorkspaceCheckout,
+    WorkspaceCheckoutCapability,
+)
 
 
 class WorkspaceErrorCode:
@@ -63,19 +69,8 @@ async def prepare_workspace(
     settings: Settings,
     request: WorkspacePrepareRequest,
     *,
-    github_client: GitHubClient | None = None,
+    provider_registry: ProviderRegistry | None = None,
 ) -> WorkspacePrepareResponse:
-    if request.provider != "github":
-        return WorkspacePrepareResponse(
-            workspace_id="",
-            workspace_path="",
-            base_sha=request.pull_request.base_sha,
-            head_sha=request.pull_request.head_sha,
-            status="failed",
-            failure_code=WorkspaceErrorCode.git_error,
-            failure_message=f"Unsupported provider: {request.provider}",
-        )
-
     identity = workspace_identity(
         provider=request.provider,
         repository=request.repository.full_name,
@@ -89,6 +84,32 @@ async def prepare_workspace(
         await session.refresh(existing)
         return _prepare_response(existing, from_cache=True)
 
+    try:
+        checkout = await _resolve_workspace_checkout(request, provider_registry)
+    except ProviderError as exc:
+        return WorkspacePrepareResponse(
+            workspace_id="",
+            workspace_path="",
+            base_sha=request.pull_request.base_sha,
+            head_sha=request.pull_request.head_sha,
+            status="failed",
+            failure_code=(
+                WorkspaceErrorCode.git_error
+                if isinstance(exc, ProviderCapabilityError)
+                else WorkspaceErrorCode.auth_failed
+            ),
+            failure_message=str(exc),
+        )
+    request = request.model_copy(
+        update={
+            "repository": request.repository.model_copy(
+                update={"clone_url": checkout.clone_url}
+            )
+        }
+    )
+    clone_url = request.repository.clone_url
+    assert clone_url is not None
+
     paths = _workspace_paths(settings, request.repository.full_name, request)
     workspace = existing
     if workspace is None:
@@ -96,7 +117,7 @@ async def prepare_workspace(
             workspace_id=identity,
             provider=request.provider,
             repository=request.repository.full_name,
-            repository_clone_url=_safe_clone_url(request.repository.clone_url),
+            repository_clone_url=_safe_clone_url(clone_url),
             repo_hash=paths.repo_hash,
             pull_request_number=request.pull_request.number,
             base_sha=request.pull_request.base_sha,
@@ -112,7 +133,7 @@ async def prepare_workspace(
         workspace.failure_code = None
         workspace.failure_message = None
         workspace.base_sha = request.pull_request.base_sha
-        workspace.repository_clone_url = _safe_clone_url(request.repository.clone_url)
+        workspace.repository_clone_url = _safe_clone_url(clone_url)
         workspace.cache_path = (
             str(paths.cache_path) if request.options.use_git_cache else None
         )
@@ -120,20 +141,13 @@ async def prepare_workspace(
     await session.refresh(workspace)
 
     try:
-        auth_token = (
-            await github_client.get_token(request.repository.full_name)
-            if github_client is not None
-            else None
+        await asyncio.to_thread(
+            _prepare_git_workspace,
+            paths,
+            request,
+            checkout.auth_token,
+            checkout.auth_username,
         )
-        await asyncio.to_thread(_prepare_git_workspace, paths, request, auth_token)
-    except GitHubClientError as exc:
-        workspace.status = "failed"
-        workspace.failure_code = WorkspaceErrorCode.auth_failed
-        workspace.failure_message = str(exc)
-        workspace.expires_at = utc_now() + timedelta(hours=6)
-        await session.commit()
-        await session.refresh(workspace)
-        return _prepare_response(workspace, from_cache=False)
     except GitCommandError as exc:
         workspace.status = "failed"
         workspace.failure_code = exc.code
@@ -152,6 +166,30 @@ async def prepare_workspace(
     await session.commit()
     await session.refresh(workspace)
     return _prepare_response(workspace, from_cache=request.options.use_git_cache)
+
+
+async def _resolve_workspace_checkout(
+    request: WorkspacePrepareRequest,
+    provider_registry: ProviderRegistry | None,
+) -> ProviderWorkspaceCheckout:
+    if provider_registry is None:
+        if request.repository.clone_url is None:
+            raise ProviderCapabilityError(
+                f"Workspace provider is not configured: {request.provider}",
+                provider=request.provider,
+                operation="get_workspace_checkout",
+            )
+        return ProviderWorkspaceCheckout(clone_url=request.repository.clone_url)
+
+    adapter = provider_registry.require_capability(
+        request.provider,
+        WorkspaceCheckoutCapability,
+        operation="get_workspace_checkout",
+    )
+    return await adapter.get_workspace_checkout(
+        request.repository.full_name,
+        clone_url=request.repository.clone_url,
+    )
 
 
 async def get_workspace(
@@ -344,17 +382,24 @@ def _prepare_git_workspace(
     paths: WorkspacePaths,
     request: WorkspacePrepareRequest,
     auth_token: str | None = None,
+    auth_username: str = "x-access-token",
 ) -> None:
     paths.repo_path.parent.mkdir(parents=True, exist_ok=True)
     if request.options.force_refresh:
         shutil.rmtree(paths.repo_path, ignore_errors=True)
 
-    env = _git_env(request, auth_token=auth_token)
+    env = _git_env(
+        request,
+        auth_token=auth_token,
+        auth_username=auth_username,
+    )
+    clone_url = request.repository.clone_url
+    assert clone_url is not None
     if request.options.use_git_cache:
-        _ensure_cache(paths.cache_path, request.repository.clone_url, env)
+        _ensure_cache(paths.cache_path, clone_url, env)
         clone_source = str(paths.cache_path)
     else:
-        clone_source = request.repository.clone_url
+        clone_source = clone_url
 
     if not paths.repo_path.exists():
         _run_git(["git", "clone", clone_source, str(paths.repo_path)], env=env)
@@ -459,6 +504,7 @@ def _git_env(
     request: WorkspacePrepareRequest,
     *,
     auth_token: str | None = None,
+    auth_username: str = "x-access-token",
 ) -> dict[str, str]:
     env = os.environ.copy()
     token_ref = request.auth.token_ref if request.auth else None
@@ -471,12 +517,15 @@ def _git_env(
             )
         return env
 
-    authenticated_base = _authenticated_https_base(request.repository.clone_url)
+    clone_url = request.repository.clone_url
+    if clone_url is None:
+        return env
+    authenticated_base = _authenticated_https_base(clone_url)
     if authenticated_base is None:
         return env
     env["GIT_CONFIG_COUNT"] = "1"
     env["GIT_CONFIG_KEY_0"] = (
-        f"url.https://x-access-token:{token}@{authenticated_base}.insteadOf"
+        f"url.https://{auth_username}:{token}@{authenticated_base}.insteadOf"
     )
     env["GIT_CONFIG_VALUE_0"] = f"https://{authenticated_base}"
     env["REVIEW_GIT_TOKEN_MASK"] = token

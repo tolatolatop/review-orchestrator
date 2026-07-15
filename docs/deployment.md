@@ -46,6 +46,7 @@ parameter for browser pages.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DATABASE_URL` | local SQLite | SQLAlchemy async database URL. Self-host Compose supplies PostgreSQL. |
+| `PROVIDERS_ENABLED` | `github,gitlab` | Comma-separated provider plugin keys. Disabled providers are neither constructed nor validated. |
 | `WORKSPACE_ROOT` | `./.workspaces` | Configurable root used to create provider/repository/PR/head-isolated checkouts. |
 | `GIT_CACHE_ROOT` | `./.git-cache` | Bare mirror cache root. |
 | `GITHUB_WEBHOOK_SECRET` | empty | Verifies GitHub webhook signatures. Required in production. |
@@ -54,7 +55,7 @@ parameter for browser pages.
 | `GITHUB_INSTALLATION_ID` | auto | Optional fixed Installation ID. |
 | `GITHUB_INSTALLATION_TOKEN` | empty | Legacy static/fine-grained token fallback. |
 | `GITLAB_WEBHOOK_SECRET` | empty | GitLab webhook token. |
-| `GITLAB_API_TOKEN` | empty | GitLab MR read/comment token. |
+| `GITLAB_API_TOKEN` | empty | GitLab MR read, private checkout, and comment token. |
 | `PROVIDER_API_TIMEOUT_SECONDS` | `30` | GitHub/GitLab request timeout. |
 | `REVIEW_RUN_SOFT_TIMEOUT_SECONDS` | `900` | Emit delayed status after this duration. |
 | `REVIEW_RUN_TIMEOUT_SECONDS` | `1800` | Cancel the runtime session and fail the run after this duration. |

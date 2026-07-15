@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict
@@ -18,6 +19,8 @@ from review_orchestrator.integrations.providers import (
     ProviderPayloadError,
     ProviderSignatureError,
     ProviderWebhookEvent,
+    ProviderWorkspaceCheckout,
+    PullRequestSnapshot,
     lower_headers,
 )
 
@@ -35,6 +38,15 @@ if TYPE_CHECKING:
 
 class GitLabClientError(RuntimeError):
     pass
+
+
+def gitlab_clone_url(api_base_url: str, repo_full_name: str) -> str:
+    parsed = urlsplit(api_base_url)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/api/v4"):
+        path = path[: -len("/api/v4")]
+    origin = urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
+    return f"{origin}/{repo_full_name}.git"
 
 
 class GitLabNote(BaseModel):
@@ -193,8 +205,16 @@ async def fetch_gitlab_changed_files(
 class GitLabAdapter:
     provider = "gitlab"
 
-    def __init__(self, client: GitLabClient | None = None) -> None:
+    def __init__(
+        self,
+        client: GitLabClient | None = None,
+        *,
+        settings: Settings | None = None,
+        diagnostics_transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         self.client = client
+        self.settings = settings
+        self.diagnostics_transport = diagnostics_transport
 
     def parse_webhook(
         self,
@@ -242,6 +262,23 @@ class GitLabAdapter:
             raise self._operation_error(operation, exc) from exc
         return context_from_merge_request_task(task, merge_request)
 
+    async def get_workspace_checkout(
+        self,
+        repo_full_name: str,
+        *,
+        clone_url: str | None = None,
+    ) -> ProviderWorkspaceCheckout:
+        client = self._require_client("get_workspace_checkout")
+        return ProviderWorkspaceCheckout(
+            clone_url=clone_url
+            or gitlab_clone_url(
+                getattr(client, "api_base_url", "https://gitlab.com/api/v4"),
+                repo_full_name,
+            ),
+            auth_token=getattr(client, "token", None),
+            auth_username="oauth2",
+        )
+
     async def list_changed_files(
         self,
         review_run: ReviewRun,
@@ -282,14 +319,40 @@ class GitLabAdapter:
         except GitLabClientError as exc:
             raise self._operation_error(operation, exc) from exc
 
-    async def publish_line_comments(
-        self,
-        session: AsyncSession,
-        review_run: ReviewRun,
-        *,
-        changed_files: list[ChangedFile],
-    ) -> dict[str, int]:
-        return {"published": 0, "summary_only": 0, "deduped": 0, "failed": 0}
+    async def diagnose_permissions(self, payload: Any) -> Any:
+        operation = "diagnose_permissions"
+        if self.settings is None:
+            raise ProviderCapabilityError(
+                "GitLab diagnostics settings are not configured.",
+                provider=self.provider,
+                operation=operation,
+            )
+        from review_orchestrator.integrations.platform_diagnostics import (
+            diagnose_gitlab_permissions,
+        )
+
+        return await diagnose_gitlab_permissions(
+            self.settings,
+            payload,
+            transport=self.diagnostics_transport,
+        )
+
+    def agent_task_comment_url(self, task: AgentTask) -> str | None:
+        if not task.response_comment_id:
+            return None
+        api_base_url = getattr(
+            self.client,
+            "api_base_url",
+            "https://gitlab.com/api/v4",
+        )
+        repository_url = gitlab_clone_url(
+            api_base_url,
+            task.repo_full_name,
+        ).removesuffix(".git")
+        return (
+            f"{repository_url}/-/merge_requests/{task.pull_request_number}"
+            f"#note_{task.response_comment_id}"
+        )
 
     def _require_client(self, operation: str) -> GitLabClient:
         if self.client is None:
@@ -354,6 +417,11 @@ def normalize_gitlab_event(
         internal_event = "pr_metadata_changed"
     review_actions = {"open", "opened", "reopen", "reopened"}
     should_review = (action or "") in review_actions or internal_event == "pr_updated"
+    snapshot = gitlab_pull_request_snapshot(payload)
+    if internal_event is not None and snapshot is None:
+        raise ProviderPayloadError(
+            "GitLab merge request payload is missing MR identity fields."
+        )
     return ProviderWebhookEvent(
         provider="gitlab",
         provider_event=event_name,
@@ -368,6 +436,7 @@ def normalize_gitlab_event(
         should_create_review_run=should_review,
         should_create_agent_task=False,
         status="received" if internal_event else "ignored",
+        pull_request=snapshot,
     )
 
 
@@ -386,6 +455,47 @@ def _project_path(payload: dict[str, Any]) -> str | None:
     if not isinstance(project, dict):
         return None
     return _optional_str(project.get("path_with_namespace"))
+
+
+def gitlab_pull_request_snapshot(
+    payload: dict[str, Any],
+) -> PullRequestSnapshot | None:
+    """Normalize the complete GitLab MR payload at the integration boundary."""
+
+    attrs = payload.get("object_attributes")
+    project = payload.get("project")
+    if not isinstance(attrs, dict) or not isinstance(project, dict):
+        return None
+    repository = _optional_str(project.get("path_with_namespace"))
+    number = _int_or_none(attrs.get("iid"))
+    last_commit = attrs.get("last_commit")
+    head_sha = (
+        _optional_str(last_commit.get("id"))
+        if isinstance(last_commit, dict)
+        else None
+    ) or _optional_str(attrs.get("last_commit_id"))
+    if not repository or number is None or not head_sha:
+        return None
+    target = attrs.get("target")
+    source = attrs.get("source")
+    return PullRequestSnapshot(
+        repository=repository,
+        number=number,
+        head_sha=head_sha,
+        provider_repo_id=_id_to_str(project.get("id")),
+        provider_pr_id=_id_to_str(attrs.get("id")),
+        title=_optional_str(attrs.get("title")),
+        author_login=_gitlab_author(payload.get("user")),
+        base_ref=_optional_str(attrs.get("target_branch")),
+        base_sha=_optional_str(attrs.get("target_branch_sha")),
+        head_ref=_optional_str(attrs.get("source_branch")),
+        base_repo_full_name=_gitlab_project_path(target),
+        head_repo_full_name=_gitlab_project_path(source),
+        status=_optional_str(attrs.get("state")) or "open",
+        html_url=_optional_str(attrs.get("url")),
+        closed_at=_parse_datetime(attrs.get("closed_at")),
+        merged_at=_parse_datetime(attrs.get("merged_at")),
+    )
 
 
 def _optional_str(value: Any) -> str | None:
@@ -436,6 +546,18 @@ def _gitlab_author(author: Any) -> str | None:
     if not isinstance(author, dict):
         return None
     return _optional_str(author.get("username")) or _optional_str(author.get("name"))
+
+
+def _gitlab_project_path(project: Any) -> str | None:
+    if not isinstance(project, dict):
+        return None
+    return _optional_str(project.get("path_with_namespace"))
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def _source_commit_changed(attrs: dict[str, Any]) -> bool:

@@ -5,7 +5,7 @@ import pytest
 
 from review_orchestrator.config import Settings
 from review_orchestrator.db import create_engine, create_session_factory, init_models
-from review_orchestrator.github import GitHubClientError
+from review_orchestrator.github import GitHubAdapter, GitHubClientError
 from review_orchestrator.models import (
     AgentTask,
     Finding,
@@ -19,7 +19,7 @@ from review_orchestrator.pi_agent import (
 )
 from review_orchestrator.providers import ProviderOperationError, ProviderRegistry
 from review_orchestrator.review_results import parse_review_result
-from review_orchestrator.schemas import ReviewRunCreate
+from review_orchestrator.schemas import ReviewRunCreate, WorkspacePrepareResponse
 from review_orchestrator.services import create_review_run
 from review_orchestrator.worker import (
     acquire_next_review_run,
@@ -29,6 +29,10 @@ from review_orchestrator.worker import (
     process_review_run_timeouts,
     release_review_run_lock,
 )
+
+
+def github_registry(client) -> ProviderRegistry:
+    return ProviderRegistry([GitHubAdapter(client)])
 
 
 class FakePiAgentClient:
@@ -251,6 +255,33 @@ class CustomProviderAdapter:
         del session, review_run, finding_stats
         self.summary_statuses.append(status_text)
         return None
+
+
+class RoutingAdapter:
+    def __init__(self, provider: str) -> None:
+        self.provider = provider
+        self.summary_statuses: list[str] = []
+
+    async def list_changed_files(self, review_run: ReviewRun):
+        assert review_run.provider == self.provider
+        return []
+
+    async def publish_summary_comment(
+        self,
+        session,
+        review_run,
+        *,
+        status_text: str,
+        finding_stats=None,
+    ):
+        del session, finding_stats
+        assert review_run.provider == self.provider
+        self.summary_statuses.append(status_text)
+        return None
+
+    async def publish_line_comments(self, session, review_run, *, changed_files):
+        del session, review_run, changed_files
+        return {"published": 0, "summary_only": 0, "deduped": 0, "failed": 0}
 
 
 @pytest.fixture
@@ -538,7 +569,7 @@ async def test_agent_task_worker_hydrates_context_for_first_mention(
         processed = await process_next_agent_task(
             session,
             worker_id="worker-1",
-            github_client=FakeGitHubClient(),
+            provider_registry=github_registry(FakeGitHubClient()),
         )
 
     assert processed is not None
@@ -625,7 +656,7 @@ async def test_agent_task_hydrate_failure_marks_failed_and_publishes_summary(
         processed = await process_next_agent_task(
             session,
             worker_id="worker-1",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
 
     assert processed is not None
@@ -680,6 +711,7 @@ async def test_review_worker_releases_lock_when_pi_agent_result_not_ready(
             settings=settings,
             pi_agent_client=FakePiAgentClient(),
             worker_id="worker-1",
+            provider_registry=github_registry(FakeGitHubClient()),
         )
 
     assert processed is not None
@@ -760,7 +792,7 @@ async def test_changed_files_failure_degrades_to_summary_only_collection(
             settings=settings,
             pi_agent_client=ResultPiAgentClient(),
             worker_id="worker-1",
-            github_client=FailingChangedFilesGitHubClient(),
+            provider_registry=github_registry(FailingChangedFilesGitHubClient()),
         )
 
     assert processed is not None
@@ -813,13 +845,93 @@ async def test_worker_collects_structured_no_findings_result(
             settings=settings,
             pi_agent_client=NoFindingsPiAgentClient(),
             worker_id="worker-1",
-            github_client=FakeGitHubClient(),
+            provider_registry=github_registry(FakeGitHubClient()),
         )
 
     assert processed is not None
     assert processed.status == "completed"
     assert processed.review_summary == "No issues found."
     assert processed.finding_count_by_severity == {}
+
+
+@pytest.mark.parametrize("provider", ["gitlab", "forge"])
+async def test_review_uses_matching_provider_for_result_upload(
+    session_factory,
+    tmp_path: Path,
+    monkeypatch,
+    provider: str,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db",
+        workspace_root=str(tmp_path / "workspaces"),
+        git_cache_root=str(tmp_path / "git-cache"),
+    )
+    adapter = RoutingAdapter(provider)
+    pi_agent = NoFindingsPiAgentClient()
+    workspace_path = str(tmp_path / f"{provider}-workspace")
+
+    async def prepare_provider_workspace(
+        session,
+        supplied_settings,
+        request,
+        *,
+        provider_registry,
+    ):
+        del session
+        assert supplied_settings is settings
+        assert request.provider == provider
+        assert request.repository.clone_url is None
+        assert provider_registry.require(provider) is adapter
+        return WorkspacePrepareResponse(
+            workspace_id=f"{provider}:workspace",
+            workspace_path=workspace_path,
+            base_sha=request.pull_request.base_sha,
+            head_sha=request.pull_request.head_sha,
+            status="ready",
+        )
+
+    monkeypatch.setattr(
+        "review_orchestrator.worker.prepare_workspace",
+        prepare_provider_workspace,
+    )
+    async with session_factory() as session:
+        context = PullRequestContext(
+            provider=provider,
+            repo_full_name="group/repo",
+            pull_request_number=42,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            status="opened",
+        )
+        session.add(context)
+        await session.commit()
+        review_run = await create_review_run(
+            session,
+            ReviewRunCreate(
+                provider=provider,
+                repo_full_name="group/repo",
+                pull_request_number=42,
+                base_sha="a" * 40,
+                head_sha="b" * 40,
+            ),
+        )
+        review_run.pull_request_context_id = context.id
+        session.add(review_run)
+        await session.commit()
+
+        processed = await process_next_review_run(
+            session,
+            settings=settings,
+            pi_agent_client=pi_agent,
+            worker_id="worker-1",
+            provider_registry=ProviderRegistry([adapter]),
+        )
+
+    assert processed is not None
+    assert processed.status == "completed"
+    assert adapter.summary_statuses == ["reviewing", "completed"]
+    assert pi_agent.started_inputs[0][0].provider == provider
+    assert pi_agent.started_inputs[0][0].workspace_path == workspace_path
 
 
 async def test_worker_collects_structured_result_without_event_scraping(
@@ -862,7 +974,7 @@ async def test_worker_collects_structured_result_without_event_scraping(
             settings=settings,
             pi_agent_client=NoFindingsPiAgentClient(),
             worker_id="worker-1",
-            github_client=FakeGitHubClient(),
+            provider_registry=github_registry(FakeGitHubClient()),
         )
 
     assert processed is not None
@@ -911,7 +1023,7 @@ async def test_review_worker_publishes_failed_summary_on_pi_agent_start_failure(
             settings=settings,
             pi_agent_client=StartFailingPiAgentClient(),
             worker_id="worker-1",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
 
     assert processed is not None
@@ -964,7 +1076,7 @@ async def test_review_worker_retries_transient_pi_agent_start_failure(
             settings=settings,
             pi_agent_client=InfrastructureFailingPiAgentClient(),
             worker_id="worker-1",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
 
     assert processed is not None
@@ -1026,6 +1138,7 @@ async def test_review_worker_retries_transient_pi_agent_start_request(
             settings=settings,
             pi_agent_client=InfrastructureFailingPiAgentClient(),
             worker_id="worker-1",
+            provider_registry=github_registry(FakeGitHubClient()),
         )
 
     assert processed is not None
@@ -1084,7 +1197,7 @@ async def test_review_worker_fails_after_pi_agent_start_retries_are_exhausted(
             settings=settings,
             pi_agent_client=InfrastructureFailingPiAgentClient(),
             worker_id="worker-1",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
 
     assert processed is not None
@@ -1141,6 +1254,7 @@ async def test_review_worker_retries_transient_pi_agent_session_request(
             settings=settings,
             pi_agent_client=SessionRequestFailingPiAgentClient(),
             worker_id="worker-1",
+            provider_registry=github_registry(FakeGitHubClient()),
         )
 
     assert processed is not None
@@ -1197,6 +1311,7 @@ async def test_review_worker_reports_waiting_for_human(
             settings=settings,
             pi_agent_client=WaitingForHumanPiAgentClient(),
             worker_id="worker-1",
+            provider_registry=github_registry(FakeGitHubClient()),
         )
 
     assert processed is not None
@@ -1248,6 +1363,7 @@ async def test_review_worker_keeps_agent_id_on_transient_status_failure(
             settings=settings,
             pi_agent_client=SessionRequestFailingPiAgentClient(),
             worker_id="worker-1",
+            provider_registry=github_registry(FakeGitHubClient()),
         )
 
     assert processed is not None
@@ -1304,7 +1420,7 @@ async def test_review_worker_publishes_failed_summary_on_invalid_result(
             settings=settings,
             pi_agent_client=InvalidResultPiAgentClient(),
             worker_id="worker-1",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
 
     assert processed is not None
@@ -1364,7 +1480,7 @@ async def test_review_worker_marks_failed_on_unexpected_result_collection_error(
             settings=settings,
             pi_agent_client=ResultPiAgentClient(),
             worker_id="worker-1",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
 
     assert processed is not None
@@ -1413,7 +1529,7 @@ async def test_review_run_timeouts_publish_summary_and_cancel_pi_agent(
             session,
             settings=settings,
             pi_agent_client=pi_agent_client,
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
 
     statuses = {run.pull_request_number: run.status for run in touched}
@@ -1468,14 +1584,14 @@ async def test_soft_timeout_summary_is_not_overwritten_by_same_worker_pass(
             session,
             settings=settings,
             pi_agent_client=pi_agent_client,
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
         processed = await process_next_review_run(
             session,
             settings=settings,
             pi_agent_client=pi_agent_client,
             worker_id="worker-1",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
 
     assert processed is not None

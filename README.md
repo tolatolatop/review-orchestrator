@@ -51,6 +51,12 @@ GitCode, and other providers is documented in
 also available at
 [`docs/platform-extension_zh.md`](docs/platform-extension_zh.md).
 
+API and worker processes share one capability-aware provider plugin registry.
+Set `PROVIDERS_ENABLED=gitlab` for a GitLab-only deployment; GitHub clients and
+credentials are not initialized in that mode. Installed third-party plugins can
+register through the `review_orchestrator.providers` Python entry-point group,
+so adding a platform does not require application, worker, or workspace changes.
+
 Default database:
 
 ```text
@@ -292,8 +298,11 @@ Prepare a workspace:
 ```
 
 When GitHub App authentication is configured, the service obtains checkout
-credentials automatically. `auth.token_ref` remains available only for the
-legacy static-token mode.
+credentials automatically. Worker-created workspaces resolve their clone URL
+and credentials through the task's provider adapter; GitLab uses
+`GITLAB_API_BASE_URL` and `GITLAB_API_TOKEN`, including for self-hosted and
+private repositories. `auth.token_ref` remains available only for the legacy
+static-token mode.
 
 The response returns `workspace_path`, `base_sha`, and `head_sha`. Callers can run
 their own diff commands from that path:

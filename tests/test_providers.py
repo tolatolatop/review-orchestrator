@@ -5,15 +5,21 @@ import pytest
 from fastapi.testclient import TestClient
 
 from review_orchestrator.config import Settings
-from review_orchestrator.github import GitHubAdapter, GitHubClientError
+from review_orchestrator.github import (
+    GitHubAdapter,
+    GitHubClientError,
+    github_clone_url,
+)
 from review_orchestrator.gitlab import (
     GitLabAdapter,
     GitLabClientError,
+    gitlab_clone_url,
     normalize_gitlab_event,
 )
 from review_orchestrator.main import create_app
 from review_orchestrator.models import AgentTask, ReviewRun
 from review_orchestrator.providers import (
+    LineCommentsCapability,
     ProviderCapabilityError,
     ProviderOperationError,
     ProviderRegistry,
@@ -21,6 +27,12 @@ from review_orchestrator.providers import (
 
 
 class FakeGitHubAdapterClient:
+    api_base_url = "https://github.example/api/v3"
+
+    async def get_token(self, repo_full_name: str) -> str:
+        del repo_full_name
+        return "github-token"
+
     async def get_pull_request(
         self,
         repo_full_name: str,
@@ -61,6 +73,9 @@ class FakeGitHubAdapterClient:
 
 
 class FakeGitLabAdapterClient:
+    api_base_url = "https://gitlab.example/api/v4"
+    token = "gitlab-token"
+
     async def get_merge_request(
         self,
         project_path: str,
@@ -224,6 +239,37 @@ async def test_gitlab_adapter_maps_context_and_changed_files() -> None:
     assert [(item.path, item.commentable_lines) for item in changed_files] == [
         ("src/gitlab.py", {4})
     ]
+
+
+async def test_adapters_resolve_provider_specific_workspace_checkout() -> None:
+    github = await GitHubAdapter(FakeGitHubAdapterClient()).get_workspace_checkout(
+        "example/repo"
+    )
+    gitlab = await GitLabAdapter(FakeGitLabAdapterClient()).get_workspace_checkout(
+        "group/repo"
+    )
+
+    assert github.clone_url == "https://github.example/example/repo.git"
+    assert github.auth_token == "github-token"
+    assert github.auth_username == "x-access-token"
+    assert gitlab.clone_url == "https://gitlab.example/group/repo.git"
+    assert gitlab.auth_token == "gitlab-token"
+    assert gitlab.auth_username == "oauth2"
+
+
+def test_clone_urls_follow_configured_platform_instances() -> None:
+    assert github_clone_url("https://api.github.com", "example/repo") == (
+        "https://github.com/example/repo.git"
+    )
+    assert github_clone_url("https://github.example/api/v3", "example/repo") == (
+        "https://github.example/example/repo.git"
+    )
+    assert gitlab_clone_url("https://gitlab.com/api/v4", "group/repo") == (
+        "https://gitlab.com/group/repo.git"
+    )
+    assert gitlab_clone_url("https://code.example/gitlab/api/v4", "group/repo") == (
+        "https://code.example/gitlab/group/repo.git"
+    )
 
 
 async def test_adapters_delegate_comment_publishing(monkeypatch) -> None:
@@ -406,6 +452,16 @@ def test_provider_registry_resolves_registered_adapter() -> None:
     assert registry.get("unknown") is None
     with pytest.raises(KeyError, match="unknown"):
         registry.require("unknown")
+
+    assert registry.capability("gitlab", LineCommentsCapability) is None
+    with pytest.raises(ProviderCapabilityError) as capability_error:
+        registry.require_capability(
+            "gitlab",
+            LineCommentsCapability,
+            operation="publish_line_comments",
+        )
+    assert capability_error.value.provider == "gitlab"
+    assert capability_error.value.operation == "publish_line_comments"
 
 
 def test_gitlab_webhook_creates_review_run(tmp_path: Path) -> None:

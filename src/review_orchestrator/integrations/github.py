@@ -9,6 +9,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict
@@ -29,6 +30,8 @@ from review_orchestrator.integrations.providers import (
     ProviderSignatureError,
     ProviderWebhookError,
     ProviderWebhookEvent,
+    ProviderWorkspaceCheckout,
+    PullRequestSnapshot,
     lower_headers,
 )
 
@@ -69,6 +72,7 @@ class NormalizedGitHubEvent:
     should_create_agent_task: bool
     status: str
     agent_command: AgentCommand | None = None
+    pull_request: PullRequestSnapshot | None = None
 
     def to_provider_event(self) -> ProviderWebhookEvent:
         return ProviderWebhookEvent(
@@ -84,14 +88,23 @@ class NormalizedGitHubEvent:
             should_create_agent_task=self.should_create_agent_task,
             status=self.status,
             agent_command=self.agent_command,
+            pull_request=self.pull_request,
         )
 
 
 class GitHubAdapter:
     provider = "github"
 
-    def __init__(self, client: GitHubClient | None = None) -> None:
+    def __init__(
+        self,
+        client: GitHubClient | None = None,
+        *,
+        settings: Settings | None = None,
+        diagnostics_transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         self.client = client
+        self.settings = settings
+        self.diagnostics_transport = diagnostics_transport
 
     def parse_webhook(
         self,
@@ -151,6 +164,28 @@ class GitHubAdapter:
         except GitHubClientError as exc:
             raise self._operation_error(operation, exc) from exc
         return context_from_pull_request_task(task, pull_request)
+
+    async def get_workspace_checkout(
+        self,
+        repo_full_name: str,
+        *,
+        clone_url: str | None = None,
+    ) -> ProviderWorkspaceCheckout:
+        operation = "get_workspace_checkout"
+        client = self._require_client(operation)
+        try:
+            token = await client.get_token(repo_full_name)
+        except GitHubClientError as exc:
+            raise self._operation_error(operation, exc) from exc
+        return ProviderWorkspaceCheckout(
+            clone_url=clone_url
+            or github_clone_url(
+                getattr(client, "api_base_url", "https://api.github.com"),
+                repo_full_name,
+            ),
+            auth_token=token,
+            auth_username="x-access-token",
+        )
 
     async def list_changed_files(
         self,
@@ -238,6 +273,43 @@ class GitHubAdapter:
         except GitHubClientError as exc:
             raise self._operation_error(operation, exc) from exc
 
+    async def diagnose_permissions(self, payload: Any) -> Any:
+        operation = "diagnose_permissions"
+        client = self._require_client(operation)
+        if self.settings is None:
+            raise ProviderCapabilityError(
+                "GitHub diagnostics settings are not configured.",
+                provider=self.provider,
+                operation=operation,
+            )
+        from review_orchestrator.integrations.platform_diagnostics import (
+            diagnose_github_permissions,
+        )
+
+        return await diagnose_github_permissions(
+            self.settings,
+            payload,
+            transport=self.diagnostics_transport,
+            github_client=client,
+        )
+
+    def agent_task_comment_url(self, task: AgentTask) -> str | None:
+        if not task.response_comment_id:
+            return None
+        api_base_url = getattr(
+            self.client,
+            "api_base_url",
+            "https://api.github.com",
+        )
+        repository_url = github_clone_url(
+            api_base_url,
+            task.repo_full_name,
+        ).removesuffix(".git")
+        return (
+            f"{repository_url}/pull/{task.pull_request_number}"
+            f"#issuecomment-{task.response_comment_id}"
+        )
+
     def _require_client(self, operation: str) -> GitHubClient:
         if self.client is None:
             raise ProviderCapabilityError(
@@ -261,6 +333,17 @@ class GitHubAdapter:
 
 class GitHubClientError(RuntimeError):
     pass
+
+
+def github_clone_url(api_base_url: str, repo_full_name: str) -> str:
+    parsed = urlsplit(api_base_url)
+    if parsed.hostname == "api.github.com":
+        return f"https://github.com/{repo_full_name}.git"
+    path = parsed.path.rstrip("/")
+    if path.endswith("/api/v3"):
+        path = path[: -len("/api/v3")]
+    origin = urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
+    return f"{origin}/{repo_full_name}.git"
 
 
 class GitHubComment(BaseModel):
@@ -691,6 +774,11 @@ def _normalize_pull_request_event(
     if action == "closed" and _pull_request_merged(payload):
         internal_event = "pr_merged"
 
+    snapshot = github_pull_request_snapshot(payload)
+    if internal_event is not None and snapshot is None:
+        raise GitHubPayloadError(
+            "GitHub pull_request payload is missing PR identity fields."
+        )
     status = "received" if internal_event else "ignored"
     return NormalizedGitHubEvent(
         provider_event="pull_request",
@@ -703,6 +791,7 @@ def _normalize_pull_request_event(
         should_create_review_run=action in REVIEW_RUN_ACTIONS,
         should_create_agent_task=False,
         status=status,
+        pull_request=snapshot,
     )
 
 
@@ -755,6 +844,47 @@ def _repository_name(payload: dict[str, Any]) -> str | None:
     if not isinstance(repository, dict):
         return None
     return _optional_str(repository.get("full_name"))
+
+
+def github_pull_request_snapshot(
+    payload: dict[str, Any],
+) -> PullRequestSnapshot | None:
+    """Normalize the complete GitHub PR payload at the integration boundary."""
+
+    pull_request = payload.get("pull_request")
+    repository = payload.get("repository")
+    if not isinstance(pull_request, dict) or not isinstance(repository, dict):
+        return None
+    repository_name = _optional_str(repository.get("full_name"))
+    number = pull_request.get("number")
+    head_sha = _pull_request_head_sha(payload)
+    if not repository_name or not isinstance(number, int) or not head_sha:
+        return None
+    base = pull_request.get("base")
+    head = pull_request.get("head")
+    base_repo = base.get("repo") if isinstance(base, dict) else None
+    head_repo = head.get("repo") if isinstance(head, dict) else None
+    status = "merged" if pull_request.get("merged") is True else (
+        _optional_str(pull_request.get("state")) or "open"
+    )
+    return PullRequestSnapshot(
+        repository=repository_name,
+        number=number,
+        head_sha=head_sha,
+        provider_repo_id=_id_to_str(repository.get("id")),
+        provider_pr_id=_id_to_str(pull_request.get("id")),
+        title=_optional_str(pull_request.get("title")),
+        author_login=_login(pull_request.get("user")),
+        base_ref=_ref(base),
+        base_sha=_sha(base),
+        head_ref=_ref(head),
+        base_repo_full_name=_repo_full_name(base_repo),
+        head_repo_full_name=_repo_full_name(head_repo),
+        status=status,
+        html_url=_optional_str(pull_request.get("html_url")),
+        closed_at=parse_github_datetime(pull_request.get("closed_at")),
+        merged_at=parse_github_datetime(pull_request.get("merged_at")),
+    )
 
 
 def _pull_request_number(payload: dict[str, Any]) -> int | None:

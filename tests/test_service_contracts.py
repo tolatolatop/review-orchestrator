@@ -4,6 +4,8 @@ import pytest
 
 from review_orchestrator.config import Settings
 from review_orchestrator.db import create_engine, create_session_factory, init_models
+from review_orchestrator.github import github_pull_request_snapshot
+from review_orchestrator.gitlab import gitlab_pull_request_snapshot
 from review_orchestrator.models import ReviewCommentRef, ReviewRun
 from review_orchestrator.services import (
     _agent_task_filters,
@@ -12,13 +14,10 @@ from review_orchestrator.services import (
     _lock_state,
     _provider_event_filters,
     _provider_publishing_from_refs,
-    _pull_request_identity,
     _review_run_filters,
     _safe_error_message,
     _timeout_state,
     _worker_state,
-    create_review_run_from_github_payload,
-    create_review_run_from_provider_payload,
     get_or_create_review_config,
 )
 
@@ -145,8 +144,7 @@ def test_provider_publishing_summary_and_line_counts() -> None:
 
 
 def test_github_and_gitlab_pull_request_identity_normalization() -> None:
-    github = _pull_request_identity(
-        "github",
+    github = github_pull_request_snapshot(
         {
             "repository": {"id": 1, "full_name": "example/repo"},
             "pull_request": {
@@ -169,8 +167,7 @@ def test_github_and_gitlab_pull_request_identity_normalization() -> None:
             },
         },
     )
-    gitlab = _pull_request_identity(
-        "gitlab",
+    gitlab = gitlab_pull_request_snapshot(
         {
             "project": {"id": 3, "path_with_namespace": "group/project"},
             "user": {"name": "Bob"},
@@ -190,33 +187,35 @@ def test_github_and_gitlab_pull_request_identity_normalization() -> None:
     )
 
     assert github is not None
-    assert github["status"] == "merged"
-    assert github["author_login"] == "alice"
-    assert github["provider_repo_id"] == "1"
+    assert github.status == "merged"
+    assert github.author_login == "alice"
+    assert github.provider_repo_id == "1"
     assert gitlab is not None
-    assert gitlab["repository"] == "group/project"
-    assert gitlab["head_sha"] == "d" * 40
-    assert gitlab["author_login"] == "Bob"
+    assert gitlab.repository == "group/project"
+    assert gitlab.head_sha == "d" * 40
+    assert gitlab.author_login == "Bob"
 
 
 @pytest.mark.parametrize(
-    ("provider", "payload"),
+    ("normalizer", "payload"),
     [
-        ("github", {}),
-        ("github", {"repository": {}, "pull_request": {"number": 1}}),
-        ("gitlab", {}),
+        (github_pull_request_snapshot, {}),
         (
-            "gitlab",
+            github_pull_request_snapshot,
+            {"repository": {}, "pull_request": {"number": 1}},
+        ),
+        (gitlab_pull_request_snapshot, {}),
+        (
+            gitlab_pull_request_snapshot,
             {"project": {"path_with_namespace": "group/repo"}, "object_attributes": {}},
         ),
-        ("unknown", {}),
     ],
 )
 def test_incomplete_provider_payloads_have_no_identity(
-    provider: str,
+    normalizer,
     payload: dict,
 ) -> None:
-    assert _pull_request_identity(provider, payload) is None
+    assert normalizer(payload) is None
 
 
 def test_coalesce_keys_separate_review_heads_from_lifecycle_events() -> None:
@@ -279,22 +278,6 @@ def test_safe_error_and_finding_count_helpers() -> None:
         object(),
     ]
     assert _finding_count_by_severity(findings) == {"high": 2, "unknown": 1}
-
-
-async def test_invalid_provider_payloads_fail_before_database_access() -> None:
-    with pytest.raises(ValueError, match="required objects"):
-        await create_review_run_from_github_payload(None, {})  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="identity fields"):
-        await create_review_run_from_github_payload(  # type: ignore[arg-type]
-            None,
-            {"repository": {}, "pull_request": {}},
-        )
-    with pytest.raises(ValueError, match="identity fields"):
-        await create_review_run_from_provider_payload(  # type: ignore[arg-type]
-            None,
-            "unknown",
-            {},
-        )
 
 
 async def test_review_config_get_or_create_is_idempotent(tmp_path) -> None:

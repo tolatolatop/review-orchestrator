@@ -35,12 +35,12 @@ GitHub 支持当前覆盖：
   和认证设置。
 - Workspace clone URL 和凭据准备仍包含 worker adapter 操作之外的 provider-aware
   行为。
-- GitHub 支持 line comment；GitLab 当前返回 summary-only 统计。
+- GitHub 声明 line-comment 能力；GitLab 不声明该能力，只发布 summary。
 - Review thread resolve 和 provider-specific rate-limit backoff 尚未进入最小
   adapter 契约。
 
-不要在第二个平台证明需求之前就重命名或泛化所有 GitHub 代码。应该添加能让下一个
-provider 复用内部契约的最小 adapter surface。
+核心现在按能力协议路由。平台只实现自己支持的操作；缺失必需能力会明确失败，缺失
+可选行评论能力则记录 summary-only 降级告警。
 
 ## Provider 边界
 
@@ -68,14 +68,15 @@ Orchestrator core 负责共享行为：
 - Review result schema 校验和 fingerprint 生成。
 - 对无法发布为 line comment 的 finding 执行 summary-only 降级。
 
-## Adapter 契约
+## 插件与能力契约
 
-新 review-triggering provider 的最小 adapter 契约是：
+`ProviderAdapter` 只提供稳定的平台键，具体操作拆分成独立、可运行时检查的协议：
 
 ```python
 class ProviderAdapter(Protocol):
     provider: str
 
+class WebhookCapability(ProviderAdapter, Protocol):
     def parse_webhook(
         self,
         *,
@@ -84,16 +85,24 @@ class ProviderAdapter(Protocol):
         settings: Settings,
     ) -> ParsedProviderWebhook: ...
 
+class WorkspaceCheckoutCapability(ProviderAdapter, Protocol):
+    async def get_workspace_checkout(
+        self, repo_full_name: str, *, clone_url: str | None = None
+    ) -> ProviderWorkspaceCheckout: ...
+
+class PullRequestCapability(ProviderAdapter, Protocol):
     async def get_pull_request_context(
         self,
         task: AgentTask,
     ) -> PullRequestContext | None: ...
 
+class ChangedFilesCapability(ProviderAdapter, Protocol):
     async def list_changed_files(
         self,
         review_run: ReviewRun,
     ) -> list[ChangedFile]: ...
 
+class ReviewSummaryCapability(ProviderAdapter, Protocol):
     async def publish_summary_comment(
         self,
         session: AsyncSession,
@@ -103,6 +112,7 @@ class ProviderAdapter(Protocol):
         finding_stats: dict[str, int] | None = None,
     ) -> ReviewCommentRef | None: ...
 
+class LineCommentsCapability(ProviderAdapter, Protocol):
     async def publish_line_comments(
         self,
         session: AsyncSession,
@@ -112,24 +122,44 @@ class ProviderAdapter(Protocol):
     ) -> dict[str, int]: ...
 ```
 
-`parse_webhook` 由 API registry 用于 webhook 接入。Worker 侧也通过同一个
-adapter 对象完成 PR context hydration、changed-file lookup、summary
-发布和 line comment 发布。暂不支持 line comment 的 provider 应让
-`publish_line_comments` 返回全零统计，并保持该 provider 的
-`ReviewConfig.line_comments_enabled` 关闭。
+另外还有 AgentTask 评论、权限诊断和资源链接等可选协议。Registry 通过
+`capability()` 和 `require_capability()` 查询能力，应用层不再用 `hasattr` 猜测。
 
-Worker 启动时应只构造一次持有 client 的 registry，并在 task 处理、review 处理和
-timeout 扫描中复用。操作未配置时，adapter 抛出 `ProviderCapabilityError`；平台
-client 或 SDK 失败时，adapter 将其转换成带有 `provider` 和 `operation` 属性的
-`ProviderOperationError`。Worker 只处理共享的 `ProviderError` 边界，不应导入
-平台专属的 client error。
+Webhook adapter 必须为触发 review 的事件附带完整 `PullRequestSnapshot`。业务服务
+只持久化归一化快照，不读取平台 Payload 路径，因此接入新平台不需要修改
+`services.py`。
+
+插件负责构造及生命周期：
+
+```python
+class ProviderPlugin(Protocol):
+    provider: str
+    kind: str
+    display_name: str
+
+    def build(self, context: ProviderBuildContext) -> ProviderRuntime: ...
+```
+
+API 和 Worker 都调用 `create_provider_registry(settings)`。只有
+`PROVIDERS_ENABLED` 中的插件会被构造；设置为 `gitlab` 时不会创建或校验 GitHub。
+`ProviderRegistry.aclose()` 统一关闭插件拥有的 Client。
+
+外部包可以直接注册，无需修改本仓库：
+
+```toml
+[project.entry-points."review_orchestrator.providers"]
+forge = "company_forge.plugin:ForgePlugin"
+```
+
+缺失必需操作时 adapter 抛出 `ProviderCapabilityError`；平台 SDK 失败统一转换为带
+`provider` 和 `operation` 属性的 `ProviderOperationError`。
 
 无论外部平台使用什么术语，内部都使用这些数据形状：
 
 | 内部形状 | 必需字段 | 说明 |
 | --- | --- | --- |
-| `ProviderWebhookEvent` | `provider`, `delivery_id`, `provider_event`, `provider_action`, `internal_event`, `repository`, `pull_request_number`, `head_sha`, `status`, `raw_payload` | `pull_request_number` 也用于 GitLab merge request 和 Azure pull request。优先存储稳定的人类可见 MR/PR 编号。 |
-| `ProviderPullRequestContext` | `provider`, `repo_full_name`, `pull_request_number`, `base_sha`, `head_sha`, `base_ref`, `head_ref`, `author_login`, `html_url`, `status`, `is_fork` | 当平台存在与 PR/MR number 不同的不透明 ID 时，保存在 `provider_pr_id`。 |
+| `ProviderWebhookEvent` | 事件标识、内部动作标志、可选 `pull_request` | 原始 Payload 只用于审计；核心编排使用归一化字段。 |
+| `PullRequestSnapshot` | 仓库、编号、head SHA、refs、作者、状态和 URL | 不透明的平台仓库/PR ID 仍分别保存。 |
 | `ProviderChangedFile` | `path`, `status`, `patch`, `commentable_lines`, `provider_position` | `commentable_lines` 是 orchestrator 面向内部的发布门禁。`provider_position` 可保存 GitLab diff position 或 Azure thread context。 |
 | `ProviderCommentRef` | `provider_comment_id`, `provider_thread_id`, `comment_type`, `status` | 外部 ID 按字符串保存，不要假设它们是 GitHub 数字 ID。 |
 
