@@ -23,7 +23,16 @@ from review_orchestrator.integrations.github_auth import (
 )
 from review_orchestrator.integrations.providers import (
     AgentCommand,
+    CommentPublishItem,
+    CommentPublishRequest,
+    CommentPublishResult,
+    Credential,
+    GitCheckoutRequest,
+    GitCheckoutTarget,
+    NormalizedWebhook,
     ParsedProviderWebhook,
+    PlatformQueryRequest,
+    PlatformQueryResult,
     ProviderCapabilityError,
     ProviderOperationError,
     ProviderPayloadError,
@@ -31,6 +40,7 @@ from review_orchestrator.integrations.providers import (
     ProviderWebhookError,
     ProviderWebhookEvent,
     ProviderWorkspaceCheckout,
+    PublishedComment,
     PullRequestSnapshot,
     lower_headers,
 )
@@ -92,19 +102,250 @@ class NormalizedGitHubEvent:
         )
 
 
-class GitHubAdapter:
+class GitHubPlatform:
+    """Owns GitHub credentials, native API access, and client lifecycle."""
+
+    key = "github"
+
+    def __init__(
+        self,
+        client: GitHubClient | None,
+        config: Settings | None = None,
+        *,
+        diagnostics_transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self.client = client
+        self.config = config
+        self.diagnostics_transport = diagnostics_transport
+
+    async def get_credential(self, target: str, scope: str) -> Credential:
+        if scope == "webhook":
+            secret = getattr(self.config, "github_webhook_secret", None)
+            return Credential(value=secret or "")
+        if scope not in {"git:read", "comment:write", "query:read"}:
+            raise ProviderCapabilityError(
+                f"GitHub does not support credential scope {scope!r}.",
+                provider=self.key,
+                operation="get_credential",
+            )
+        client = self.require_client("get_credential")
+        try:
+            token = await client.get_token(target)
+        except GitHubClientError as exc:
+            message = _safe_platform_error(exc)
+            exc.args = (message,)
+            raise ProviderOperationError(
+                message,
+                provider=self.key,
+                operation="get_credential",
+            ) from exc
+        return Credential(
+            value=token or "",
+            username="x-access-token",
+        )
+
+    async def aclose(self) -> None:
+        if self.client is not None and hasattr(self.client, "aclose"):
+            await self.client.aclose()
+
+    def require_client(self, operation: str) -> GitHubClient:
+        if self.client is None:
+            raise ProviderCapabilityError(
+                "GitHub client is not configured.",
+                provider=self.key,
+                operation=operation,
+            )
+        return self.client
+
+    def clone_url(self, repository: str) -> str:
+        client = self.require_client("resolve_git_checkout")
+        return github_clone_url(
+            getattr(client, "api_base_url", "https://api.github.com"),
+            repository,
+        )
+
+    async def get_pull_request(self, repository: str, number: int) -> dict[str, Any]:
+        return await self.require_client("pull_request.get").get_pull_request(
+            repository,
+            number,
+        )
+
+    async def list_pull_request_files(
+        self, repository: str, number: int
+    ) -> list[dict[str, Any]]:
+        return await self.require_client(
+            "pull_request.changes.list"
+        ).list_pull_request_files(repository, number)
+
+    async def list_pull_request_comments(
+        self, repository: str, number: int
+    ) -> list[dict[str, Any]]:
+        client = self.require_client("pull_request.comments.list")
+        issue_comments = await client.list_issue_comments(repository, number)
+        review_comments = await client.list_review_comments(repository, number)
+        comments = [*issue_comments, *review_comments]
+        return [
+            comment.model_dump(mode="json")
+            if isinstance(comment, BaseModel)
+            else dict(comment)
+            for comment in comments
+        ]
+
+    async def publish_comment(
+        self,
+        repository: str,
+        number: int,
+        item: CommentPublishItem,
+    ) -> str:
+        client = self.require_client("publish_comments")
+        body = _idempotent_comment_body(item.body, item.idempotency_key)
+        comment_id = item.comment_id or item.thread_id
+        if comment_id is None and item.idempotency_key:
+            marker = _idempotency_marker(item.idempotency_key)
+            comments = (
+                await client.list_review_comments(repository, number)
+                if item.kind == "line"
+                else await client.list_issue_comments(repository, number)
+            )
+            comment_id = next(
+                (
+                    str(comment.id)
+                    for comment in comments
+                    if marker in (comment.body or "")
+                ),
+                None,
+            )
+        if item.kind == "line":
+            if comment_id is not None:
+                return await client.update_review_comment(
+                    repository,
+                    comment_id,
+                    body,
+                )
+            assert item.path is not None
+            assert item.line is not None
+            assert item.commit_sha is not None
+            return await client.create_review_comment(
+                repository,
+                number,
+                body=body,
+                commit_id=item.commit_sha,
+                path=item.path,
+                line=item.line,
+            )
+        if comment_id is not None:
+            return await client.update_issue_comment(repository, comment_id, body)
+        return await client.create_issue_comment(repository, number, body)
+
+    async def publish_summary_comment(
+        self,
+        session: AsyncSession,
+        review_run: ReviewRun,
+        *,
+        status_text: str,
+        finding_stats: dict[str, int] | None,
+    ) -> ReviewCommentRef | None:
+        from review_orchestrator.integrations.comments import (
+            publish_github_summary_comment,
+        )
+
+        return await publish_github_summary_comment(
+            session,
+            review_run,
+            github_client=self.require_client("publish_summary_comment"),
+            status_text=status_text,
+            finding_stats=finding_stats,
+        )
+
+    async def publish_line_comments(
+        self,
+        session: AsyncSession,
+        review_run: ReviewRun,
+        *,
+        changed_files: list[ChangedFile],
+    ) -> dict[str, int]:
+        from review_orchestrator.integrations.comments import (
+            publish_github_line_comments,
+        )
+
+        return await publish_github_line_comments(
+            session,
+            review_run,
+            github_client=self.require_client("publish_line_comments"),
+            changed_files=changed_files,
+        )
+
+    async def publish_agent_task_comment(
+        self,
+        session: AsyncSession,
+        task: AgentTask,
+        *,
+        state: str,
+    ) -> str:
+        from review_orchestrator.integrations.comments import (
+            publish_github_agent_task_comment,
+        )
+
+        return await publish_github_agent_task_comment(
+            session,
+            task,
+            github_client=self.require_client("publish_agent_task_comment"),
+            state=state,
+        )
+
+    async def diagnose_permissions(self, payload: Any) -> Any:
+        if self.config is None:
+            raise ProviderCapabilityError(
+                "GitHub diagnostics settings are not configured.",
+                provider=self.key,
+                operation="diagnose_permissions",
+            )
+        from review_orchestrator.integrations.platform_diagnostics import (
+            diagnose_github_permissions,
+        )
+
+        return await diagnose_github_permissions(
+            self.config,
+            payload,
+            transport=self.diagnostics_transport,
+            github_client=self.require_client("diagnose_permissions"),
+        )
+
+
+class GitHubProvider:
+    """Converts GitHub-native protocols into provider-neutral contracts."""
+
+    key = "github"
     provider = "github"
 
     def __init__(
         self,
-        client: GitHubClient | None = None,
+        platform: GitHubPlatform | GitHubClient | None = None,
         *,
         settings: Settings | None = None,
         diagnostics_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        self.client = client
-        self.settings = settings
-        self.diagnostics_transport = diagnostics_transport
+        self.platform = (
+            platform
+            if isinstance(platform, GitHubPlatform)
+            else GitHubPlatform(
+                platform,
+                settings,
+                diagnostics_transport=diagnostics_transport,
+            )
+        )
+
+    @property
+    def client(self) -> GitHubClient | None:
+        return self.platform.client
+
+    @property
+    def settings(self) -> Settings | None:
+        return self.platform.config
+
+    @property
+    def diagnostics_transport(self) -> httpx.AsyncBaseTransport | None:
+        return self.platform.diagnostics_transport
 
     def parse_webhook(
         self,
@@ -113,41 +354,148 @@ class GitHubAdapter:
         raw_body: bytes,
         settings: Settings,
     ) -> ParsedProviderWebhook:
-        normalized_headers = lower_headers(headers)
-        delivery_id = normalized_headers.get("x-github-delivery")
-        provider_event = normalized_headers.get("x-github-event")
-        if not delivery_id:
-            raise GitHubPayloadError("Missing X-GitHub-Delivery header.")
-        if not provider_event:
-            raise GitHubPayloadError("Missing X-GitHub-Event header.")
-
-        verify_signature(
-            raw_body,
-            normalized_headers.get("x-hub-signature-256"),
-            getattr(settings, "github_webhook_secret", None),
-        )
-        payload = parse_json_body(raw_body)
-        normalized_event = normalize_github_event(
-            provider_event,
-            payload,
-            bot_login=getattr(settings, "review_bot_login", None),
-            command_enabled=getattr(settings, "agent_command_enabled", True),
-            allowed_associations={
-                item.strip().upper()
-                for item in getattr(
-                    settings,
-                    "agent_task_allowed_associations",
-                    "OWNER,MEMBER,COLLABORATOR",
-                ).split(",")
-                if item.strip()
-            },
-            max_command_chars=getattr(settings, "agent_task_max_command_chars", 8000),
-        )
-        return ParsedProviderWebhook(
-            delivery_id=delivery_id,
-            provider_event=normalized_event.to_provider_event(),
-            payload=payload,
+        return _parse_github_webhook(
+            headers=headers,
             raw_body=raw_body,
+            settings=settings,
+            webhook_secret=getattr(settings, "github_webhook_secret", None),
+        )
+
+    async def normalize_webhook(
+        self,
+        headers: dict[str, str],
+        raw_body: bytes,
+    ) -> NormalizedWebhook:
+        credential = await self.platform.get_credential("", "webhook")
+        parsed = _parse_github_webhook(
+            headers=headers,
+            raw_body=raw_body,
+            settings=self.platform.config,
+            webhook_secret=credential.value or None,
+        )
+        return NormalizedWebhook(
+            delivery_id=parsed.delivery_id,
+            provider_event=parsed.provider_event,
+            payload=parsed.payload,
+        )
+
+    async def resolve_git_checkout(
+        self,
+        request: GitCheckoutRequest,
+    ) -> GitCheckoutTarget:
+        credential = await self.platform.get_credential(
+            request.repository,
+            "git:read",
+        )
+        return GitCheckoutTarget(
+            remote_url=request.clone_url or self.platform.clone_url(request.repository),
+            username=credential.username,
+            password=credential.value or None,
+            expires_at=credential.expires_at,
+        )
+
+    async def publish_comments(
+        self,
+        request: CommentPublishRequest,
+    ) -> CommentPublishResult:
+        await self.platform.get_credential(request.repository, "comment:write")
+        results: list[PublishedComment] = []
+        for item in request.comments:
+            try:
+                comment_id = await self.platform.publish_comment(
+                    request.repository,
+                    request.pull_request_number,
+                    item,
+                )
+                results.append(
+                    PublishedComment(
+                        kind=item.kind,
+                        comment_id=comment_id,
+                        thread_id=comment_id if item.kind == "line" else None,
+                        url=self._comment_url(
+                            request.repository,
+                            request.pull_request_number,
+                            comment_id,
+                            item.kind,
+                        ),
+                    )
+                )
+            except GitHubClientError as exc:
+                results.append(
+                    PublishedComment(
+                        kind=item.kind,
+                        error=_safe_platform_error(exc),
+                    )
+                )
+        failed = sum(item.error is not None for item in results)
+        return CommentPublishResult(
+            comments=tuple(results),
+            published=len(results) - failed,
+            failed=failed,
+        )
+
+    async def query(self, request: PlatformQueryRequest) -> PlatformQueryResult:
+        await self.platform.get_credential(request.repository, "query:read")
+        try:
+            if request.action == "pull_request.get":
+                pull_request = await self.platform.get_pull_request(
+                    request.repository,
+                    request.pull_request_number,
+                )
+                return PlatformQueryResult(
+                    action=request.action,
+                    data=_github_query_pull_request(
+                        request.repository,
+                        request.pull_request_number,
+                        pull_request,
+                    ),
+                )
+            if request.action == "pull_request.status.get":
+                pull_request = await self.platform.get_pull_request(
+                    request.repository,
+                    request.pull_request_number,
+                )
+                return PlatformQueryResult(
+                    action=request.action,
+                    data={
+                        "status": (
+                            "merged"
+                            if pull_request.get("merged")
+                            else pull_request.get("state")
+                        ),
+                        "state": pull_request.get("state"),
+                        "merged": bool(pull_request.get("merged")),
+                        "head_sha": _sha(pull_request.get("head")),
+                    },
+                )
+            if request.action == "pull_request.changes.list":
+                items = await self.platform.list_pull_request_files(
+                    request.repository,
+                    request.pull_request_number,
+                )
+            elif request.action == "pull_request.comments.list":
+                items = await self.platform.list_pull_request_comments(
+                    request.repository,
+                    request.pull_request_number,
+                )
+            else:
+                raise ProviderCapabilityError(
+                    f"Unsupported query action: {request.action}",
+                    provider=self.provider,
+                    operation="query",
+                )
+        except GitHubClientError as exc:
+            raise self._operation_error(request.action, exc) from exc
+        page, next_cursor = _query_page(items, request.cursor, request.page_size)
+        converter = (
+            _github_query_change
+            if request.action == "pull_request.changes.list"
+            else _github_query_comment
+        )
+        return PlatformQueryResult(
+            action=request.action,
+            items=tuple(converter(item) for item in page),
+            next_cursor=next_cursor,
         )
 
     async def get_pull_request_context(
@@ -155,9 +503,8 @@ class GitHubAdapter:
         task: AgentTask,
     ) -> PullRequestContext:
         operation = "get_pull_request_context"
-        client = self._require_client(operation)
         try:
-            pull_request = await client.get_pull_request(
+            pull_request = await self.platform.get_pull_request(
                 task.repo_full_name,
                 task.pull_request_number,
             )
@@ -171,20 +518,13 @@ class GitHubAdapter:
         *,
         clone_url: str | None = None,
     ) -> ProviderWorkspaceCheckout:
-        operation = "get_workspace_checkout"
-        client = self._require_client(operation)
-        try:
-            token = await client.get_token(repo_full_name)
-        except GitHubClientError as exc:
-            raise self._operation_error(operation, exc) from exc
+        resolved = await self.resolve_git_checkout(
+            GitCheckoutRequest(repository=repo_full_name, clone_url=clone_url)
+        )
         return ProviderWorkspaceCheckout(
-            clone_url=clone_url
-            or github_clone_url(
-                getattr(client, "api_base_url", "https://api.github.com"),
-                repo_full_name,
-            ),
-            auth_token=token,
-            auth_username="x-access-token",
+            clone_url=resolved.remote_url,
+            auth_token=resolved.password,
+            auth_username=resolved.username or "x-access-token",
         )
 
     async def list_changed_files(
@@ -192,10 +532,9 @@ class GitHubAdapter:
         review_run: ReviewRun,
     ) -> list[ChangedFile]:
         operation = "list_changed_files"
-        client = self._require_client(operation)
         try:
             return await fetch_changed_files(
-                client,
+                self.platform.require_client(operation),
                 repo_full_name=review_run.repo_full_name,
                 pull_request_number=review_run.pull_request_number,
             )
@@ -211,16 +550,10 @@ class GitHubAdapter:
         finding_stats: dict[str, int] | None = None,
     ) -> ReviewCommentRef | None:
         operation = "publish_summary_comment"
-        client = self._require_client(operation)
-        from review_orchestrator.integrations.comments import (
-            publish_github_summary_comment,
-        )
-
         try:
-            return await publish_github_summary_comment(
+            return await self.platform.publish_summary_comment(
                 session,
                 review_run,
-                github_client=client,
                 status_text=status_text,
                 finding_stats=finding_stats,
             )
@@ -235,16 +568,10 @@ class GitHubAdapter:
         changed_files: list[ChangedFile],
     ) -> dict[str, int]:
         operation = "publish_line_comments"
-        client = self._require_client(operation)
-        from review_orchestrator.integrations.comments import (
-            publish_github_line_comments,
-        )
-
         try:
-            return await publish_github_line_comments(
+            return await self.platform.publish_line_comments(
                 session,
                 review_run,
-                github_client=client,
                 changed_files=changed_files,
             )
         except GitHubClientError as exc:
@@ -258,77 +585,58 @@ class GitHubAdapter:
         state: str,
     ) -> str:
         operation = "publish_agent_task_comment"
-        client = self._require_client(operation)
-        from review_orchestrator.integrations.comments import (
-            publish_github_agent_task_comment,
-        )
-
         try:
-            return await publish_github_agent_task_comment(
+            return await self.platform.publish_agent_task_comment(
                 session,
                 task,
-                github_client=client,
                 state=state,
             )
         except GitHubClientError as exc:
             raise self._operation_error(operation, exc) from exc
 
     async def diagnose_permissions(self, payload: Any) -> Any:
-        operation = "diagnose_permissions"
-        client = self._require_client(operation)
-        if self.settings is None:
-            raise ProviderCapabilityError(
-                "GitHub diagnostics settings are not configured.",
-                provider=self.provider,
-                operation=operation,
-            )
-        from review_orchestrator.integrations.platform_diagnostics import (
-            diagnose_github_permissions,
-        )
-
-        return await diagnose_github_permissions(
-            self.settings,
-            payload,
-            transport=self.diagnostics_transport,
-            github_client=client,
-        )
+        return await self.platform.diagnose_permissions(payload)
 
     def agent_task_comment_url(self, task: AgentTask) -> str | None:
         if not task.response_comment_id:
             return None
-        api_base_url = getattr(
-            self.client,
-            "api_base_url",
-            "https://api.github.com",
-        )
-        repository_url = github_clone_url(
-            api_base_url,
+        return self._comment_url(
             task.repo_full_name,
-        ).removesuffix(".git")
-        return (
-            f"{repository_url}/pull/{task.pull_request_number}"
-            f"#issuecomment-{task.response_comment_id}"
+            task.pull_request_number,
+            task.response_comment_id,
+            "agent",
         )
 
+    def _comment_url(
+        self,
+        repository: str,
+        number: int,
+        comment_id: str,
+        kind: str,
+    ) -> str:
+        repository_url = self.platform.clone_url(repository).removesuffix(".git")
+        anchor = "discussion_r" if kind == "line" else "issuecomment-"
+        return f"{repository_url}/pull/{number}#{anchor}{comment_id}"
+
     def _require_client(self, operation: str) -> GitHubClient:
-        if self.client is None:
-            raise ProviderCapabilityError(
-                "GitHub client is not configured.",
-                provider=self.provider,
-                operation=operation,
-            )
-        return self.client
+        return self.platform.require_client(operation)
 
     def _operation_error(
         self,
         operation: str,
         error: GitHubClientError,
     ) -> ProviderOperationError:
+        message = _safe_platform_error(error)
+        error.args = (message,)
         return ProviderOperationError(
-            str(error),
+            message,
             provider=self.provider,
             operation=operation,
         )
+
+
+# Compatibility name retained for Worker, Workspace, and third-party callers.
+GitHubAdapter = GitHubProvider
 
 
 class GitHubClientError(RuntimeError):
@@ -417,6 +725,17 @@ class GitHubClient:
         )
         return [GitHubComment.model_validate(item) for item in items]
 
+    async def list_review_comments(
+        self,
+        repo_full_name: str,
+        pull_request_number: int,
+    ) -> list[GitHubComment]:
+        items = await self._paginate(
+            f"/repos/{repo_full_name}/pulls/{pull_request_number}/comments",
+            repo_full_name=repo_full_name,
+        )
+        return [GitHubComment.model_validate(item) for item in items]
+
     async def create_issue_comment(
         self,
         repo_full_name: str,
@@ -469,6 +788,20 @@ class GitHubClient:
         )
         return str(response["id"])
 
+    async def update_review_comment(
+        self,
+        repo_full_name: str,
+        comment_id: str,
+        body: str,
+    ) -> str:
+        response = await self._request(
+            "PATCH",
+            f"/repos/{repo_full_name}/pulls/comments/{comment_id}",
+            repo_full_name=repo_full_name,
+            json={"body": body},
+        )
+        return str(response["id"])
+
     async def _paginate(
         self, path: str, *, repo_full_name: str | None = None
     ) -> list[dict[str, Any]]:
@@ -514,12 +847,11 @@ class GitHubClient:
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise GitHubClientError(
-                f"GitHub request failed ({exc.response.status_code} {method} {path}): "
-                f"{exc.response.text[:500]}"
+                f"GitHub request failed ({exc.response.status_code} {method} {path})."
             ) from exc
         except httpx.RequestError as exc:
             raise GitHubClientError(
-                f"GitHub request failed ({method} {path}): {exc}"
+                f"GitHub request failed ({method} {path}): transport error."
             ) from exc
         return response.json() if response.content else {}
 
@@ -549,6 +881,101 @@ def create_github_client(settings: Any) -> GitHubClient:
         token_provider=token_provider,
         timeout=settings.provider_api_timeout_seconds,
     )
+
+
+def _idempotency_marker(key: str) -> str:
+    digest = hashlib.sha256(key.encode()).hexdigest()
+    return f"<!-- review-orchestrator:{digest} -->"
+
+
+def _idempotent_comment_body(body: str, key: str | None) -> str:
+    if key is None:
+        return body
+    marker = _idempotency_marker(key)
+    return body if marker in body else f"{body}\n\n{marker}"
+
+
+def _safe_platform_error(error: Exception) -> str:
+    message = str(error).splitlines()[0][:1000]
+    return re.sub(
+        r"(?i)((?:\bbearer\s+)|(?:\b(?:private-token|token|password)\s*[:=]\s*))"
+        r"[^\s,;]+",
+        r"\1[REDACTED]",
+        message,
+    )
+
+
+def _query_page(
+    items: list[dict[str, Any]],
+    cursor: str | None,
+    page_size: int,
+) -> tuple[list[dict[str, Any]], str | None]:
+    try:
+        offset = int(cursor) if cursor is not None else 0
+    except ValueError as exc:
+        raise ProviderCapabilityError(
+            "Query cursor must be a non-negative integer.",
+            operation="query",
+        ) from exc
+    if offset < 0:
+        raise ProviderCapabilityError(
+            "Query cursor must be a non-negative integer.",
+            operation="query",
+        )
+    page = items[offset : offset + page_size]
+    next_offset = offset + len(page)
+    return page, str(next_offset) if next_offset < len(items) else None
+
+
+def _github_query_pull_request(
+    repository: str,
+    number: int,
+    pull_request: dict[str, Any],
+) -> dict[str, Any]:
+    base = pull_request.get("base")
+    head = pull_request.get("head")
+    status = "merged" if pull_request.get("merged") else pull_request.get("state")
+    return {
+        "provider": "github",
+        "repository": repository,
+        "number": pull_request.get("number", number),
+        "provider_id": _id_to_str(pull_request.get("id")),
+        "title": pull_request.get("title"),
+        "author": _login(pull_request.get("user")),
+        "status": status,
+        "url": pull_request.get("html_url"),
+        "base_ref": _ref(base),
+        "base_sha": _sha(base),
+        "head_ref": _ref(head),
+        "head_sha": _sha(head),
+    }
+
+
+def _github_query_change(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "path": item.get("filename"),
+        "previous_path": item.get("previous_filename"),
+        "status": item.get("status"),
+        "patch": item.get("patch"),
+        "additions": item.get("additions"),
+        "deletions": item.get("deletions"),
+    }
+
+
+def _github_query_comment(item: dict[str, Any]) -> dict[str, Any]:
+    user = item.get("user")
+    return {
+        "comment_id": _id_to_str(item.get("id")),
+        "thread_id": _id_to_str(item.get("pull_request_review_id")),
+        "kind": "line" if item.get("path") else "summary",
+        "body": item.get("body"),
+        "author": _login(user),
+        "url": item.get("html_url"),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+        "path": item.get("path"),
+        "line": item.get("line") or item.get("original_line"),
+    }
 
 
 async def fetch_changed_files(
@@ -635,6 +1062,51 @@ def context_from_pull_request_task(
         ),
         status=_optional_str(pull_request.get("state")) or "open",
         html_url=_optional_str(pull_request.get("html_url")),
+    )
+
+
+def _parse_github_webhook(
+    *,
+    headers: dict[str, str],
+    raw_body: bytes,
+    settings: Any | None,
+    webhook_secret: str | None,
+) -> ParsedProviderWebhook:
+    normalized_headers = lower_headers(headers)
+    delivery_id = normalized_headers.get("x-github-delivery")
+    provider_event = normalized_headers.get("x-github-event")
+    if not delivery_id:
+        raise GitHubPayloadError("Missing X-GitHub-Delivery header.")
+    if not provider_event:
+        raise GitHubPayloadError("Missing X-GitHub-Event header.")
+
+    verify_signature(
+        raw_body,
+        normalized_headers.get("x-hub-signature-256"),
+        webhook_secret,
+    )
+    payload = parse_json_body(raw_body)
+    normalized_event = normalize_github_event(
+        provider_event,
+        payload,
+        bot_login=getattr(settings, "review_bot_login", None),
+        command_enabled=getattr(settings, "agent_command_enabled", True),
+        allowed_associations={
+            item.strip().upper()
+            for item in getattr(
+                settings,
+                "agent_task_allowed_associations",
+                "OWNER,MEMBER,COLLABORATOR",
+            ).split(",")
+            if item.strip()
+        },
+        max_command_chars=getattr(settings, "agent_task_max_command_chars", 8000),
+    )
+    return ParsedProviderWebhook(
+        delivery_id=delivery_id,
+        provider_event=normalized_event.to_provider_event(),
+        payload=payload,
+        raw_body=raw_body,
     )
 
 
@@ -864,8 +1336,10 @@ def github_pull_request_snapshot(
     head = pull_request.get("head")
     base_repo = base.get("repo") if isinstance(base, dict) else None
     head_repo = head.get("repo") if isinstance(head, dict) else None
-    status = "merged" if pull_request.get("merged") is True else (
-        _optional_str(pull_request.get("state")) or "open"
+    status = (
+        "merged"
+        if pull_request.get("merged") is True
+        else (_optional_str(pull_request.get("state")) or "open")
     )
     return PullRequestSnapshot(
         repository=repository_name,

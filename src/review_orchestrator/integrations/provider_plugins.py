@@ -8,8 +8,16 @@ from importlib.metadata import entry_points
 from typing import Any, Protocol
 
 from review_orchestrator.infrastructure.config import Settings
-from review_orchestrator.integrations.github import GitHubAdapter, create_github_client
-from review_orchestrator.integrations.gitlab import GitLabAdapter, GitLabClient
+from review_orchestrator.integrations.github import (
+    GitHubPlatform,
+    GitHubProvider,
+    create_github_client,
+)
+from review_orchestrator.integrations.gitlab import (
+    GitLabClient,
+    GitLabPlatform,
+    GitLabProvider,
+)
 from review_orchestrator.integrations.providers import (
     ProviderDescriptor,
     ProviderRegistry,
@@ -42,19 +50,20 @@ class GitHubProviderPlugin:
     def build(self, context: ProviderBuildContext) -> ProviderRuntime:
         injected = context.client_overrides.get(self.provider)
         client = injected or create_github_client(context.settings)
-        adapter = GitHubAdapter(
+        platform = GitHubPlatform(
             client,
-            settings=context.settings,
+            context.settings,
             diagnostics_transport=context.diagnostics_transport,
         )
+        provider = GitHubProvider(platform)
         return ProviderRuntime(
-            adapter=adapter,
+            provider=provider,
             descriptor=ProviderDescriptor(
                 key=self.provider,
                 kind=self.kind,
                 display_name=self.display_name,
             ),
-            close=None if injected is not None else client.aclose,
+            close=None if injected is not None else platform.aclose,
         )
 
 
@@ -64,22 +73,25 @@ class GitLabProviderPlugin:
     display_name = "GitLab"
 
     def build(self, context: ProviderBuildContext) -> ProviderRuntime:
-        client = context.client_overrides.get(self.provider) or GitLabClient(
+        injected = context.client_overrides.get(self.provider)
+        client = injected or GitLabClient(
             api_base_url=context.settings.gitlab_api_base_url,
             token=context.settings.gitlab_api_token,
             timeout=context.settings.provider_api_timeout_seconds,
         )
+        platform = GitLabPlatform(
+            client,
+            context.settings,
+            diagnostics_transport=context.diagnostics_transport,
+        )
         return ProviderRuntime(
-            adapter=GitLabAdapter(
-                client,
-                settings=context.settings,
-                diagnostics_transport=context.diagnostics_transport,
-            ),
+            provider=GitLabProvider(platform),
             descriptor=ProviderDescriptor(
                 key=self.provider,
                 kind=self.kind,
                 display_name=self.display_name,
             ),
+            close=None if injected is not None else platform.aclose,
         )
 
 

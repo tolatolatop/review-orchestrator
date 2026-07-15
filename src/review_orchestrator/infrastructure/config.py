@@ -88,6 +88,12 @@ class Settings(BaseSettings):
         gt=0,
         description="HTTP timeout for GitHub and GitLab API requests.",
     )
+    provider_core_api_token: str | None = Field(
+        default=None,
+        description=(
+            "Bearer token protecting the provider-neutral /v1 Provider Core API."
+        ),
+    )
     providers_enabled: str = Field(
         default="github,gitlab",
         description=(

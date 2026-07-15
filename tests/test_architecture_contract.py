@@ -24,6 +24,10 @@ def test_public_route_inventory_survives_directory_refactors() -> None:
         ("GET", "/reviews/"),
         ("GET", "/api/v1/providers"),
         ("POST", "/api/v1/webhooks/{provider}"),
+        ("POST", "/v1/webhooks/{provider}/normalize"),
+        ("POST", "/v1/git/{provider}/resolve-checkout"),
+        ("POST", "/v1/comments/{provider}/publish"),
+        ("POST", "/v1/query/{provider}"),
         ("GET", "/api/v1/provider-events"),
         ("GET", "/api/v1/agent-tasks"),
         ("POST", "/api/v1/agent-tasks/{task_id}/cancel"),
@@ -76,9 +80,7 @@ def test_legacy_modules_are_true_aliases_of_layered_implementations() -> None:
         "review_orchestrator.platform_diagnostics": (
             "review_orchestrator.integrations.platform_diagnostics"
         ),
-        "review_orchestrator.providers": (
-            "review_orchestrator.integrations.providers"
-        ),
+        "review_orchestrator.providers": ("review_orchestrator.integrations.providers"),
         "review_orchestrator.provider_plugins": (
             "review_orchestrator.integrations.provider_plugins"
         ),

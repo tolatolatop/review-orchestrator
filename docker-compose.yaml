@@ -70,6 +70,7 @@ services:
       PI_AGENT_REVIEW_SKILL: ${PI_AGENT_REVIEW_SKILL:-code-review}
       AGENT_COMMAND_AGENT: ${AGENT_COMMAND_AGENT:-pr-assistant}
       AGENT_COMMAND_SKILL: ${AGENT_COMMAND_SKILL:-pr-assistant}
+      PROVIDER_CORE_API_TOKEN: ${PROVIDER_CORE_API_TOKEN:-}
     ports:
       - "${PORT:-8000}:8000"
     volumes:

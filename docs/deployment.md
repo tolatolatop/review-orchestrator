@@ -47,6 +47,7 @@ parameter for browser pages.
 | --- | --- | --- |
 | `DATABASE_URL` | local SQLite | SQLAlchemy async database URL. Self-host Compose supplies PostgreSQL. |
 | `PROVIDERS_ENABLED` | `github,gitlab` | Comma-separated provider plugin keys. Disabled providers are neither constructed nor validated. |
+| `PROVIDER_CORE_API_TOKEN` | empty | Bearer token for the four `/v1` Provider Core endpoints. The endpoints fail closed while unset. |
 | `WORKSPACE_ROOT` | `./.workspaces` | Configurable root used to create provider/repository/PR/head-isolated checkouts. |
 | `GIT_CACHE_ROOT` | `./.git-cache` | Bare mirror cache root. |
 | `GITHUB_WEBHOOK_SECRET` | empty | Verifies GitHub webhook signatures. Required in production. |

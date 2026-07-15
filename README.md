@@ -83,6 +83,10 @@ locally:
 - `GET /health`
 - `POST /api/v1/diagnostics/platform-permissions`
 - `POST /api/v1/webhooks/{provider}`
+- `POST /v1/webhooks/{provider}/normalize`
+- `POST /v1/git/{provider}/resolve-checkout`
+- `POST /v1/comments/{provider}/publish`
+- `POST /v1/query/{provider}`
 - `POST /api/v1/review-runs`
 - `GET /api/v1/review-runs/{review_run_id}`
 - `POST /api/v1/review-runs/{review_run_id}/session/start`
@@ -103,6 +107,14 @@ in [`docs/observability-api.md`](docs/observability-api.md).
 Secure self-host exposure, authentication boundaries, raw-payload risks, and
 the deployment verification checklist are documented in
 [`docs/observability-deployment.md`](docs/observability-deployment.md).
+
+The four `/v1` Provider Core endpoints are provider-neutral. Their request
+bodies contain a provider target and business parameters, never a GitHub,
+GitLab, or other platform credential. Configure `PROVIDER_CORE_API_TOKEN` and
+send it as `Authorization: Bearer ...`; these endpoints return `503` while the
+token is unset. Platform credentials remain inside the configured Platform
+object and are selected by the `webhook`, `git:read`, `comment:write`, or
+`query:read` scope.
 
 `POST /api/v1/review-runs` is idempotent for
 `provider + repo_full_name + pull_request_number + head_sha`. A repeated request
