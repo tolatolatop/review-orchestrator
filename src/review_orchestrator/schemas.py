@@ -294,6 +294,7 @@ class AgentTaskQueueHealth(BaseModel):
     running: int = 0
     completed: int = 0
     failed: int = 0
+    cancelled: int = 0
     oldest_queued_age_seconds: int | None = None
 
 
@@ -304,10 +305,30 @@ class AgentTaskSummary(BaseModel):
     pull_request_number: int
     task_type: str
     status: str
+    stage: str | None = None
+    source_kind: str | None = None
+    source_comment_id: str | None = None
+    source_url: str | None = None
+    source_author_login: str | None = None
+    command_text: str | None = None
+    head_sha: str | None = None
+    response_comment_id: str | None = None
+    response_comment_url: str | None = None
+    agent_session_id: str | None = None
+    agent_status: str | None = None
+    agent_provider: str | None = None
+    agent_model: str | None = None
+    agent_thinking_level: str | None = None
+    failure_code: str | None = None
     provider_event_id: str | None
     provider_event_link: str | None
     pull_request_context_link: str | None
     error_message: str | None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    deadline_at: datetime | None = None
+    soft_timeout_emitted_at: datetime | None = None
+    hard_timeout_emitted_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 

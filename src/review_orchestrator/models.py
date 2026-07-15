@@ -338,6 +338,47 @@ class AgentTask(Base):
         String(64), nullable=False, default="mention"
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    stage: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    source_kind: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_comment_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, index=True
+    )
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_author_login: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    command_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    head_sha: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    workspace_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    response_comment_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    response_body_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    response_published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    publish_attempts: Mapped[int] = mapped_column(nullable=False, default=0)
+    last_publish_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    agent_session_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, index=True
+    )
+    agent_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    agent_provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    agent_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    agent_thinking_level: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    result_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    attempt: Mapped[int] = mapped_column(nullable=False, default=1)
+    agent_start_attempts: Mapped[int] = mapped_column(nullable=False, default=0)
+    lock_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    locked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    soft_timeout_emitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    hard_timeout_emitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     input_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -378,6 +419,15 @@ class ReviewConfig(Base):
         String(128), nullable=False, default="code-review"
     )
     default_review_profile: Mapped[str] = mapped_column(
+        String(128), nullable=False, default="default"
+    )
+    agent_commands_enabled: Mapped[bool] = mapped_column(
+        nullable=False, default=True
+    )
+    default_agent_command_skill: Mapped[str] = mapped_column(
+        String(128), nullable=False, default="pr-assistant"
+    )
+    default_agent_command_profile: Mapped[str] = mapped_column(
         String(128), nullable=False, default="default"
     )
     created_at: Mapped[datetime] = mapped_column(

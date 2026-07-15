@@ -18,12 +18,21 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 const stateRoot = await mkdtemp(join(tmpdir(), "pi-agent-state-"));
+const workspaceRoot = await mkdtemp(join(tmpdir(), "pi-agent-workspaces-"));
 process.env.PI_AGENT_STATE_ROOT = stateRoot;
-const { createReviewTools, flushPersistence } = await import("../dist/server.js");
+process.env.PI_AGENT_WORKSPACE_ROOT = workspaceRoot;
+const {
+  createInstructionTools,
+  createReviewTools,
+  flushPersistence,
+  startSession,
+  validateStartRequest,
+} = await import("../dist/server.js");
 
 test.after(async () => {
   await flushPersistence();
   await rm(stateRoot, { recursive: true, force: true });
+  await rm(workspaceRoot, { recursive: true, force: true });
 });
 
 function record(workspace) {
@@ -45,6 +54,38 @@ function record(workspace) {
     model: "gpt-5.4",
     thinking_level: "high",
     skills: ["code-review"],
+    profile: "default",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    events: [],
+  };
+}
+
+function instructionRecord(workspace) {
+  return {
+    id: "instruction-session",
+    kind: "instruction",
+    idempotency_key: "agent-task:task-1:attempt:1",
+    title: "PR instruction",
+    status: "running",
+    stage: "analyzing",
+    workspace_path: workspace,
+    repository_context: {
+      provider: "github",
+      repo_full_name: "example/repo",
+      pr_number: 1,
+      base_sha: "aaaaaaaa",
+      head_sha: "bbbbbbbb",
+    },
+    instruction: {
+      text: "Explain the retry behavior.",
+      author_login: "alice",
+      history: [],
+    },
+    provider: "openai",
+    model: "gpt-5.4",
+    thinking_level: "high",
+    skills: ["pr-assistant"],
     profile: "default",
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
@@ -151,6 +192,70 @@ test("submit_review records structured output and terminates", async () => {
   }
 });
 
+test("instruction tools expose only read operations and submit_task_result", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "pi-agent-instruction-tools-"));
+  try {
+    await writeFile(join(workspace, "app.py"), "def retry():\n    return True\n", "utf8");
+    const state = instructionRecord(workspace);
+    const tools = createInstructionTools(state);
+
+    assert.deepEqual(
+      tools.map((item) => item.name),
+      ["list_files", "read_file", "search_code", "git_diff", "submit_task_result"],
+    );
+    assert.equal(tools.some((item) => item.name === "submit_review"), false);
+    assert.equal(tools.some((item) => item.name === "request_human_input"), false);
+
+    const payload = {
+      outcome: "answered",
+      answer: "The retry returns after the first successful attempt.",
+      references: [{ path: "app.py", line_start: 1, line_end: 2 }],
+    };
+    const result = await tool(tools, "submit_task_result").execute(
+      "task-result-1",
+      payload,
+      undefined,
+      undefined,
+      undefined,
+    );
+
+    assert.equal(state.status, "completed");
+    assert.equal(state.stage, "completed");
+    assert.deepEqual(state.result, payload);
+    assert.equal(result.terminate, true);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("instruction session start is idempotent for one agent task attempt", async () => {
+  const workspace = await mkdtemp(join(workspaceRoot, "task-"));
+  const request = validateStartRequest({
+    kind: "instruction",
+    idempotency_key: "agent-task:idempotent-task:attempt:1",
+    workspace_path: workspace,
+    repository_context: {
+      provider: "github",
+      repo_full_name: "example/repo",
+      pr_number: 1,
+      base_sha: "aaaaaaaa",
+      head_sha: "bbbbbbbb",
+    },
+    instruction: {
+      text: "Explain the retry.",
+      author_login: "alice",
+      history: [],
+    },
+    skills: ["pr-assistant"],
+  });
+
+  const first = await startSession(request);
+  const duplicate = await startSession(request);
+
+  assert.equal(duplicate.id, first.id);
+  assert.equal(duplicate.idempotency_key, "agent-task:idempotent-task:attempt:1");
+});
+
 test("pi SDK completes a review through submit_review", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "pi-agent-loop-"));
   try {
@@ -211,6 +316,80 @@ test("pi SDK completes a review through submit_review", async () => {
     });
 
     await session.prompt("Submit the final review.");
+
+    assert.equal(state.status, "completed");
+    assert.deepEqual(state.result, expected);
+    assert.equal(faux.state.callCount, 1);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("pi SDK completes an instruction through submit_task_result", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "pi-agent-instruction-loop-"));
+  try {
+    await writeFile(join(workspace, "app.py"), "def retry():\n    return True\n", "utf8");
+    const state = {
+      ...instructionRecord(workspace),
+      id: "sdk-instruction-session",
+      provider: "faux-instruction",
+      model: "faux-1",
+      thinking_level: "minimal",
+    };
+    const expected = {
+      outcome: "answered",
+      answer: "The retry is bounded.",
+      references: [{ path: "app.py", line_start: 1, line_end: 2 }],
+    };
+    const faux = fauxProvider({ provider: "faux-instruction" });
+    const model = faux.getModel();
+    faux.setResponses([
+      fauxAssistantMessage(
+        [fauxToolCall("submit_task_result", expected)],
+        { stopReason: "toolUse" },
+      ),
+    ]);
+
+    const authStorage = AuthStorage.inMemory();
+    const modelRegistry = ModelRegistry.inMemory(authStorage);
+    modelRegistry.registerProvider("faux-instruction", {
+      name: "Faux Instruction",
+      baseUrl: model.baseUrl,
+      api: model.api,
+      apiKey: "test-only",
+      streamSimple: faux.provider.streamSimple,
+      models: [
+        {
+          id: model.id,
+          name: model.name,
+          api: model.api,
+          baseUrl: model.baseUrl,
+          reasoning: model.reasoning,
+          input: model.input,
+          cost: model.cost,
+          contextWindow: model.contextWindow,
+          maxTokens: model.maxTokens,
+        },
+      ],
+    });
+    const tools = createInstructionTools(state);
+    const { session } = await createAgentSession({
+      cwd: workspace,
+      agentDir: workspace,
+      authStorage,
+      modelRegistry,
+      model: modelRegistry.find("faux-instruction", "faux-1"),
+      thinkingLevel: "minimal",
+      customTools: tools,
+      tools: tools.map((item) => item.name),
+      sessionManager: SessionManager.inMemory(workspace),
+      settingsManager: SettingsManager.inMemory({
+        compaction: { enabled: false },
+        retry: { enabled: false },
+      }),
+    });
+
+    await session.prompt("Answer the user command.");
 
     assert.equal(state.status, "completed");
     assert.deepEqual(state.result, expected);

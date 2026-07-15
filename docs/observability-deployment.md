@@ -121,6 +121,11 @@ Human answers and steering messages use the token-protected orchestrator
 `session/messages` endpoint. The pi-agent runtime port is loopback-only and is
 not an operator UI; do not expose it directly to untrusted networks.
 
+GitHub `@bot` message commands are separate AgentTasks. Operators inspect their
+live session through `/api/v1/agent-tasks/{task_id}/agent-session`; the worker
+creates one placeholder and updates it with completion, failure, cancellation,
+or timeout instead of exposing runtime events to GitHub.
+
 ## Verification Checklist
 
 Run these checks from outside the private service network against Nginx/ingress.

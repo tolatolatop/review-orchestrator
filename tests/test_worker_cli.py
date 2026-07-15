@@ -80,13 +80,14 @@ async def test_worker_builds_and_reuses_one_provider_registry(monkeypatch) -> No
         lambda **kwargs: gitlab_client,
     )
     monkeypatch.setattr(worker_cli, "process_review_run_timeouts", process_timeouts)
+    monkeypatch.setattr(worker_cli, "process_agent_task_timeouts", process_timeouts)
     monkeypatch.setattr(worker_cli, "process_next_agent_task", process_agent_task)
     monkeypatch.setattr(worker_cli, "process_next_review_run", process_review_run)
 
     await run_worker(settings=Settings(), once=True, worker_id="worker-test")
 
-    assert len(registries) == 3
-    assert registries[0] is registries[1] is registries[2]
+    assert len(registries) == 4
+    assert registries[0] is registries[1] is registries[2] is registries[3]
     assert registries[0].require("github").client is github_client
     assert registries[0].require("gitlab").client is gitlab_client
     assert github_client.closed is True

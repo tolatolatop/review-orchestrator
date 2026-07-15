@@ -36,6 +36,7 @@ type SessionStatus =
   | "cancelled";
 
 type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
+type SessionKind = "review" | "instruction";
 
 interface ReviewInput {
   provider: string;
@@ -47,6 +48,29 @@ interface ReviewInput {
   review_mode?: string;
 }
 
+interface RepositoryContext {
+  provider: string;
+  repo_full_name: string;
+  pr_number: number;
+  base_sha: string;
+  head_sha: string;
+}
+
+interface InstructionHistoryItem {
+  author_login: string;
+  command: string;
+  answer: string;
+  outcome: "answered" | "needs_clarification" | "refused";
+  head_sha: string;
+}
+
+interface InstructionInput {
+  text: string;
+  author_login: string;
+  source_url?: string;
+  history: InstructionHistoryItem[];
+}
+
 interface ModelSelection {
   provider?: string;
   id?: string;
@@ -55,9 +79,13 @@ interface ModelSelection {
 }
 
 interface StartSessionRequest {
+  kind: SessionKind;
+  idempotency_key?: string;
   title?: string;
   workspace_path: string;
-  review: ReviewInput;
+  review?: ReviewInput;
+  repository_context?: RepositoryContext;
+  instruction?: InstructionInput;
   model?: ModelSelection;
   skills?: string[];
   profile?: string;
@@ -85,11 +113,15 @@ interface PendingInput {
 
 interface SessionRecord {
   id: string;
+  kind: SessionKind;
+  idempotency_key?: string;
   title: string;
   status: SessionStatus;
   stage: string;
   workspace_path: string;
-  review: ReviewInput;
+  review?: ReviewInput;
+  repository_context?: RepositoryContext;
+  instruction?: InstructionInput;
   provider: string;
   model: string;
   thinking_level: ThinkingLevel;
@@ -113,6 +145,8 @@ interface PublicPendingInput {
 
 interface PublicSession {
   id: string;
+  kind: SessionKind;
+  idempotency_key?: string;
   title: string;
   status: SessionStatus;
   stage: string;
@@ -155,11 +189,13 @@ const config = {
   defaultModel: process.env.PI_AGENT_MODEL ?? "gpt-5.4",
   defaultThinking: normalizeThinking(process.env.PI_AGENT_THINKING_LEVEL ?? "high"),
   defaultSkill: process.env.PI_AGENT_REVIEW_SKILL ?? "code-review",
+  defaultInstructionSkill: process.env.PI_AGENT_COMMAND_SKILL ?? "pr-assistant",
   defaultProfile: process.env.PI_AGENT_REVIEW_PROFILE ?? "default",
   modelBaseUrl: process.env.PI_AGENT_MODEL_BASE_URL,
 };
 
 const sessions = new Map<string, SessionRecord>();
+const idempotentSessions = new Map<string, string>();
 const persistenceQueues = new Map<string, Promise<void>>();
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
@@ -195,6 +231,7 @@ function addEvent(record: SessionRecord, event: Omit<RuntimeEvent, "at">): void 
 function publicSession(record: SessionRecord): PublicSession {
   const response: PublicSession = {
     id: record.id,
+    kind: record.kind,
     title: record.title,
     status: record.status,
     stage: record.stage,
@@ -208,6 +245,9 @@ function publicSession(record: SessionRecord): PublicSession {
     updated_at: record.updated_at,
     events: record.events,
   };
+  if (record.idempotency_key !== undefined) {
+    response.idempotency_key = record.idempotency_key;
+  }
   if (record.result !== undefined) response.result = record.result;
   if (record.error !== undefined) response.error = record.error;
   if (record.session_file !== undefined) response.session_file = record.session_file;
@@ -264,16 +304,19 @@ async function loadPersistedSessions(): Promise<void> {
       const status = TERMINAL_STATUSES.has(value.status) ? value.status : "failed";
       const record: SessionRecord = {
         ...value,
+        kind: value.kind ?? "review",
         status,
-        review: {
+      };
+      if (record.kind === "review") {
+        record.review = {
           provider: "unknown",
           repo_full_name: "unknown/unknown",
           pr_number: 1,
           base_sha: "unknown",
           head_sha: "unknown",
           workspace_path: value.workspace_path,
-        },
-      };
+        };
+      }
       if (!TERMINAL_STATUSES.has(value.status)) {
         record.stage = "runtime_restarted";
         record.error = "The pi-agent runtime restarted while this session was active.";
@@ -281,6 +324,9 @@ async function loadPersistedSessions(): Promise<void> {
         await persistRecord(record);
       }
       sessions.set(record.id, record);
+      if (record.idempotency_key !== undefined) {
+        idempotentSessions.set(record.idempotency_key, record.id);
+      }
     } catch {
       // A corrupt state snapshot must not prevent other sessions from being served.
     }
@@ -300,26 +346,94 @@ function requireString(value: unknown, name: string): string {
   return value.trim();
 }
 
-function validateStartRequest(value: unknown): StartSessionRequest {
-  assertObject(value, "request");
-  assertObject(value.review, "review");
-  const workspacePath = requireString(value.workspace_path, "workspace_path");
-  const review: ReviewInput = {
-    provider: requireString(value.review.provider, "review.provider"),
-    repo_full_name: requireString(value.review.repo_full_name, "review.repo_full_name"),
-    pr_number: Number(value.review.pr_number),
-    base_sha: requireString(value.review.base_sha, "review.base_sha"),
-    head_sha: requireString(value.review.head_sha, "review.head_sha"),
-    workspace_path: workspacePath,
+function validateRepositoryContext(
+  value: unknown,
+  name: string,
+): RepositoryContext {
+  assertObject(value, name);
+  const context: RepositoryContext = {
+    provider: requireString(value.provider, `${name}.provider`),
+    repo_full_name: requireString(value.repo_full_name, `${name}.repo_full_name`),
+    pr_number: Number(value.pr_number),
+    base_sha: requireString(value.base_sha, `${name}.base_sha`),
+    head_sha: requireString(value.head_sha, `${name}.head_sha`),
   };
-  if (!Number.isInteger(review.pr_number) || review.pr_number <= 0) {
-    throw new HttpError(422, "review.pr_number must be a positive integer.");
+  if (!Number.isInteger(context.pr_number) || context.pr_number <= 0) {
+    throw new HttpError(422, `${name}.pr_number must be a positive integer.`);
   }
-  if (!COMMIT_PATTERN.test(review.base_sha) || !COMMIT_PATTERN.test(review.head_sha)) {
-    throw new HttpError(422, "review base_sha and head_sha must be commit hashes.");
+  if (!COMMIT_PATTERN.test(context.base_sha) || !COMMIT_PATTERN.test(context.head_sha)) {
+    throw new HttpError(422, `${name} base_sha and head_sha must be commit hashes.`);
   }
-  if (typeof value.review.review_mode === "string") {
-    review.review_mode = value.review.review_mode;
+  return context;
+}
+
+function validateInstruction(value: unknown): InstructionInput {
+  assertObject(value, "instruction");
+  const text = requireString(value.text, "instruction.text");
+  if (text.length > 8000) throw new HttpError(422, "instruction.text is too long.");
+  const historyValue = value.history ?? [];
+  if (!Array.isArray(historyValue)) {
+    throw new HttpError(422, "instruction.history must be an array.");
+  }
+  if (historyValue.length > 6) {
+    throw new HttpError(422, "instruction.history may contain at most 6 turns.");
+  }
+  const history = historyValue.map((item, index): InstructionHistoryItem => {
+    assertObject(item, `instruction.history[${index}]`);
+    const outcome = requireString(item.outcome, `instruction.history[${index}].outcome`);
+    if (!["answered", "needs_clarification", "refused"].includes(outcome)) {
+      throw new HttpError(422, `instruction.history[${index}].outcome is invalid.`);
+    }
+    const headSha = requireString(item.head_sha, `instruction.history[${index}].head_sha`);
+    if (!COMMIT_PATTERN.test(headSha)) {
+      throw new HttpError(422, `instruction.history[${index}].head_sha must be a commit hash.`);
+    }
+    return {
+      author_login: requireString(item.author_login, `instruction.history[${index}].author_login`),
+      command: requireString(item.command, `instruction.history[${index}].command`),
+      answer: requireString(item.answer, `instruction.history[${index}].answer`),
+      outcome: outcome as InstructionHistoryItem["outcome"],
+      head_sha: headSha,
+    };
+  });
+  const instruction: InstructionInput = {
+    text,
+    author_login: requireString(value.author_login, "instruction.author_login"),
+    history,
+  };
+  if (value.source_url !== undefined) {
+    instruction.source_url = requireString(value.source_url, "instruction.source_url");
+  }
+  return instruction;
+}
+
+export function validateStartRequest(value: unknown): StartSessionRequest {
+  assertObject(value, "request");
+  const kindValue = value.kind ?? "review";
+  if (kindValue !== "review" && kindValue !== "instruction") {
+    throw new HttpError(422, "kind must be review or instruction.");
+  }
+  const kind = kindValue as SessionKind;
+  const workspacePath = requireString(value.workspace_path, "workspace_path");
+
+  let review: ReviewInput | undefined;
+  let repositoryContext: RepositoryContext | undefined;
+  let instruction: InstructionInput | undefined;
+  if (kind === "review") {
+    const context = validateRepositoryContext(value.review, "review");
+    review = { ...context, workspace_path: workspacePath };
+    if (value.review !== null && typeof value.review === "object" && !Array.isArray(value.review)) {
+      const reviewValue = value.review as Record<string, unknown>;
+      if (typeof reviewValue.review_mode === "string") {
+        review.review_mode = reviewValue.review_mode;
+      }
+    }
+  } else {
+    repositoryContext = validateRepositoryContext(
+      value.repository_context,
+      "repository_context",
+    );
+    instruction = validateInstruction(value.instruction);
   }
 
   let model: ModelSelection | undefined;
@@ -345,7 +459,15 @@ function validateStartRequest(value: unknown): StartSessionRequest {
     });
   }
 
-  const request: StartSessionRequest = { workspace_path: workspacePath, review };
+  const request: StartSessionRequest = { kind, workspace_path: workspacePath };
+  if (review !== undefined) request.review = review;
+  if (repositoryContext !== undefined) request.repository_context = repositoryContext;
+  if (instruction !== undefined) request.instruction = instruction;
+  if (value.idempotency_key !== undefined) {
+    const key = requireString(value.idempotency_key, "idempotency_key");
+    if (key.length > 256) throw new HttpError(422, "idempotency_key is too long.");
+    request.idempotency_key = key;
+  }
   if (typeof value.title === "string" && value.title.trim() !== "") request.title = value.title.trim();
   if (typeof value.profile === "string" && value.profile.trim() !== "") request.profile = value.profile.trim();
   if (model !== undefined) request.model = model;
@@ -456,6 +578,12 @@ function textToolResult(text: string, details: Record<string, unknown> = {}) {
   return { content: [{ type: "text" as const, text }], details };
 }
 
+function repositoryContext(record: SessionRecord): RepositoryContext {
+  if (record.review !== undefined) return record.review;
+  if (record.repository_context !== undefined) return record.repository_context;
+  throw new Error("Session has no repository context.");
+}
+
 export function createReviewTools(record: SessionRecord) {
   const listFiles = defineTool({
     name: "list_files",
@@ -560,12 +688,13 @@ export function createReviewTools(record: SessionRecord) {
       context_lines: Type.Optional(Type.Integer({ minimum: 0, maximum: 200 })),
     }),
     async execute(_toolCallId, params, signal) {
+      const context = repositoryContext(record);
       const args = [
         "diff",
         "--no-ext-diff",
         "--no-textconv",
         `--unified=${params.context_lines ?? 40}`,
-        `${record.review.base_sha}...${record.review.head_sha}`,
+        `${context.base_sha}...${context.head_sha}`,
       ];
       if (params.path !== undefined) {
         await resolveWorkspacePath(record.workspace_path, params.path);
@@ -657,6 +786,66 @@ export function createReviewTools(record: SessionRecord) {
   return [listFiles, readFileTool, searchCode, gitDiff, requestHumanInput, submitReview];
 }
 
+export function createInstructionTools(record: SessionRecord) {
+  const commonTools = createReviewTools(record).filter((tool) =>
+    ["list_files", "read_file", "search_code", "git_diff"].includes(tool.name),
+  );
+  const referenceSchema = Type.Object({
+    path: Type.String({ minLength: 1, maxLength: 1024 }),
+    line_start: Type.Optional(Type.Integer({ minimum: 1 })),
+    line_end: Type.Optional(Type.Integer({ minimum: 1 })),
+  });
+  const submitTaskResult = defineTool({
+    name: "submit_task_result",
+    label: "Submit task result",
+    description: "Submit the final answer to the user's pull-request command and end the agent run.",
+    promptSnippet: "Submit the final validated command answer",
+    promptGuidelines: ["Always finish by calling submit_task_result exactly once."],
+    executionMode: "sequential" as const,
+    parameters: Type.Object({
+      outcome: Type.Union([
+        Type.Literal("answered"),
+        Type.Literal("needs_clarification"),
+        Type.Literal("refused"),
+      ]),
+      answer: Type.String({ minLength: 1, maxLength: 30000 }),
+      references: Type.Optional(Type.Array(referenceSchema, { maxItems: 50 })),
+    }),
+    async execute(_toolCallId, params) {
+      for (const reference of params.references ?? []) {
+        const target = await resolveWorkspacePath(record.workspace_path, reference.path);
+        const metadata = await stat(target);
+        if (!metadata.isFile()) {
+          throw new Error(`Reference path is not a file: ${reference.path}`);
+        }
+        if (
+          reference.line_start !== undefined
+          && reference.line_end !== undefined
+          && reference.line_end < reference.line_start
+        ) {
+          throw new Error("Reference line_end must be greater than or equal to line_start.");
+        }
+      }
+      record.result = params as unknown as Record<string, unknown>;
+      record.status = "completed";
+      record.stage = "completed";
+      addEvent(record, {
+        type: "task_result_submitted",
+        stage: record.stage,
+        tool: "submit_task_result",
+      });
+      return {
+        ...textToolResult("Structured task result accepted.", {
+          outcome: params.outcome,
+          reference_count: params.references?.length ?? 0,
+        }),
+        terminate: true,
+      };
+    },
+  });
+  return [...commonTools, submitTaskResult];
+}
+
 function createAuthStorage(provider: string): AuthStorage {
   const authStorage = AuthStorage.create(join(config.agentDir, "auth.json"));
   const genericKey = process.env.PI_AGENT_LLM_API_KEY;
@@ -677,23 +866,43 @@ function resolveModel(
   return baseUrl ? { ...selected, baseUrl } : selected;
 }
 
-async function startSession(request: StartSessionRequest): Promise<SessionRecord> {
+export async function startSession(request: StartSessionRequest): Promise<SessionRecord> {
+  if (request.idempotency_key !== undefined) {
+    const existingId = idempotentSessions.get(request.idempotency_key);
+    if (existingId !== undefined) {
+      const existing = sessions.get(existingId);
+      if (existing !== undefined) return existing;
+      idempotentSessions.delete(request.idempotency_key);
+    }
+  }
   const workspace = await validateWorkspace(request.workspace_path);
-  if (request.review.workspace_path !== request.workspace_path) {
+  if (
+    request.kind === "review"
+    && request.review?.workspace_path !== request.workspace_path
+  ) {
     throw new HttpError(422, "review.workspace_path must match workspace_path.");
   }
+  const context = request.review ?? request.repository_context;
+  if (context === undefined) throw new HttpError(422, "Repository context is required.");
   const provider = request.model?.provider ?? config.defaultProvider;
   const model = request.model?.id ?? config.defaultModel;
   const thinking = normalizeThinking(request.model?.thinking_level ?? config.defaultThinking);
-  const skills = request.skills?.length ? request.skills : [config.defaultSkill];
+  const defaultSkill = request.kind === "instruction"
+    ? config.defaultInstructionSkill
+    : config.defaultSkill;
+  const skills = request.skills?.length ? request.skills : [defaultSkill];
   const timestamp = now();
   const record: SessionRecord = {
     id: randomUUID(),
-    title: request.title ?? `Review PR #${request.review.pr_number}: ${request.review.repo_full_name}`,
+    kind: request.kind,
+    title: request.title ?? (
+      request.kind === "review"
+        ? `Review PR #${context.pr_number}: ${context.repo_full_name}`
+        : `PR #${context.pr_number} command: ${context.repo_full_name}`
+    ),
     status: "starting",
     stage: "starting",
     workspace_path: workspace,
-    review: { ...request.review, workspace_path: workspace },
     provider,
     model,
     thinking_level: thinking,
@@ -703,10 +912,52 @@ async function startSession(request: StartSessionRequest): Promise<SessionRecord
     updated_at: timestamp,
     events: [{ at: timestamp, type: "session_created", stage: "starting" }],
   };
+  if (request.idempotency_key !== undefined) {
+    record.idempotency_key = request.idempotency_key;
+  }
+  if (request.review !== undefined) {
+    record.review = { ...request.review, workspace_path: workspace };
+  }
+  if (request.repository_context !== undefined) {
+    record.repository_context = request.repository_context;
+  }
+  if (request.instruction !== undefined) record.instruction = request.instruction;
   sessions.set(record.id, record);
+  if (record.idempotency_key !== undefined) {
+    idempotentSessions.set(record.idempotency_key, record.id);
+  }
   await persistRecord(record);
   void runAgent(record, request.model?.base_url ?? config.modelBaseUrl);
   return record;
+}
+
+function instructionPrompt(
+  record: SessionRecord,
+  context: RepositoryContext,
+): string {
+  if (record.instruction === undefined) {
+    throw new Error("Instruction session has no instruction payload.");
+  }
+  const history = record.instruction.history.length === 0
+    ? "(no previous bot exchanges)"
+    : record.instruction.history.map((item, index) => [
+      `Previous exchange ${index + 1} at ${item.head_sha}:`,
+      `${item.author_login}: ${item.command}`,
+      `assistant (${item.outcome}): ${item.answer}`,
+    ].join("\n")).join("\n\n");
+  return [
+    `Answer a command about ${context.repo_full_name} pull request #${context.pr_number}.`,
+    `Provider: ${context.provider}`,
+    `Base commit: ${context.base_sha}`,
+    `Head commit: ${context.head_sha}`,
+    `Profile: ${record.profile}`,
+    "Previous orchestrator-owned exchanges:",
+    history,
+    "Current user command:",
+    `${record.instruction.author_login}: ${record.instruction.text}`,
+    "Answer the current command directly. Inspect repository evidence as needed.",
+    "When finished, call submit_task_result with the final structured result.",
+  ].join("\n");
 }
 
 async function runAgent(record: SessionRecord, baseUrl: string | undefined): Promise<void> {
@@ -714,7 +965,7 @@ async function runAgent(record: SessionRecord, baseUrl: string | undefined): Pro
     const skillPaths = record.skills.map((skill) => join(config.skillsRoot, skill, "SKILL.md"));
     for (const skillPath of skillPaths) {
       await stat(skillPath).catch(() => {
-        throw new Error(`Configured review skill does not exist: ${skillPath}`);
+        throw new Error(`Configured agent skill does not exist: ${skillPath}`);
       });
     }
     const authStorage = createAuthStorage(record.provider);
@@ -740,9 +991,13 @@ async function runAgent(record: SessionRecord, baseUrl: string | undefined): Pro
         diagnostics: base.diagnostics,
       }),
       appendSystemPrompt: [
-        "You are an automated pull request review agent running in a read-only, isolated workspace.",
+        record.kind === "review"
+          ? "You are an automated pull request review agent running in a read-only, isolated workspace."
+          : "You are a pull request assistant answering a user's explicit command in a read-only, isolated workspace.",
         "Use only the supplied tools. Never attempt to modify files or publish provider comments.",
-        "The submit_review tool is the only valid final output channel.",
+        record.kind === "review"
+          ? "The submit_review tool is the only valid final output channel."
+          : "The submit_task_result tool is the only valid final output channel.",
       ],
     });
     await loader.reload();
@@ -754,7 +1009,9 @@ async function runAgent(record: SessionRecord, baseUrl: string | undefined): Pro
     const sessionDirectory = join(config.stateRoot, "pi-sessions", record.id);
     await mkdir(sessionDirectory, { recursive: true });
     const sessionManager = SessionManager.create(record.workspace_path, sessionDirectory);
-    const customTools = createReviewTools(record);
+    const customTools = record.kind === "review"
+      ? createReviewTools(record)
+      : createInstructionTools(record);
     const activeTools = customTools.map((tool) => tool.name);
     const { session } = await createAgentSession({
       cwd: record.workspace_path,
@@ -797,21 +1054,26 @@ async function runAgent(record: SessionRecord, baseUrl: string | undefined): Pro
     record.stage = "analyzing";
     addEvent(record, { type: "runtime_ready", stage: record.stage });
 
-    const prompt = [
-      `Review ${record.review.repo_full_name} pull request #${record.review.pr_number}.`,
-      `Provider: ${record.review.provider}`,
-      `Base commit: ${record.review.base_sha}`,
-      `Head commit: ${record.review.head_sha}`,
-      `Profile: ${record.profile}`,
-      "Inspect the complete base...head diff and relevant repository context.",
-      "When finished, call submit_review with the final structured result.",
-    ].join("\n");
+    const context = repositoryContext(record);
+    const prompt = record.kind === "review"
+      ? [
+        `Review ${context.repo_full_name} pull request #${context.pr_number}.`,
+        `Provider: ${context.provider}`,
+        `Base commit: ${context.base_sha}`,
+        `Head commit: ${context.head_sha}`,
+        `Profile: ${record.profile}`,
+        "Inspect the complete base...head diff and relevant repository context.",
+        "When finished, call submit_review with the final structured result.",
+      ].join("\n")
+      : instructionPrompt(record, context);
     await session.prompt(`/skill:${record.skills[0]} ${prompt}`, { source: "rpc" });
 
     if (!TERMINAL_STATUSES.has(record.status)) {
       record.status = "failed";
       record.stage = "missing_result";
-      record.error = "pi-agent ended without calling submit_review.";
+      record.error = record.kind === "review"
+        ? "pi-agent ended without calling submit_review."
+        : "pi-agent ended without calling submit_task_result.";
       addEvent(record, { type: "session_failed", stage: record.stage });
     }
   } catch (error) {

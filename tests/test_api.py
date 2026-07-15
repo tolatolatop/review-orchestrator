@@ -186,6 +186,12 @@ async def create_agent_task_record(
     input_json: dict | None = None,
     result_json: dict | None = None,
     error_message: str | None = None,
+    stage: str | None = None,
+    agent_session_id: str | None = None,
+    response_comment_id: str | None = None,
+    command_text: str | None = None,
+    source_author_login: str | None = None,
+    failure_code: str | None = None,
 ) -> AgentTask:
     created_at = created_at or datetime.now(UTC)
     session_factory = client.app.state.session_factory
@@ -243,6 +249,12 @@ async def create_agent_task_record(
             pull_request_number=pull_request_number,
             task_type=task_type,
             status=status,
+            stage=stage,
+            agent_session_id=agent_session_id,
+            response_comment_id=response_comment_id,
+            command_text=command_text,
+            source_author_login=source_author_login,
+            failure_code=failure_code,
             input_json=input_json,
             result_json=result_json,
             error_message=error_message,
@@ -253,6 +265,24 @@ async def create_agent_task_record(
         await session.commit()
         await session.refresh(task)
         return task
+
+
+class FakeTaskCommentGitHubClient:
+    def __init__(self) -> None:
+        self.updated: list[tuple[str, str]] = []
+
+    async def update_issue_comment(self, repo_full_name, comment_id, body):
+        del repo_full_name
+        self.updated.append((str(comment_id), body))
+        return str(comment_id)
+
+    async def list_issue_comments(self, repo_full_name, pull_request_number):
+        del repo_full_name, pull_request_number
+        return []
+
+    async def create_issue_comment(self, repo_full_name, pull_request_number, body):
+        del repo_full_name, pull_request_number, body
+        return "created-task-comment"
 
 
 def pull_request_payload(
@@ -857,6 +887,57 @@ def test_closed_pull_request_cancels_existing_queued_review_run(tmp_path: Path) 
     assert review_run["failure_code"] == "pr_merged"
 
 
+def test_closed_pull_request_requests_active_message_task_cancellation(
+    tmp_path: Path,
+) -> None:
+    opened_payload = pull_request_payload(action="opened", head_sha="b" * 40)
+    opened_body = json_body(opened_payload)
+    command_payload = {
+        "action": "created",
+        "repository": {"full_name": "example/repo"},
+        "issue": {"number": 42, "pull_request": {"url": "https://api.github/pr"}},
+        "comment": {
+            "id": 777,
+            "body": "@review-agent explain this change",
+            "user": {"login": "alice", "type": "User"},
+            "author_association": "MEMBER",
+        },
+    }
+    command_body = json_body(command_payload)
+    closed_payload = pull_request_payload(
+        action="closed", merged=False, head_sha="b" * 40
+    )
+    closed_body = json_body(closed_payload)
+
+    with make_signed_client(tmp_path) as client:
+        client.post(
+            "/api/v1/webhooks/github",
+            content=opened_body,
+            headers=github_headers(opened_body, delivery_id="open-for-command"),
+        )
+        command = client.post(
+            "/api/v1/webhooks/github",
+            content=command_body,
+            headers=github_headers(
+                command_body,
+                delivery_id="message-before-close",
+                event="issue_comment",
+            ),
+        ).json()
+        client.post(
+            "/api/v1/webhooks/github",
+            content=closed_body,
+            headers=github_headers(closed_body, delivery_id="close-with-command"),
+        )
+        task = client.get(
+            f"/api/v1/agent-tasks/{command['agent_task_id']}"
+        ).json()
+
+    assert task["status"] == "running"
+    assert task["stage"] == "cancellation_pending"
+    assert task["failure_code"] == "pr_closed"
+
+
 def test_pr_issue_comment_is_context_only(tmp_path: Path) -> None:
     payload = {
         "action": "created",
@@ -885,7 +966,13 @@ def test_pr_issue_comment_mention_creates_agent_task(tmp_path: Path) -> None:
         "action": "created",
         "repository": {"full_name": "example/repo"},
         "issue": {"number": 42, "pull_request": {"url": "https://api.github/pr"}},
-        "comment": {"id": 123, "body": "@review-agent should I re-review this?"},
+        "comment": {
+            "id": 123,
+            "html_url": "https://github.com/example/repo/pull/42#issuecomment-123",
+            "body": "@review-agent explain why this retry is safe",
+            "user": {"login": "alice", "type": "User"},
+            "author_association": "MEMBER",
+        },
     }
     body = json_body(payload)
 
@@ -895,12 +982,134 @@ def test_pr_issue_comment_mention_creates_agent_task(tmp_path: Path) -> None:
             content=body,
             headers=github_headers(body, event="issue_comment"),
         )
+        task = client.get(
+            f"/api/v1/agent-tasks/{response.json()['agent_task_id']}"
+        ).json()
 
     assert response.status_code == 200
-    assert response.json()["internal_event"] == "agent_mention"
+    assert response.json()["internal_event"] == "agent_command"
     assert response.json()["status"] == "queued"
     assert response.json()["review_run_id"] is None
     assert response.json()["agent_task_id"] is not None
+    assert task["task_type"] == "message_command"
+    assert task["status"] == "queued"
+    assert task["stage"] == "placeholder_pending"
+    assert task["command_text"] == "explain why this retry is safe"
+    assert task["source_kind"] == "issue_comment"
+    assert task["source_comment_id"] == "123"
+    assert task["source_author_login"] == "alice"
+
+
+def test_bot_authored_mention_does_not_create_agent_task(tmp_path: Path) -> None:
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "example/repo"},
+        "issue": {"number": 42, "pull_request": {"url": "https://api.github/pr"}},
+        "comment": {
+            "id": 124,
+            "body": "@review-agent recursive message",
+            "user": {"login": "review-agent", "type": "Bot"},
+            "author_association": "MEMBER",
+        },
+    }
+    body = json_body(payload)
+
+    with make_signed_client(tmp_path) as client:
+        response = client.post(
+            "/api/v1/webhooks/github",
+            content=body,
+            headers=github_headers(
+                body,
+                delivery_id="delivery-bot-comment",
+                event="issue_comment",
+            ),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["internal_event"] == "pr_comment_context"
+    assert response.json()["agent_task_id"] is None
+
+
+def test_untrusted_comment_author_does_not_create_agent_task(tmp_path: Path) -> None:
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "example/repo"},
+        "issue": {"number": 42, "pull_request": {"url": "https://api.github/pr"}},
+        "comment": {
+            "id": 125,
+            "body": "@review-agent inspect the authentication flow",
+            "user": {"login": "external-user", "type": "User"},
+            "author_association": "NONE",
+        },
+    }
+    body = json_body(payload)
+
+    with make_signed_client(tmp_path) as client:
+        response = client.post(
+            "/api/v1/webhooks/github",
+            content=body,
+            headers=github_headers(
+                body,
+                delivery_id="delivery-untrusted-comment",
+                event="issue_comment",
+            ),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["internal_event"] == "pr_comment_context"
+    assert response.json()["agent_task_id"] is None
+
+
+def test_review_and_line_comment_mentions_create_message_commands(
+    tmp_path: Path,
+) -> None:
+    cases = [
+        (
+            "pull_request_review",
+            "submitted",
+            "review",
+            126,
+        ),
+        (
+            "pull_request_review_comment",
+            "created",
+            "comment",
+            127,
+        ),
+    ]
+    with make_signed_client(tmp_path) as client:
+        for event, action, source_key, source_id in cases:
+            payload = {
+                "action": action,
+                "repository": {"full_name": "example/repo"},
+                "pull_request": {"number": 42},
+                source_key: {
+                    "id": source_id,
+                    "html_url": f"https://github.com/example/repo/pull/42#{source_id}",
+                    "body": "@review-agent explain this change",
+                    "user": {"login": "alice", "type": "User"},
+                    "author_association": "COLLABORATOR",
+                },
+            }
+            body = json_body(payload)
+            response = client.post(
+                "/api/v1/webhooks/github",
+                content=body,
+                headers=github_headers(
+                    body,
+                    delivery_id=f"delivery-{event}",
+                    event=event,
+                ),
+            )
+
+            assert response.status_code == 200
+            assert response.json()["internal_event"] == "agent_command"
+            task = client.get(
+                f"/api/v1/agent-tasks/{response.json()['agent_task_id']}"
+            ).json()
+            assert task["task_type"] == "message_command"
+            assert task["source_kind"] == event
+            assert task["source_comment_id"] == str(source_id)
 
 
 def test_list_provider_events_filters_and_returns_safe_summary(
@@ -912,7 +1121,12 @@ def test_list_provider_events_filters_and_returns_safe_summary(
         "action": "created",
         "repository": {"full_name": "example/repo"},
         "issue": {"number": 42, "pull_request": {"url": "https://api.github/pr"}},
-        "comment": {"id": 123, "body": "@review-agent should I re-review this?"},
+        "comment": {
+            "id": 123,
+            "body": "@review-agent should I re-review this?",
+            "user": {"login": "alice", "type": "User"},
+            "author_association": "MEMBER",
+        },
     }
     comment_body = json_body(comment_payload)
 
@@ -938,7 +1152,7 @@ def test_list_provider_events_filters_and_returns_safe_summary(
                 "provider": "github",
                 "repo_full_name": "example/repo",
                 "pull_request_number": 42,
-                "internal_event": "agent_mention",
+                "internal_event": "agent_command",
                 "status": "queued",
                 "delivery_id": "delivery-comment",
             },
@@ -1080,6 +1294,109 @@ async def test_get_agent_task_detail_returns_redacted_metadata(tmp_path: Path) -
     assert data["result_json"] == {"published": False, "reason": "provider_error"}
     assert data["error_message"] == "first line"
     assert missing_response.status_code == 404
+
+
+async def test_cancel_agent_task_cancels_runtime_and_updates_placeholder(
+    tmp_path: Path,
+) -> None:
+    pi_agent_client = FakePiAgentClient()
+    github_client = FakeTaskCommentGitHubClient()
+    with make_client(tmp_path) as client:
+        client.app.state.pi_agent_client = pi_agent_client
+        client.app.state.github_client = github_client
+        task = await create_agent_task_record(
+            client,
+            status="running",
+            stage="waiting_for_agent",
+            task_type="message_command",
+            agent_session_id="session-1",
+            response_comment_id="task-comment-1",
+            command_text="Explain the retry.",
+            source_author_login="alice",
+        )
+
+        response = client.post(f"/api/v1/agent-tasks/{task.id}/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    assert response.json()["stage"] == "cancelled"
+    assert pi_agent_client.cancelled_session_ids == ["session-1"]
+    assert len(github_client.updated) == 1
+    assert github_client.updated[0][0] == "task-comment-1"
+    assert "cancelled" in github_client.updated[0][1]
+
+
+async def test_retry_failed_agent_task_reuses_placeholder_with_new_attempt(
+    tmp_path: Path,
+) -> None:
+    with make_client(tmp_path) as client:
+        task = await create_agent_task_record(
+            client,
+            status="failed",
+            stage="failed",
+            task_type="message_command",
+            response_comment_id="task-comment-1",
+            command_text="Explain the retry.",
+            source_author_login="alice",
+            failure_code="agent_failed",
+            error_message="model failed",
+        )
+
+        response = client.post(f"/api/v1/agent-tasks/{task.id}/retry")
+
+    assert response.status_code == 202
+    data = response.json()
+    assert data["status"] == "queued"
+    assert data["stage"] == "placeholder_pending"
+    assert data["response_comment_id"] == "task-comment-1"
+    assert data["failure_code"] is None
+    assert data["error_message"] is None
+
+
+async def test_agent_task_session_diagnostics_reads_live_instruction_session(
+    tmp_path: Path,
+) -> None:
+    pi_agent_client = FakePiAgentClient()
+    pi_agent_client.session = PiAgentSession(
+        id="session-1",
+        kind="instruction",
+        status="running",
+        stage="tool:read_file",
+        provider="openai",
+        model="gpt-5.4",
+        thinking_level="high",
+        events=[
+            {
+                "at": "2026-07-15T00:00:00Z",
+                "type": "tool_execution_start",
+                "stage": "tool:read_file",
+                "tool": "read_file",
+            }
+        ],
+    )
+    with make_client(tmp_path) as client:
+        client.app.state.pi_agent_client = pi_agent_client
+        task = await create_agent_task_record(
+            client,
+            status="running",
+            stage="waiting_for_agent",
+            task_type="message_command",
+            agent_session_id="session-1",
+            command_text="Explain the retry.",
+            source_author_login="alice",
+        )
+
+        response = client.get(f"/api/v1/agent-tasks/{task.id}/agent-session")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["review_run_id"] is None
+    assert data["agent_task_ids"] == [task.id]
+    assert data["status"] == "running"
+    assert data["stage"] == "waiting_for_agent"
+    assert data["execution_status"] == "running"
+    assert data["execution_stage"] == "tool:read_file"
+    assert data["event_count"] == 1
 
 
 def test_start_review_session_records_pi_agent_identifiers(tmp_path: Path) -> None:

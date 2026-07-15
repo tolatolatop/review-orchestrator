@@ -118,6 +118,73 @@ def _migrate_agent_runtime_columns(connection: Connection) -> None:
         )
     )
 
+    agent_task_columns = {
+        column["name"] for column in inspect(connection).get_columns("agent_task")
+    }
+    task_additions = {
+        "stage": "VARCHAR(64)",
+        "source_kind": "VARCHAR(64)",
+        "source_comment_id": "VARCHAR(128)",
+        "source_url": "TEXT",
+        "source_author_login": "VARCHAR(255)",
+        "command_text": "TEXT",
+        "head_sha": "VARCHAR(80)",
+        "workspace_path": "TEXT",
+        "response_comment_id": "VARCHAR(128)",
+        "response_body_hash": "VARCHAR(128)",
+        "response_published_at": "TIMESTAMP",
+        "publish_attempts": "INTEGER DEFAULT 0",
+        "last_publish_error": "TEXT",
+        "agent_session_id": "VARCHAR(128)",
+        "agent_status": "VARCHAR(32)",
+        "agent_provider": "VARCHAR(64)",
+        "agent_model": "VARCHAR(128)",
+        "agent_thinking_level": "VARCHAR(16)",
+        "result_text": "TEXT",
+        "failure_code": "VARCHAR(64)",
+        "attempt": "INTEGER DEFAULT 1",
+        "agent_start_attempts": "INTEGER DEFAULT 0",
+        "lock_owner": "VARCHAR(128)",
+        "locked_until": "TIMESTAMP",
+        "started_at": "TIMESTAMP",
+        "completed_at": "TIMESTAMP",
+        "deadline_at": "TIMESTAMP",
+        "soft_timeout_emitted_at": "TIMESTAMP",
+        "hard_timeout_emitted_at": "TIMESTAMP",
+    }
+    for name, sql_type in task_additions.items():
+        if name not in agent_task_columns:
+            connection.execute(
+                text(f"ALTER TABLE agent_task ADD COLUMN {name} {sql_type}")
+            )
+    connection.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_task_provider_event "
+            "ON agent_task (provider_event_id) "
+            "WHERE provider_event_id IS NOT NULL"
+        )
+    )
+    connection.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_agent_task_agent_session_id "
+            "ON agent_task (agent_session_id)"
+        )
+    )
+
+    review_config_columns = {
+        column["name"] for column in inspect(connection).get_columns("review_config")
+    }
+    config_additions = {
+        "agent_commands_enabled": "BOOLEAN DEFAULT TRUE",
+        "default_agent_command_skill": "VARCHAR(128) DEFAULT 'pr-assistant'",
+        "default_agent_command_profile": "VARCHAR(128) DEFAULT 'default'",
+    }
+    for name, sql_type in config_additions.items():
+        if name not in review_config_columns:
+            connection.execute(
+                text(f"ALTER TABLE review_config ADD COLUMN {name} {sql_type}")
+            )
+
 
 async def get_session(request: Request) -> AsyncGenerator[AsyncSession, None]:
     session_factory = request.app.state.session_factory

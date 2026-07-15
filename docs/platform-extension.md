@@ -22,8 +22,9 @@ GitHub support currently covers:
 - Review-run creation for PR `opened`, `synchronize`, `reopened`, and
   `ready_for_review`.
 - PR context updates for supported pull request state and metadata changes.
-- Mention-trigger agent tasks when PR comments or reviews mention the configured
-  review bot login.
+- Mention-trigger message-command AgentTasks when PR comments or reviews mention
+  the configured review bot login. These answer the message and do not create a
+  ReviewRun.
 - Provider event idempotency through `(provider, delivery_id)`.
 - Provider-scoped storage for PR contexts, review runs, comment refs, workspaces,
   and review config.
@@ -154,7 +155,7 @@ the payload is invalid or unauthenticated.
 | `pr_converted_to_draft` | `pull_request.converted_to_draft` | Draft flag changed to true | Draft support varies | If unsupported, leave unmapped. |
 | `pr_metadata_changed` | edited, labeled, assigned, unlabeled, unassigned | title/label/assignee/target branch update | title/reviewer/status metadata updates | Do not create review runs by default. |
 | `pr_comment_context` | issue comment, review, review comment on PR | MR note/discussion | PR thread/comment | Context only unless bot is mentioned. |
-| `agent_mention` | PR comment/review mentions bot | MR note mentions bot | PR thread/comment mentions bot | Requires provider-specific bot identity matching. |
+| `agent_command` | PR comment/review mentions bot with a command | MR note mentions bot | PR thread/comment mentions bot | Requires provider-specific bot identity and actor-policy matching. |
 
 Review runs should be created for `pr_opened`, `pr_updated`, `pr_reopened`, and
 `pr_ready_for_review` by default. Metadata-only and comment-context events should

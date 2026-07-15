@@ -80,6 +80,9 @@ locally:
 - `POST /api/v1/review-runs/{review_run_id}/result`
 - `POST /api/v1/review-runs/{review_run_id}/retry`
 - `POST /api/v1/review-runs/{review_run_id}/cancel`
+- `GET /api/v1/agent-tasks/{agent_task_id}/agent-session`
+- `POST /api/v1/agent-tasks/{agent_task_id}/cancel`
+- `POST /api/v1/agent-tasks/{agent_task_id}/retry`
 - `GET /api/v1/observability/review-runs/{review_run_id}/agent-session`
 - `GET /api/v1/observability/agent-sessions/{agent_session_id}`
 
@@ -218,11 +221,29 @@ pi-agent SDK as the execution backend for each review session:
    completed.
 
 The bundled runtime discovers Agent Skills from `PI_AGENT_SKILLS_PATH`. The
-repository includes `pi-agent-runtime/skills/code-review/SKILL.md`; add another
-`<skill-name>/SKILL.md` directory and select it through repository review config
-or the `session/start` request. Custom model definitions can be placed in
+repository includes `code-review` and the read-only `pr-assistant` command
+skill; add another `<skill-name>/SKILL.md` directory and select it through
+repository review config or a session request. Custom model definitions can be placed in
 `${PI_AGENT_CONFIG_PATH}/models.json`; see
 `pi-agent-runtime/config/models.example.json`.
+
+### `@bot` message commands
+
+On a GitHub PR, a trusted `OWNER`, `MEMBER`, or `COLLABORATOR` can mention the
+configured `REVIEW_BOT_LOGIN` in an issue comment, submitted review, or review
+comment. The text after the mention becomes a read-only message command rather
+than an automatic review.
+
+The command path persists an `AgentTask`, creates one task-specific placeholder
+comment, prepares the same head-SHA-isolated workspace used by reviews, and
+starts pi-agent in `instruction` mode with the `pr-assistant` skill. A validated
+`submit_task_result` answer replaces that exact placeholder. Failures,
+cancellation, soft timeout, and hard timeout also update the same comment.
+
+Commands for one PR execute FIFO. A new command receives a bounded history of
+the six most recent successful command/answer exchanges. It never creates a
+`ReviewRun` or `Finding`, and the runtime still has no shell, write, or edit
+tools.
 
 ### Workspace MVP Contract
 

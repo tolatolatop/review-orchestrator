@@ -60,6 +60,15 @@ class Settings(BaseSettings):
     )
     github_api_base_url: str = "https://api.github.com"
     review_bot_login: str = "review-agent"
+    agent_command_enabled: bool = True
+    agent_command_skill: str = "pr-assistant"
+    agent_command_profile: str = "default"
+    agent_task_soft_timeout_seconds: int = Field(default=120, gt=0)
+    agent_task_timeout_seconds: int = Field(default=600, gt=0)
+    agent_task_max_history_turns: int = Field(default=6, ge=0, le=20)
+    agent_task_max_history_chars: int = Field(default=24000, ge=0)
+    agent_task_allowed_associations: str = "OWNER,MEMBER,COLLABORATOR"
+    agent_task_max_command_chars: int = Field(default=8000, gt=0, le=30000)
     gitlab_webhook_secret: str | None = Field(
         default=None,
         description=(

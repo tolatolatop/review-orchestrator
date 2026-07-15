@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from review_orchestrator.db import get_session
 from review_orchestrator.github import GitHubAdapter
 from review_orchestrator.gitlab import GitLabAdapter
+from review_orchestrator.models import AgentTask
 from review_orchestrator.pi_agent import PiAgentClient, PiAgentClientError
 from review_orchestrator.platform_diagnostics import diagnose_platform_permissions
 from review_orchestrator.providers import ProviderRegistry, ProviderWebhookError
@@ -41,11 +42,13 @@ from review_orchestrator.schemas import (
 from review_orchestrator.services import (
     ReviewRunTransitionError,
     accept_provider_webhook,
+    cancel_agent_task,
     cancel_review_run,
     cancel_review_session,
     collect_review_result,
     create_review_run,
     get_agent_task_detail,
+    get_pi_agent_session_diagnostics_for_agent_task,
     get_pi_agent_session_diagnostics_for_review_run,
     get_pi_agent_session_diagnostics_for_session,
     get_provider_event_inbox_detail,
@@ -54,6 +57,7 @@ from review_orchestrator.services import (
     list_agent_tasks,
     list_provider_event_inbox,
     list_review_runs,
+    retry_agent_task,
     retry_review_run,
     start_review_session,
     sync_review_session,
@@ -266,6 +270,73 @@ async def get_agent_task_endpoint(
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return task
+
+
+@router.get(
+    "/agent-tasks/{task_id}/agent-session",
+    response_model=PiAgentSessionDiagnostics,
+)
+async def get_agent_task_session_endpoint(
+    task_id: str,
+    session: AsyncSession = session_dependency,
+    pi_agent_client: PiAgentClient = pi_agent_client_dependency,
+) -> PiAgentSessionDiagnostics:
+    task = await session.get(AgentTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return await get_pi_agent_session_diagnostics_for_agent_task(
+        task,
+        pi_agent_client=pi_agent_client,
+    )
+
+
+@router.post(
+    "/agent-tasks/{task_id}/cancel",
+    response_model=AgentTaskDetail,
+)
+async def cancel_agent_task_endpoint(
+    task_id: str,
+    request: Request,
+    session: AsyncSession = session_dependency,
+    pi_agent_client: PiAgentClient = pi_agent_client_dependency,
+) -> AgentTaskDetail:
+    registry = ProviderRegistry(
+        [GitHubAdapter(request.app.state.github_client), GitLabAdapter()]
+    )
+    try:
+        task = await cancel_agent_task(
+            session,
+            task_id,
+            pi_agent_client=pi_agent_client,
+            provider_registry=registry,
+        )
+    except ReviewRunTransitionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    detail = await get_agent_task_detail(session, task.id)
+    assert detail is not None
+    return detail
+
+
+@router.post(
+    "/agent-tasks/{task_id}/retry",
+    response_model=AgentTaskDetail,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_agent_task_endpoint(
+    task_id: str,
+    session: AsyncSession = session_dependency,
+) -> AgentTaskDetail:
+    try:
+        task = await retry_agent_task(session, task_id)
+    except ReviewRunTransitionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    detail = await get_agent_task_detail(session, task.id)
+    assert detail is not None
+    return detail
 
 
 @router.post(

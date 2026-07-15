@@ -30,7 +30,7 @@ from review_orchestrator.pi_agent import (
     PiAgentSession,
     PiAgentSessionStatus,
 )
-from review_orchestrator.providers import ProviderWebhookEvent
+from review_orchestrator.providers import AgentCommand, ProviderWebhookEvent
 from review_orchestrator.reconciliation import persist_and_reconcile_findings
 from review_orchestrator.review_results import (
     ChangedFile,
@@ -184,6 +184,49 @@ async def get_pi_agent_session_diagnostics_for_review_run(
     )
 
 
+async def get_pi_agent_session_diagnostics_for_agent_task(
+    task: AgentTask,
+    *,
+    pi_agent_client: PiAgentClient | None = None,
+    live_status_disabled_reason: str | None = None,
+) -> PiAgentSessionDiagnostics:
+    execution_status: str | None = None
+    execution_stage: str | None = None
+    event_count = 0
+    live_status_error = live_status_disabled_reason
+    if task.agent_session_id and pi_agent_client is not None:
+        try:
+            runtime_session = await pi_agent_client.get_session(task.agent_session_id)
+        except PiAgentClientError as exc:
+            live_status_error = str(exc)
+        else:
+            execution_status = runtime_session.status
+            execution_stage = runtime_session.stage
+            event_count = len(runtime_session.events)
+            live_status_error = None
+    return PiAgentSessionDiagnostics(
+        review_run_id=None,
+        agent_task_ids=[task.id],
+        provider=task.provider,
+        repo_full_name=task.repo_full_name,
+        pull_request_number=task.pull_request_number,
+        status=task.status,
+        stage=task.stage,
+        agent_session_id=task.agent_session_id,
+        agent_provider=task.agent_provider,
+        agent_model=task.agent_model,
+        agent_thinking_level=task.agent_thinking_level,
+        execution_status=execution_status,
+        execution_stage=execution_stage,
+        event_count=event_count,
+        session_available=bool(task.agent_session_id),
+        live_status_available=execution_status is not None,
+        live_status_error=live_status_error,
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+    )
+
+
 async def get_pi_agent_session_diagnostics_for_session(
     session: AsyncSession,
     agent_session_id: str,
@@ -198,11 +241,24 @@ async def get_pi_agent_session_diagnostics_for_session(
         .limit(1)
     )
     review_run = result.scalar_one_or_none()
-    if review_run is None:
+    if review_run is not None:
+        return await get_pi_agent_session_diagnostics_for_review_run(
+            session,
+            review_run,
+            pi_agent_client=pi_agent_client,
+            live_status_disabled_reason=live_status_disabled_reason,
+        )
+    task_result = await session.execute(
+        select(AgentTask)
+        .where(AgentTask.agent_session_id == agent_session_id)
+        .order_by(AgentTask.created_at.desc(), AgentTask.id.desc())
+        .limit(1)
+    )
+    task = task_result.scalar_one_or_none()
+    if task is None:
         return None
-    return await get_pi_agent_session_diagnostics_for_review_run(
-        session,
-        review_run,
+    return await get_pi_agent_session_diagnostics_for_agent_task(
+        task,
         pi_agent_client=pi_agent_client,
         live_status_disabled_reason=live_status_disabled_reason,
     )
@@ -711,6 +767,13 @@ async def accept_provider_webhook(
             pull_request_number=event.pull_request_number,
             failure_code=normalized_event.internal_event,
         )
+        await cancel_active_agent_tasks_for_pr(
+            session,
+            provider=provider,
+            repo_full_name=event.repo_full_name,
+            pull_request_number=event.pull_request_number,
+            failure_code=normalized_event.internal_event,
+        )
 
     if normalized_event.should_create_review_run:
         review_run = await create_review_run_from_provider_payload(
@@ -727,10 +790,12 @@ async def accept_provider_webhook(
             context.latest_review_run_id = review_run_id
 
     if normalized_event.should_create_agent_task:
+        if normalized_event.agent_command is None:
+            raise ValueError("Agent command event is missing command metadata.")
         agent_task = await create_agent_task_from_event(
             session,
             event,
-            payload=payload,
+            command=normalized_event.agent_command,
             context=context,
         )
         agent_task_id = agent_task.id
@@ -910,7 +975,7 @@ async def create_agent_task_from_event(
     session: AsyncSession,
     event: ProviderEventInbox,
     *,
-    payload: dict[str, Any],
+    command: AgentCommand,
     context: PullRequestContext | None = None,
 ) -> AgentTask:
     if not event.repo_full_name or event.pull_request_number is None:
@@ -932,12 +997,20 @@ async def create_agent_task_from_event(
         provider=event.provider,
         repo_full_name=event.repo_full_name,
         pull_request_number=event.pull_request_number,
-        task_type="mention",
+        task_type="message_command",
         status="queued",
+        stage="placeholder_pending",
+        source_kind=command.source_kind,
+        source_comment_id=command.source_comment_id,
+        source_url=command.source_url,
+        source_author_login=command.author_login,
+        command_text=command.command_text,
+        head_sha=context.head_sha if context else event.head_sha,
         input_json={
             "internal_event": event.internal_event,
             "provider_action": event.provider_action,
-            "payload": payload,
+            "author_association": command.author_association,
+            "payload_digest": event.payload_digest,
         },
     )
     session.add(agent_task)
@@ -1011,6 +1084,93 @@ async def get_agent_task_detail(
         input_metadata=redact_value(task.input_json),
         result_json=task.result_json,
     )
+
+
+async def cancel_agent_task(
+    session: AsyncSession,
+    task_id: str,
+    *,
+    pi_agent_client: PiAgentClient,
+    provider_registry: Any,
+) -> AgentTask | None:
+    task = await session.get(AgentTask, task_id)
+    if task is None:
+        return None
+    if task.task_type != "message_command":
+        raise ReviewRunTransitionError("Only message-command tasks can be cancelled.")
+    if task.status not in {"queued", "running"}:
+        raise ReviewRunTransitionError(
+            f"Agent task cannot be cancelled from status {task.status}."
+        )
+    task.status = "running"
+    task.stage = "cancellation_pending"
+    session.add(task)
+    await session.commit()
+    if task.agent_session_id:
+        try:
+            await pi_agent_client.cancel_session(task.agent_session_id)
+        except PiAgentClientError:
+            pass
+    adapter = provider_registry.get(task.provider)
+    if adapter is None or not hasattr(adapter, "publish_agent_task_comment"):
+        raise ReviewRunTransitionError(
+            f"Provider {task.provider} cannot publish agent task comments.",
+            status_code=503,
+        )
+    try:
+        await adapter.publish_agent_task_comment(session, task, state="cancelled")
+    except Exception as exc:
+        task.last_publish_error = str(exc)
+        session.add(task)
+        await session.commit()
+        raise ReviewRunTransitionError(str(exc), status_code=503) from exc
+    task.status = "cancelled"
+    task.stage = "cancelled"
+    task.completed_at = utc_now()
+    task.lock_owner = None
+    task.locked_until = None
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+async def retry_agent_task(
+    session: AsyncSession,
+    task_id: str,
+) -> AgentTask | None:
+    task = await session.get(AgentTask, task_id)
+    if task is None:
+        return None
+    if task.task_type != "message_command":
+        raise ReviewRunTransitionError("Only message-command tasks can be retried.")
+    if task.status != "failed":
+        raise ReviewRunTransitionError(
+            f"Agent task cannot be retried from status {task.status}."
+        )
+    task.status = "queued"
+    task.stage = "placeholder_pending"
+    task.attempt += 1
+    task.agent_start_attempts = 0
+    task.agent_session_id = None
+    task.agent_status = None
+    task.result_text = None
+    task.result_json = None
+    task.failure_code = None
+    task.error_message = None
+    task.last_publish_error = None
+    task.response_body_hash = None
+    task.started_at = None
+    task.completed_at = None
+    task.deadline_at = None
+    task.soft_timeout_emitted_at = None
+    task.hard_timeout_emitted_at = None
+    task.lock_owner = None
+    task.locked_until = None
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
 
 
 async def _get_agent_task_id_for_event(
@@ -1102,6 +1262,7 @@ async def _agent_task_queue_health(
         running=counts.get("running", 0),
         completed=counts.get("completed", 0),
         failed=counts.get("failed", 0),
+        cancelled=counts.get("cancelled", 0),
         oldest_queued_age_seconds=oldest_queued_age_seconds,
     )
 
@@ -1114,6 +1275,26 @@ def _agent_task_summary(task: AgentTask) -> AgentTaskSummary:
         pull_request_number=task.pull_request_number,
         task_type=task.task_type,
         status=task.status,
+        stage=task.stage,
+        source_kind=task.source_kind,
+        source_comment_id=task.source_comment_id,
+        source_url=task.source_url,
+        source_author_login=task.source_author_login,
+        command_text=task.command_text,
+        head_sha=task.head_sha,
+        response_comment_id=task.response_comment_id,
+        response_comment_url=(
+            f"https://github.com/{task.repo_full_name}/pull/"
+            f"{task.pull_request_number}#issuecomment-{task.response_comment_id}"
+            if task.provider == "github" and task.response_comment_id
+            else None
+        ),
+        agent_session_id=task.agent_session_id,
+        agent_status=task.agent_status,
+        agent_provider=task.agent_provider,
+        agent_model=task.agent_model,
+        agent_thinking_level=task.agent_thinking_level,
+        failure_code=task.failure_code,
         provider_event_id=task.provider_event_id,
         provider_event_link=(
             f"/api/v1/provider-events/{task.provider_event_id}"
@@ -1126,6 +1307,11 @@ def _agent_task_summary(task: AgentTask) -> AgentTaskSummary:
             else None
         ),
         error_message=_safe_error_message(task.error_message),
+        started_at=task.started_at,
+        completed_at=task.completed_at,
+        deadline_at=task.deadline_at,
+        soft_timeout_emitted_at=task.soft_timeout_emitted_at,
+        hard_timeout_emitted_at=task.hard_timeout_emitted_at,
         created_at=task.created_at,
         updated_at=task.updated_at,
     )
@@ -1603,6 +1789,41 @@ def _safe_error_message(error_message: str | None) -> str | None:
     if len(first_line) > 1000:
         return f"{first_line[:1000]}..."
     return first_line
+
+
+async def cancel_active_agent_tasks_for_pr(
+    session: AsyncSession,
+    *,
+    provider: str,
+    repo_full_name: str | None,
+    pull_request_number: int | None,
+    failure_code: str,
+) -> list[AgentTask]:
+    if repo_full_name is None or pull_request_number is None:
+        return []
+    result = await session.execute(
+        select(AgentTask).where(
+            AgentTask.provider == provider,
+            AgentTask.repo_full_name == repo_full_name,
+            AgentTask.pull_request_number == pull_request_number,
+            AgentTask.task_type == "message_command",
+            AgentTask.status.in_({"queued", "running"}),
+        )
+    )
+    tasks = list(result.scalars().all())
+    for task in tasks:
+        task.status = "running"
+        task.stage = "cancellation_pending"
+        task.failure_code = failure_code
+        task.error_message = "Pull request closed before the command completed."
+        task.lock_owner = None
+        task.locked_until = None
+        session.add(task)
+    if tasks:
+        await session.commit()
+        for task in tasks:
+            await session.refresh(task)
+    return tasks
 
 
 async def cancel_active_review_runs_for_pr(

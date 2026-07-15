@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -17,6 +18,7 @@ from review_orchestrator.github_auth import (
     StaticGitHubTokenProvider,
 )
 from review_orchestrator.providers import (
+    AgentCommand,
     ParsedProviderWebhook,
     ProviderCapabilityError,
     ProviderOperationError,
@@ -64,6 +66,7 @@ class NormalizedGitHubEvent:
     should_create_review_run: bool
     should_create_agent_task: bool
     status: str
+    agent_command: AgentCommand | None = None
 
     def to_provider_event(self) -> ProviderWebhookEvent:
         return ProviderWebhookEvent(
@@ -78,6 +81,7 @@ class NormalizedGitHubEvent:
             should_create_review_run=self.should_create_review_run,
             should_create_agent_task=self.should_create_agent_task,
             status=self.status,
+            agent_command=self.agent_command,
         )
 
 
@@ -112,6 +116,17 @@ class GitHubAdapter:
             provider_event,
             payload,
             bot_login=getattr(settings, "review_bot_login", None),
+            command_enabled=getattr(settings, "agent_command_enabled", True),
+            allowed_associations={
+                item.strip().upper()
+                for item in getattr(
+                    settings,
+                    "agent_task_allowed_associations",
+                    "OWNER,MEMBER,COLLABORATOR",
+                ).split(",")
+                if item.strip()
+            },
+            max_command_chars=getattr(settings, "agent_task_max_command_chars", 8000),
         )
         return ParsedProviderWebhook(
             delivery_id=delivery_id,
@@ -190,6 +205,27 @@ class GitHubAdapter:
                 review_run,
                 github_client=client,
                 changed_files=changed_files,
+            )
+        except GitHubClientError as exc:
+            raise self._operation_error(operation, exc) from exc
+
+    async def publish_agent_task_comment(
+        self,
+        session: AsyncSession,
+        task: AgentTask,
+        *,
+        state: str,
+    ) -> str:
+        operation = "publish_agent_task_comment"
+        client = self._require_client(operation)
+        from review_orchestrator.comments import publish_github_agent_task_comment
+
+        try:
+            return await publish_github_agent_task_comment(
+                session,
+                task,
+                github_client=client,
+                state=state,
             )
         except GitHubClientError as exc:
             raise self._operation_error(operation, exc) from exc
@@ -596,6 +632,9 @@ def normalize_github_event(
     payload: dict[str, Any],
     *,
     bot_login: str | None = None,
+    command_enabled: bool = True,
+    allowed_associations: set[str] | None = None,
+    max_command_chars: int = 8000,
 ) -> NormalizedGitHubEvent:
     action = _optional_str(payload.get("action"))
 
@@ -608,6 +647,9 @@ def normalize_github_event(
             action,
             payload,
             bot_login=bot_login,
+            command_enabled=command_enabled,
+            allowed_associations=allowed_associations,
+            max_command_chars=max_command_chars,
         )
 
     return NormalizedGitHubEvent(
@@ -659,12 +701,23 @@ def _normalize_comment_context_event(
     payload: dict[str, Any],
     *,
     bot_login: str | None,
+    command_enabled: bool,
+    allowed_associations: set[str] | None,
+    max_command_chars: int,
 ) -> NormalizedGitHubEvent:
     pull_request_number = _pull_request_number(payload)
-    mentions_bot = _comment_mentions_bot(payload, bot_login)
+    command = _extract_agent_command(
+        provider_event,
+        action,
+        payload,
+        bot_login=bot_login,
+        command_enabled=command_enabled,
+        allowed_associations=allowed_associations,
+        max_command_chars=max_command_chars,
+    )
     internal_event = (
-        "agent_mention"
-        if pull_request_number and mentions_bot
+        "agent_command"
+        if pull_request_number and command is not None
         else COMMENT_CONTEXT_EVENTS[provider_event]
         if pull_request_number
         else None
@@ -678,8 +731,11 @@ def _normalize_comment_context_event(
         head_sha=_pull_request_head_sha(payload),
         should_update_context=False,
         should_create_review_run=False,
-        should_create_agent_task=pull_request_number is not None and mentions_bot,
+        should_create_agent_task=(
+            pull_request_number is not None and command is not None
+        ),
         status="received" if internal_event else "ignored",
+        agent_command=command,
     )
 
 
@@ -721,19 +777,71 @@ def _pull_request_merged(payload: dict[str, Any]) -> bool:
     return isinstance(pull_request, dict) and pull_request.get("merged") is True
 
 
-def _comment_mentions_bot(payload: dict[str, Any], bot_login: str | None) -> bool:
-    if not bot_login:
-        return False
+def _extract_agent_command(
+    provider_event: str,
+    action: str | None,
+    payload: dict[str, Any],
+    *,
+    bot_login: str | None,
+    command_enabled: bool,
+    allowed_associations: set[str] | None,
+    max_command_chars: int,
+) -> AgentCommand | None:
+    accepted_actions = {
+        "issue_comment": "created",
+        "pull_request_review": "submitted",
+        "pull_request_review_comment": "created",
+    }
+    if (
+        not command_enabled
+        or not bot_login
+        or action != accepted_actions.get(provider_event)
+    ):
+        return None
     comment = payload.get("comment")
     review = payload.get("review")
-    body = None
-    if isinstance(comment, dict):
-        body = comment.get("body")
-    elif isinstance(review, dict):
-        body = review.get("body")
-    if not isinstance(body, str):
-        return False
-    return f"@{bot_login.lower()}" in body.lower()
+    source = comment if isinstance(comment, dict) else review
+    if not isinstance(source, dict):
+        return None
+    body = source.get("body")
+    source_id = source.get("id")
+    user = source.get("user")
+    if not isinstance(body, str) or not isinstance(source_id, int | str):
+        return None
+    if not isinstance(user, dict):
+        return None
+    author_login = _optional_str(user.get("login"))
+    author_type = _optional_str(user.get("type"))
+    if (
+        not author_login
+        or author_login.lower() == bot_login.lower()
+        or (author_type and author_type.lower() == "bot")
+    ):
+        return None
+    association = _optional_str(source.get("author_association")) or _optional_str(
+        payload.get("author_association")
+    )
+    if allowed_associations is not None and (
+        not association or association.upper() not in allowed_associations
+    ):
+        return None
+    mention_pattern = re.compile(
+        rf"(?<![A-Za-z0-9_-])@{re.escape(bot_login)}(?![A-Za-z0-9_-])",
+        re.IGNORECASE,
+    )
+    if mention_pattern.search(body) is None:
+        return None
+    command_text = mention_pattern.sub("", body).strip()
+    if len(command_text) > max_command_chars:
+        return None
+    return AgentCommand(
+        source_kind=provider_event,
+        source_comment_id=str(source_id),
+        source_url=_optional_str(source.get("html_url")),
+        author_login=author_login,
+        author_association=association,
+        command_text=command_text,
+    )
 
 
 def _optional_str(value: Any) -> str | None:

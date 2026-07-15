@@ -4,7 +4,7 @@ from enum import StrEnum
 from typing import Any, Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from review_orchestrator.review_results import ReviewSkillInput
 
@@ -34,6 +34,57 @@ class PiAgentPendingInput(BaseModel):
     choices: list[str] | None = None
 
 
+class AgentInstructionRepositoryContext(BaseModel):
+    provider: str
+    repo_full_name: str
+    pr_number: int = Field(gt=0)
+    base_sha: str
+    head_sha: str
+
+
+class AgentInstructionHistoryItem(BaseModel):
+    author_login: str
+    command: str
+    answer: str
+    outcome: Literal["answered", "needs_clarification", "refused"]
+    head_sha: str
+
+
+class AgentInstructionInput(BaseModel):
+    idempotency_key: str = Field(min_length=1, max_length=256)
+    workspace_path: str = Field(min_length=1)
+    repository_context: AgentInstructionRepositoryContext
+    text: str = Field(min_length=1, max_length=8000)
+    author_login: str = Field(min_length=1, max_length=255)
+    source_url: str | None = None
+    history: list[AgentInstructionHistoryItem] = Field(
+        default_factory=list,
+        max_length=6,
+    )
+
+
+class AgentTaskReference(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+    line_start: int | None = Field(default=None, ge=1)
+    line_end: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_line_order(self) -> AgentTaskReference:
+        if (
+            self.line_start is not None
+            and self.line_end is not None
+            and self.line_end < self.line_start
+        ):
+            raise ValueError("line_end must be greater than or equal to line_start")
+        return self
+
+
+class AgentTaskResult(BaseModel):
+    outcome: Literal["answered", "needs_clarification", "refused"]
+    answer: str = Field(min_length=1, max_length=30000)
+    references: list[AgentTaskReference] = Field(default_factory=list, max_length=50)
+
+
 class PiAgentRuntimeEvent(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -47,6 +98,7 @@ class PiAgentSession(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     id: str
+    kind: Literal["review", "instruction"] | None = None
     title: str | None = None
     status: PiAgentSessionStatus
     stage: str
@@ -93,6 +145,32 @@ class PiAgentClient:
             "/v1/sessions",
             json=self._start_payload(
                 review_input,
+                skill=skill,
+                profile=profile,
+                provider=provider,
+                model=model,
+                thinking_level=thinking_level,
+                model_base_url=model_base_url,
+            ),
+        )
+        return PiAgentSession.model_validate(response)
+
+    async def start_instruction_session(
+        self,
+        instruction: AgentInstructionInput,
+        *,
+        skill: str,
+        profile: str,
+        provider: str,
+        model: str,
+        thinking_level: str,
+        model_base_url: str | None = None,
+    ) -> PiAgentSession:
+        response = await self._request(
+            "POST",
+            "/v1/sessions",
+            json=self._instruction_start_payload(
+                instruction,
                 skill=skill,
                 profile=profile,
                 provider=provider,
@@ -150,6 +228,46 @@ class PiAgentClient:
             ),
             "workspace_path": review_input.workspace_path,
             "review": review_input.model_dump(),
+            "model": model_config,
+            "skills": [skill],
+            "profile": profile,
+        }
+
+    def _instruction_start_payload(
+        self,
+        instruction: AgentInstructionInput,
+        *,
+        skill: str,
+        profile: str,
+        provider: str,
+        model: str,
+        thinking_level: str,
+        model_base_url: str | None,
+    ) -> dict[str, Any]:
+        model_config = {
+            "provider": provider,
+            "id": model,
+            "thinking_level": thinking_level,
+        }
+        if model_base_url:
+            model_config["base_url"] = model_base_url
+        instruction_payload: dict[str, Any] = {
+            "text": instruction.text,
+            "author_login": instruction.author_login,
+            "history": [item.model_dump() for item in instruction.history],
+        }
+        if instruction.source_url:
+            instruction_payload["source_url"] = instruction.source_url
+        return {
+            "kind": "instruction",
+            "idempotency_key": instruction.idempotency_key,
+            "title": (
+                f"PR #{instruction.repository_context.pr_number} command from "
+                f"{instruction.author_login}"
+            ),
+            "workspace_path": instruction.workspace_path,
+            "repository_context": instruction.repository_context.model_dump(),
+            "instruction": instruction_payload,
             "model": model_config,
             "skills": [skill],
             "profile": profile,

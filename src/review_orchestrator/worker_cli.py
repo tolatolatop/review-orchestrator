@@ -11,6 +11,7 @@ from review_orchestrator.gitlab import GitLabClient
 from review_orchestrator.pi_agent import PiAgentClient
 from review_orchestrator.worker import (
     build_worker_provider_registry,
+    process_agent_task_timeouts,
     process_next_agent_task,
     process_next_review_run,
     process_review_run_timeouts,
@@ -61,6 +62,13 @@ async def run_worker(
 
         while True:
             async with session_factory() as session:
+                await process_agent_task_timeouts(
+                    session,
+                    settings=settings,
+                    pi_agent_client=pi_agent_client,
+                    provider_registry=provider_registry,
+                )
+            async with session_factory() as session:
                 await process_review_run_timeouts(
                     session,
                     settings=settings,
@@ -70,6 +78,8 @@ async def run_worker(
             async with session_factory() as session:
                 agent_task = await process_next_agent_task(
                     session,
+                    settings=settings,
+                    pi_agent_client=pi_agent_client,
                     worker_id=resolved_worker_id,
                     provider_registry=provider_registry,
                 )

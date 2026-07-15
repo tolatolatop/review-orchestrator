@@ -56,6 +56,16 @@ class ProviderOperationError(ProviderError):
 
 
 @dataclass(frozen=True)
+class AgentCommand:
+    source_kind: str
+    source_comment_id: str
+    source_url: str | None
+    author_login: str
+    author_association: str | None
+    command_text: str
+
+
+@dataclass(frozen=True)
 class ProviderWebhookEvent:
     provider: str
     provider_event: str
@@ -68,6 +78,7 @@ class ProviderWebhookEvent:
     should_create_review_run: bool
     should_create_agent_task: bool
     status: str
+    agent_command: AgentCommand | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +130,15 @@ class ProviderAdapter(Protocol):
         *,
         changed_files: list[ChangedFile],
     ) -> dict[str, int]:
+        ...
+
+    async def publish_agent_task_comment(
+        self,
+        session: AsyncSession,
+        task: AgentTask,
+        *,
+        state: str,
+    ) -> str:
         ...
 
 

@@ -75,6 +75,15 @@ parameter for browser pages.
 | `ANTHROPIC_API_KEY` | empty | Standard key discovered by pi's Anthropic provider. |
 | `PI_AGENT_REVIEW_SKILL` | `code-review` | Default Agent Skill name. |
 | `PI_AGENT_REVIEW_PROFILE` | `default` | Default profile metadata. |
+| `AGENT_COMMAND_ENABLED` | `true` | Enable trusted `@bot` PR message commands. |
+| `AGENT_COMMAND_SKILL` | `pr-assistant` | Read-only skill for message commands. |
+| `AGENT_COMMAND_PROFILE` | `default` | Message-command profile metadata. |
+| `AGENT_TASK_SOFT_TIMEOUT_SECONDS` | `120` | Refresh a delayed command placeholder once. |
+| `AGENT_TASK_TIMEOUT_SECONDS` | `600` | Cancel a command session and publish timeout. |
+| `AGENT_TASK_MAX_HISTORY_TURNS` | `6` | Prior successful PR command exchanges supplied to the agent. |
+| `AGENT_TASK_MAX_HISTORY_CHARS` | `24000` | Total prior command/answer prompt characters. |
+| `AGENT_TASK_ALLOWED_ASSOCIATIONS` | `OWNER,MEMBER,COLLABORATOR` | GitHub author associations allowed to consume command capacity. |
+| `AGENT_TASK_MAX_COMMAND_CHARS` | `8000` | Maximum command length after removing the bot mention. |
 | `PI_AGENT_SKILLS_PATH` | `./pi-agent-runtime/skills` | Host directory mounted read-only at `/opt/pi-agent/skills`. |
 | `PI_AGENT_CONFIG_PATH` | `./pi-agent-runtime/config` | Host directory containing optional `models.json`. |
 | `PI_AGENT_TIMEOUT_SECONDS` | `30` | Runtime HTTP request timeout. |
@@ -146,6 +155,35 @@ curl -X POST \
 Use `delivery=steer` to affect the active turn or `delivery=follow_up` to queue
 input after the current work. Messages are delivered through pi-agent's native
 steering/follow-up APIs.
+
+## Pull Request Message Commands
+
+Set `REVIEW_BOT_LOGIN` to the GitHub App bot login, for example
+`bitbakedev[bot]`. A trusted repository participant can then write:
+
+```text
+@bitbakedev[bot] explain why the retry loop cannot run forever
+```
+
+The webhook stores a `message_command` AgentTask and returns immediately. The
+worker must create or recover its placeholder before starting pi-agent. It then
+updates the same comment with the validated answer. The command is read-only;
+requests to edit or push code are answered within that boundary rather than
+executed.
+
+Inspect or control a command:
+
+```bash
+curl http://127.0.0.1:${REVIEW_LOCAL_PORT:-18000}/api/v1/agent-tasks/<task-id>
+curl http://127.0.0.1:${REVIEW_LOCAL_PORT:-18000}/api/v1/agent-tasks/<task-id>/agent-session
+curl -X POST http://127.0.0.1:${REVIEW_LOCAL_PORT:-18000}/api/v1/agent-tasks/<task-id>/cancel
+curl -X POST http://127.0.0.1:${REVIEW_LOCAL_PORT:-18000}/api/v1/agent-tasks/<task-id>/retry
+```
+
+The runtime uses `submit_task_result`, not `submit_review`. An empty mention is
+completed without an LLM call and asks the user to include a request. Comments
+from the bot itself, untrusted author associations, edited comments, and
+oversized commands do not start an agent.
 
 ## Manual Session API
 

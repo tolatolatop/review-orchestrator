@@ -38,6 +38,9 @@ Operator clients should use these paths:
 | `GET /api/v1/observability/review-runs/{review_run_id}` | Run detail with session, findings, retry, and publishing summaries. |
 | `GET /api/v1/observability/agent-tasks` | List queued/running/completed agent tasks. |
 | `GET /api/v1/observability/agent-tasks/{agent_task_id}` | Agent task detail with redacted input and result. |
+| `GET /api/v1/agent-tasks/{agent_task_id}/agent-session` | Live pi-agent instruction session for a message task. |
+| `POST /api/v1/agent-tasks/{agent_task_id}/cancel` | Cancel runtime work and update the task placeholder. |
+| `POST /api/v1/agent-tasks/{agent_task_id}/retry` | Requeue a failed command using the same placeholder and a new idempotent attempt. |
 | `GET /api/v1/observability/pull-requests/{provider}/{repo}/{number}` | PR context drill-down entry point. |
 | `GET /api/v1/observability/agent-sessions/{agent_session_id}` | pi-agent session status known to the orchestrator. |
 | `GET /api/v1/observability/review-runs/{review_run_id}/agent-session` | pi-agent status, stage, model, event count, and pending human-input question for one review run. |
@@ -180,10 +183,11 @@ Current shared models:
 - `ProviderEventInboxListResponse`
 - `ProviderEventInboxDetail`
 
-pi-agent session diagnostics expose only safe metadata: review run and linked
-agent task identifiers, session ID, selected provider/model/thinking level,
-run status/stage, live execution stage, event count, and any pending human-input
-question. The response never includes LLM credentials, assistant reasoning, raw
+pi-agent session diagnostics expose only safe metadata: optional review run and
+linked agent task identifiers, session ID, selected provider/model/thinking
+level, owner status/stage, live execution stage, event count, and any pending
+review human-input question. The response never includes LLM credentials,
+assistant reasoning, raw
 tool output, the runtime session file contents, container internals, or logs.
 
 Future endpoint response models should add endpoint-specific item fields while

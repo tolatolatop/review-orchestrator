@@ -7,10 +7,134 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from review_orchestrator.github import GitHubClient, GitHubClientError
 from review_orchestrator.gitlab import GitLabClient, GitLabClientError
-from review_orchestrator.models import Finding, ReviewCommentRef, ReviewRun
+from review_orchestrator.models import (
+    AgentTask,
+    Finding,
+    ReviewCommentRef,
+    ReviewRun,
+    utc_now,
+)
 from review_orchestrator.review_results import ChangedFile
 
 SUMMARY_MARKER = "<!-- review-orchestrator:summary"
+AGENT_TASK_MARKER = "<!-- review-orchestrator:agent-task"
+
+
+def agent_task_marker(task: AgentTask) -> str:
+    source_id = task.source_comment_id or "unknown"
+    return f"{AGENT_TASK_MARKER} task_id={task.id} source_id={source_id} -->"
+
+
+def build_agent_task_comment_body(task: AgentTask, *, state: str) -> str:
+    author = task.source_author_login or "user"
+    marker = agent_task_marker(task)
+    short_id = task.id[:8]
+    if state == "completed":
+        answer = task.result_text or "The agent completed without an answer."
+        lines = [marker, f"🤖 Answer for @{author}", "", answer]
+        references = (task.result_json or {}).get("references")
+        if isinstance(references, list) and references:
+            lines.extend(["", "References:"])
+            for reference in references[:50]:
+                if not isinstance(reference, dict):
+                    continue
+                path = reference.get("path")
+                if not isinstance(path, str):
+                    continue
+                line_start = reference.get("line_start")
+                line_end = reference.get("line_end")
+                suffix = ""
+                if isinstance(line_start, int):
+                    suffix = f":{line_start}"
+                    if isinstance(line_end, int) and line_end != line_start:
+                        suffix += f"-{line_end}"
+                lines.append(f"- `{path}{suffix}`")
+        lines.extend(["", f"Task: `{short_id}` · completed"])
+        return "\n".join(lines)
+    if state == "soft_timeout":
+        return "\n".join(
+            [
+                marker,
+                f"🤖 Still working on @{author}'s request…",
+                "",
+                "The task is taking longer than expected and is still running.",
+                f"Task: `{short_id}`",
+            ]
+        )
+    if state == "cancelled":
+        return "\n".join(
+            [
+                marker,
+                f"🤖 Request for @{author} was cancelled.",
+                "",
+                f"Task: `{short_id}` · cancelled",
+            ]
+        )
+    if state == "failed":
+        if task.failure_code == "hard_timeout":
+            detail = "The task timed out before the agent produced a valid result."
+        else:
+            detail = "Could not complete the request."
+        lines = [marker, f"🤖 Request for @{author} failed.", "", detail]
+        if task.failure_code:
+            lines.append(f"Failure category: `{task.failure_code}`")
+        if task.error_message:
+            lines.append(f"Error: {_safe_error_text(task.error_message)}")
+        lines.extend(["", f"Task: `{short_id}` · failed"])
+        return "\n".join(lines)
+    status = "queued" if state == "queued" else "preparing repository context"
+    return "\n".join(
+        [
+            marker,
+            f"🤖 Working on @{author}'s request…",
+            "",
+            f"Status: {status}",
+            f"Task: `{short_id}`",
+        ]
+    )
+
+
+async def publish_github_agent_task_comment(
+    session: AsyncSession,
+    task: AgentTask,
+    *,
+    github_client: GitHubClient,
+    state: str,
+) -> str:
+    body = build_agent_task_comment_body(task, state=state)
+    digest = body_hash(body)
+    if task.response_comment_id and task.response_body_hash == digest:
+        return task.response_comment_id
+    comment_id = task.response_comment_id
+    if comment_id is None:
+        marker = agent_task_marker(task)
+        for comment in await github_client.list_issue_comments(
+            task.repo_full_name, task.pull_request_number
+        ):
+            if comment.body and marker in comment.body:
+                comment_id = str(comment.id)
+                break
+    if comment_id is None:
+        comment_id = await github_client.create_issue_comment(
+            task.repo_full_name,
+            task.pull_request_number,
+            body,
+        )
+    else:
+        comment_id = await github_client.update_issue_comment(
+            task.repo_full_name,
+            comment_id,
+            body,
+        )
+    task.response_comment_id = str(comment_id)
+    task.response_body_hash = digest
+    task.response_published_at = utc_now()
+    task.publish_attempts += 1
+    task.last_publish_error = None
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return str(comment_id)
 
 
 def build_summary_comment_body(

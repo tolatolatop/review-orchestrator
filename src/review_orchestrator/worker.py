@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from review_orchestrator.config import Settings
@@ -23,7 +25,14 @@ from review_orchestrator.models import (
     ReviewRun,
     utc_now,
 )
-from review_orchestrator.pi_agent import PiAgentClient, PiAgentClientError
+from review_orchestrator.pi_agent import (
+    AgentInstructionHistoryItem,
+    AgentInstructionInput,
+    AgentInstructionRepositoryContext,
+    AgentTaskResult,
+    PiAgentClient,
+    PiAgentClientError,
+)
 from review_orchestrator.providers import (
     ProviderAdapter,
     ProviderError,
@@ -104,18 +113,33 @@ async def acquire_next_agent_task(
     session: AsyncSession,
     *,
     worker_id: str,
+    lock_seconds: int = 300,
+    now: datetime | None = None,
 ) -> AgentTask | None:
+    now = now or utc_now()
     result = await session.execute(
         select(AgentTask)
-        .where(AgentTask.status == "queued")
+        .where(
+            or_(
+                AgentTask.status == "queued",
+                and_(
+                    AgentTask.task_type == "message_command",
+                    AgentTask.status == "running",
+                ),
+            ),
+            or_(AgentTask.locked_until.is_(None), AgentTask.locked_until < now),
+        )
         .order_by(AgentTask.created_at)
         .limit(1)
     )
     task = result.scalar_one_or_none()
     if task is None:
         return None
-    task.status = "running"
-    task.result_json = {"worker_id": worker_id}
+    if task.task_type != "message_command":
+        task.status = "running"
+        task.result_json = {"worker_id": worker_id}
+    task.lock_owner = worker_id
+    task.locked_until = now + timedelta(seconds=lock_seconds)
     session.add(task)
     await session.commit()
     await session.refresh(task)
@@ -126,17 +150,58 @@ async def process_next_agent_task(
     session: AsyncSession,
     *,
     worker_id: str,
+    settings: Settings | None = None,
+    pi_agent_client: PiAgentClient | None = None,
     github_client: GitHubClient | None = None,
     gitlab_client: GitLabClient | None = None,
     provider_registry: ProviderRegistry | None = None,
 ) -> AgentTask | None:
-    task = await acquire_next_agent_task(session, worker_id=worker_id)
+    task = await acquire_next_agent_task(
+        session,
+        worker_id=worker_id,
+        lock_seconds=settings.worker_lock_seconds if settings else 300,
+    )
     if task is None:
         return None
     registry = provider_registry or build_worker_provider_registry(
         github_client=github_client,
         gitlab_client=gitlab_client,
     )
+
+    if task.task_type == "message_command":
+        if settings is None or pi_agent_client is None:
+            return await _fail_command_agent_task(
+                session,
+                task,
+                failure_code="worker_not_configured",
+                error=(
+                    "Message-command execution requires worker settings and pi-agent."
+                ),
+                provider_registry=registry,
+            )
+        try:
+            return await _process_command_agent_task(
+                session,
+                task,
+                settings=settings,
+                pi_agent_client=pi_agent_client,
+                github_client=github_client,
+                provider_registry=registry,
+            )
+        except Exception as exc:
+            return await _fail_command_agent_task(
+                session,
+                task,
+                failure_code="agent_task_failed",
+                error=str(exc),
+                provider_registry=registry,
+            )
+        finally:
+            await _release_agent_task_lock(
+                session,
+                task.id,
+                retry_after_seconds=settings.worker_poll_interval_seconds,
+            )
 
     try:
         context = await _task_context(session, task)
@@ -191,6 +256,520 @@ async def process_next_agent_task(
             error=str(exc),
             provider_registry=registry,
         )
+
+
+async def _process_command_agent_task(
+    session: AsyncSession,
+    task: AgentTask,
+    *,
+    settings: Settings,
+    pi_agent_client: PiAgentClient,
+    github_client: GitHubClient | None,
+    provider_registry: ProviderRegistry,
+) -> AgentTask:
+    if task.response_comment_id is None or task.stage == "placeholder_pending":
+        try:
+            await _publish_agent_task_comment(
+                session, task, provider_registry=provider_registry, state="working"
+            )
+        except ProviderError as exc:
+            task.last_publish_error = str(exc)
+            task.error_message = str(exc)
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            return task
+
+    if task.stage == "cancellation_pending":
+        return await _cancel_command_agent_task(
+            session,
+            task,
+            pi_agent_client=pi_agent_client,
+            provider_registry=provider_registry,
+        )
+    if task.stage == "publishing_failure":
+        return await _fail_command_agent_task(
+            session,
+            task,
+            failure_code=task.failure_code or "agent_task_failed",
+            error=task.error_message or "Agent task failed.",
+            provider_registry=provider_registry,
+        )
+
+    if not (task.command_text or "").strip():
+        task.result_text = "Please include a request after the bot mention."
+        task.result_json = {
+            "outcome": "needs_clarification",
+            "answer": task.result_text,
+            "references": [],
+        }
+        return await _complete_command_agent_task(
+            session, task, provider_registry=provider_registry
+        )
+
+    older_result = await session.execute(
+        select(AgentTask.id).where(
+            AgentTask.provider == task.provider,
+            AgentTask.repo_full_name == task.repo_full_name,
+            AgentTask.pull_request_number == task.pull_request_number,
+            AgentTask.task_type == "message_command",
+            AgentTask.status.in_({"queued", "running"}),
+            AgentTask.created_at < task.created_at,
+        ).limit(1)
+    )
+    if older_result.scalar_one_or_none() is not None:
+        task.status = "queued"
+        task.stage = "waiting_for_turn"
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        try:
+            await _publish_agent_task_comment(
+                session,
+                task,
+                provider_registry=provider_registry,
+                state="queued",
+            )
+        except ProviderError as exc:
+            task.last_publish_error = str(exc)
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+        return task
+
+    context = await _task_context(session, task)
+    if context is None:
+        try:
+            context = await _hydrate_task_context(
+                session, task, provider_registry=provider_registry
+            )
+        except ProviderError as exc:
+            return await _fail_command_agent_task(
+                session,
+                task,
+                failure_code="provider_context_lookup_failed",
+                error=str(exc),
+                provider_registry=provider_registry,
+            )
+    if context is None:
+        return await _fail_command_agent_task(
+            session,
+            task,
+            failure_code="missing_pr_context",
+            error="Pull request context was not found for message command.",
+            provider_registry=provider_registry,
+        )
+    if context.status not in {"open", "opened"}:
+        return await _fail_command_agent_task(
+            session,
+            task,
+            failure_code="pull_request_closed",
+            error="The pull request is no longer open.",
+            provider_registry=provider_registry,
+        )
+    command_config = await get_or_create_review_config(
+        session,
+        provider=task.provider,
+        repo_full_name=task.repo_full_name,
+    )
+    if command_config.agent_commands_enabled is False:
+        return await _fail_command_agent_task(
+            session,
+            task,
+            failure_code="agent_commands_disabled",
+            error="Agent commands are disabled for this repository.",
+            provider_registry=provider_registry,
+        )
+
+    task.head_sha = task.head_sha or context.head_sha
+    if task.workspace_path is None:
+        task.status = "running"
+        task.stage = "preparing_workspace"
+        session.add(task)
+        await session.commit()
+        try:
+            workspace = await prepare_workspace(
+                session,
+                settings,
+                _workspace_request_from_context(context),
+                github_client=github_client if task.provider == "github" else None,
+            )
+        except Exception as exc:
+            return await _fail_command_agent_task(
+                session,
+                task,
+                failure_code="workspace_failed",
+                error=str(exc),
+                provider_registry=provider_registry,
+            )
+        if workspace.status == "failed":
+            return await _fail_command_agent_task(
+                session,
+                task,
+                failure_code=workspace.failure_code or "workspace_failed",
+                error=workspace.failure_message or "Workspace preparation failed.",
+                provider_registry=provider_registry,
+            )
+        task.workspace_path = workspace.workspace_path
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+
+    if task.agent_session_id is None:
+        task.status = "running"
+        task.stage = "starting_agent"
+        task.started_at = task.started_at or utc_now()
+        task.deadline_at = task.started_at + timedelta(
+            seconds=settings.agent_task_timeout_seconds
+        )
+        session.add(task)
+        await session.commit()
+        instruction = await _build_agent_instruction(session, task, context, settings)
+        task.agent_start_attempts += 1
+        session.add(task)
+        await session.commit()
+        try:
+            runtime_session = await pi_agent_client.start_instruction_session(
+                instruction,
+                skill=(
+                    command_config.default_agent_command_skill
+                    or settings.agent_command_skill
+                ),
+                profile=(
+                    command_config.default_agent_command_profile
+                    or settings.agent_command_profile
+                ),
+                provider=settings.pi_agent_provider,
+                model=settings.pi_agent_model,
+                thinking_level=settings.pi_agent_thinking_level,
+                model_base_url=settings.pi_agent_model_base_url,
+            )
+        except PiAgentClientError as exc:
+            if (
+                exc.infrastructure_failure
+                and task.agent_start_attempts < settings.retry_max_attempts
+            ):
+                task.status = "queued"
+                task.stage = "retrying_agent_start"
+                task.error_message = str(exc)
+                task.locked_until = utc_now() + timedelta(
+                    seconds=settings.retry_initial_delay_seconds
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                return task
+            return await _fail_command_agent_task(
+                session,
+                task,
+                failure_code="agent_start_failed",
+                error=str(exc),
+                provider_registry=provider_registry,
+            )
+        task.agent_session_id = runtime_session.id
+        task.error_message = None
+    else:
+        try:
+            runtime_session = await pi_agent_client.get_session(task.agent_session_id)
+        except PiAgentClientError as exc:
+            return await _fail_command_agent_task(
+                session,
+                task,
+                failure_code="agent_sync_failed",
+                error=str(exc),
+                provider_registry=provider_registry,
+            )
+
+    task.agent_status = runtime_session.status.value
+    task.agent_provider = runtime_session.provider
+    task.agent_model = runtime_session.model
+    task.agent_thinking_level = runtime_session.thinking_level
+    if runtime_session.status == "completed":
+        try:
+            result = AgentTaskResult.model_validate(runtime_session.result)
+            await _validate_task_result_references(task, result)
+        except Exception:
+            return await _fail_command_agent_task(
+                session,
+                task,
+                failure_code="invalid_result",
+                error="Agent returned an invalid structured task result.",
+                provider_registry=provider_registry,
+            )
+        task.result_text = result.answer
+        task.result_json = result.model_dump()
+        return await _complete_command_agent_task(
+            session, task, provider_registry=provider_registry
+        )
+    if runtime_session.status in {"failed", "cancelled"}:
+        return await _fail_command_agent_task(
+            session,
+            task,
+            failure_code=(
+                "agent_cancelled"
+                if runtime_session.status == "cancelled"
+                else "agent_failed"
+            ),
+            error=(
+                runtime_session.error
+                or f"Agent session {runtime_session.status.value}."
+            ),
+            provider_registry=provider_registry,
+        )
+
+    task.status = "running"
+    task.stage = "waiting_for_agent"
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+async def _build_agent_instruction(
+    session: AsyncSession,
+    task: AgentTask,
+    context: PullRequestContext,
+    settings: Settings,
+) -> AgentInstructionInput:
+    result = await session.execute(
+        select(AgentTask)
+        .where(
+            AgentTask.provider == task.provider,
+            AgentTask.repo_full_name == task.repo_full_name,
+            AgentTask.pull_request_number == task.pull_request_number,
+            AgentTask.task_type == "message_command",
+            AgentTask.status == "completed",
+            AgentTask.created_at < task.created_at,
+            AgentTask.result_text.is_not(None),
+        )
+        .order_by(AgentTask.created_at.desc())
+        .limit(settings.agent_task_max_history_turns)
+    )
+    history: list[AgentInstructionHistoryItem] = []
+    remaining = settings.agent_task_max_history_chars
+    for previous in reversed(list(result.scalars().all())):
+        command = previous.command_text or ""
+        answer = previous.result_text or ""
+        size = len(command) + len(answer)
+        if size > remaining:
+            continue
+        remaining -= size
+        raw_outcome = (previous.result_json or {}).get("outcome", "answered")
+        outcome = (
+            raw_outcome
+            if raw_outcome in {"answered", "needs_clarification", "refused"}
+            else "answered"
+        )
+        history.append(
+            AgentInstructionHistoryItem(
+                author_login=previous.source_author_login or "user",
+                command=command,
+                answer=answer,
+                outcome=outcome,
+                head_sha=previous.head_sha or context.head_sha,
+            )
+        )
+    return AgentInstructionInput(
+        idempotency_key=f"agent-task:{task.id}:attempt:{task.attempt}",
+        workspace_path=task.workspace_path or "",
+        repository_context=AgentInstructionRepositoryContext(
+            provider=task.provider,
+            repo_full_name=task.repo_full_name,
+            pr_number=task.pull_request_number,
+            base_sha=context.base_sha,
+            head_sha=task.head_sha or context.head_sha,
+        ),
+        text=task.command_text or "",
+        author_login=task.source_author_login or "user",
+        source_url=task.source_url,
+        history=history,
+    )
+
+
+async def _validate_task_result_references(
+    task: AgentTask,
+    result: AgentTaskResult,
+) -> None:
+    if not task.workspace_path:
+        raise ValueError("Task workspace is missing.")
+    await asyncio.to_thread(_validate_task_result_reference_paths, task, result)
+
+
+def _validate_task_result_reference_paths(
+    task: AgentTask,
+    result: AgentTaskResult,
+) -> None:
+    assert task.workspace_path is not None
+    workspace = Path(task.workspace_path).resolve()
+    for reference in result.references:
+        target = (workspace / reference.path).resolve()
+        try:
+            target.relative_to(workspace)
+        except ValueError as exc:
+            raise ValueError("Task result reference escapes the workspace.") from exc
+        if not target.is_file():
+            raise ValueError(f"Task result reference does not exist: {reference.path}")
+
+
+async def _complete_command_agent_task(
+    session: AsyncSession,
+    task: AgentTask,
+    *,
+    provider_registry: ProviderRegistry,
+) -> AgentTask:
+    task.status = "running"
+    task.stage = "publishing_result"
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    try:
+        await _publish_agent_task_comment(
+            session, task, provider_registry=provider_registry, state="completed"
+        )
+    except ProviderError as exc:
+        task.last_publish_error = str(exc)
+        task.error_message = str(exc)
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        return task
+    task.status = "completed"
+    task.stage = "completed"
+    task.completed_at = utc_now()
+    task.error_message = None
+    task.failure_code = None
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+async def _publish_agent_task_comment(
+    session: AsyncSession,
+    task: AgentTask,
+    *,
+    provider_registry: ProviderRegistry,
+    state: str,
+) -> str:
+    adapter = provider_registry.get(task.provider)
+    if adapter is None or not hasattr(adapter, "publish_agent_task_comment"):
+        raise ProviderError(
+            f"Provider {task.provider} cannot publish agent task comments.",
+            provider=task.provider,
+            operation="publish_agent_task_comment",
+        )
+    try:
+        return await adapter.publish_agent_task_comment(session, task, state=state)
+    except ProviderError:
+        raise
+    except Exception as exc:
+        raise ProviderError(
+            str(exc),
+            provider=task.provider,
+            operation="publish_agent_task_comment",
+        ) from exc
+
+
+async def _fail_command_agent_task(
+    session: AsyncSession,
+    task: AgentTask,
+    *,
+    failure_code: str,
+    error: str,
+    provider_registry: ProviderRegistry,
+) -> AgentTask:
+    task.status = "running"
+    task.stage = "publishing_failure"
+    task.failure_code = failure_code
+    task.error_message = error
+    task.completed_at = utc_now()
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    try:
+        await _publish_agent_task_comment(
+            session, task, provider_registry=provider_registry, state="failed"
+        )
+    except ProviderError as exc:
+        task.last_publish_error = str(exc)
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        return task
+    task.status = "failed"
+    task.stage = "failed"
+    task.last_publish_error = None
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+async def _cancel_command_agent_task(
+    session: AsyncSession,
+    task: AgentTask,
+    *,
+    pi_agent_client: PiAgentClient,
+    provider_registry: ProviderRegistry,
+) -> AgentTask:
+    if task.agent_session_id:
+        try:
+            await pi_agent_client.cancel_session(task.agent_session_id)
+        except PiAgentClientError:
+            pass
+    task.status = "running"
+    task.stage = "cancellation_pending"
+    session.add(task)
+    await session.commit()
+    try:
+        await _publish_agent_task_comment(
+            session,
+            task,
+            provider_registry=provider_registry,
+            state="cancelled",
+        )
+    except ProviderError as exc:
+        task.last_publish_error = str(exc)
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        return task
+    task.status = "cancelled"
+    task.stage = "cancelled"
+    task.completed_at = utc_now()
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+async def _release_agent_task_lock(
+    session: AsyncSession,
+    task_id: str,
+    *,
+    retry_after_seconds: float = 0,
+) -> AgentTask | None:
+    task = await session.get(AgentTask, task_id)
+    if task is None:
+        return None
+    task.lock_owner = None
+    if task.stage == "retrying_agent_start" and task.locked_until is not None:
+        pass
+    elif task.status in {"queued", "running"} and task.stage in {
+        "waiting_for_turn",
+        "waiting_for_agent",
+        "publishing_result",
+        "publishing_failure",
+        "cancellation_pending",
+        "placeholder_pending",
+    }:
+        task.locked_until = utc_now() + timedelta(seconds=retry_after_seconds)
+    else:
+        task.locked_until = None
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
 
 
 async def _fail_agent_task(
@@ -535,6 +1114,81 @@ def _should_publish_reviewing(review_run: ReviewRun) -> bool:
         and review_run.soft_timeout_emitted_at is None
         and review_run.stage in {None, "start"}
     )
+
+
+async def process_agent_task_timeouts(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    pi_agent_client: PiAgentClient,
+    github_client: GitHubClient | None = None,
+    gitlab_client: GitLabClient | None = None,
+    provider_registry: ProviderRegistry | None = None,
+    now: datetime | None = None,
+) -> list[AgentTask]:
+    now = now or utc_now()
+    registry = provider_registry or build_worker_provider_registry(
+        github_client=github_client,
+        gitlab_client=gitlab_client,
+    )
+    result = await session.execute(
+        select(AgentTask).where(
+            AgentTask.task_type == "message_command",
+            AgentTask.status.in_({"queued", "running"}),
+            AgentTask.stage.in_(
+                {"starting_agent", "waiting_for_agent", "retrying_agent_start"}
+            ),
+            AgentTask.started_at.is_not(None),
+        )
+    )
+    touched: list[AgentTask] = []
+    for task in result.scalars().all():
+        if task.started_at is None:
+            continue
+        started_at = task.started_at
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=now.tzinfo)
+        elapsed = (now - started_at).total_seconds()
+        if elapsed >= settings.agent_task_timeout_seconds:
+            if task.hard_timeout_emitted_at is not None:
+                continue
+            task.hard_timeout_emitted_at = now
+            if task.agent_session_id:
+                try:
+                    await pi_agent_client.cancel_session(task.agent_session_id)
+                except PiAgentClientError:
+                    pass
+            failed = await _fail_command_agent_task(
+                session,
+                task,
+                failure_code="hard_timeout",
+                error="Agent task exceeded the hard timeout.",
+                provider_registry=registry,
+            )
+            touched.append(failed)
+            continue
+        if (
+            elapsed >= settings.agent_task_soft_timeout_seconds
+            and task.soft_timeout_emitted_at is None
+        ):
+            task.soft_timeout_emitted_at = now
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            try:
+                await _publish_agent_task_comment(
+                    session,
+                    task,
+                    provider_registry=registry,
+                    state="soft_timeout",
+                )
+            except ProviderError as exc:
+                task.last_publish_error = str(exc)
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+            touched.append(task)
+    return touched
 
 
 async def process_review_run_timeouts(

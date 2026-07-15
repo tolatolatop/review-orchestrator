@@ -81,3 +81,58 @@ async def test_init_models_migrates_legacy_session_identifiers(tmp_path: Path) -
         assert migrated_session == "legacy-session-1"
     finally:
         await engine.dispose()
+
+
+async def test_init_models_adds_message_command_task_columns(tmp_path: Path) -> None:
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/legacy-task.db",
+        github_app_id=None,
+        github_private_key_path=None,
+    )
+    engine = create_engine(settings)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "CREATE TABLE agent_task ("
+                    "id VARCHAR(36) PRIMARY KEY, "
+                    "provider_event_id VARCHAR(36))"
+                )
+            )
+            await connection.execute(
+                text("CREATE TABLE review_config (id VARCHAR(36) PRIMARY KEY)")
+            )
+
+        await init_models(engine)
+
+        async with engine.connect() as connection:
+            task_columns = await connection.run_sync(
+                lambda sync_connection: {
+                    column["name"]
+                    for column in inspect(sync_connection).get_columns("agent_task")
+                }
+            )
+            config_columns = await connection.run_sync(
+                lambda sync_connection: {
+                    column["name"]
+                    for column in inspect(sync_connection).get_columns("review_config")
+                }
+            )
+
+        assert {
+            "stage",
+            "command_text",
+            "response_comment_id",
+            "agent_session_id",
+            "result_text",
+            "failure_code",
+            "soft_timeout_emitted_at",
+            "hard_timeout_emitted_at",
+        } <= task_columns
+        assert {
+            "agent_commands_enabled",
+            "default_agent_command_skill",
+            "default_agent_command_profile",
+        } <= config_columns
+    finally:
+        await engine.dispose()

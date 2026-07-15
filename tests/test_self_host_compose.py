@@ -43,6 +43,25 @@ def test_pi_agent_runtime_supports_configurable_models_and_skills() -> None:
     ) in compose
     assert "PI_AGENT_PROVIDER=openai" in example_env
     assert "PI_AGENT_SKILLS_PATH=./pi-agent-runtime/skills" in example_env
+    assert "PI_AGENT_COMMAND_SKILL: ${AGENT_COMMAND_SKILL:-pr-assistant}" in compose
+    assert "AGENT_COMMAND_SKILL=pr-assistant" in example_env
+
+
+def test_worker_receives_message_command_timeout_and_history_configuration() -> None:
+    compose, example_env = root_files()
+    worker = compose.split("  review-orchestrator-worker:", 1)[1].split(
+        "  nginx:", 1
+    )[0]
+
+    assert "AGENT_TASK_SOFT_TIMEOUT_SECONDS:" in worker
+    assert "AGENT_TASK_TIMEOUT_SECONDS:" in worker
+    assert "AGENT_TASK_MAX_HISTORY_TURNS:" in worker
+    assert "AGENT_TASK_MAX_HISTORY_CHARS:" in worker
+    assert "AGENT_TASK_ALLOWED_ASSOCIATIONS:" in worker
+    assert "AGENT_TASK_SOFT_TIMEOUT_SECONDS=120" in example_env
+    assert "AGENT_TASK_TIMEOUT_SECONDS=600" in example_env
+    assert "AGENT_TASK_MAX_HISTORY_TURNS=6" in example_env
+    assert "AGENT_TASK_MAX_HISTORY_CHARS=24000" in example_env
 
 
 def test_pi_agent_runtime_defaults_to_loopback_port_3210() -> None:
