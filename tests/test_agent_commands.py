@@ -11,14 +11,18 @@ from review_orchestrator.comments import (
 )
 from review_orchestrator.config import Settings
 from review_orchestrator.db import create_engine, create_session_factory, init_models
-from review_orchestrator.github import GitHubClientError
+from review_orchestrator.github import GitHubAdapter, GitHubClientError
 from review_orchestrator.models import AgentTask, PullRequestContext, ReviewRun, utc_now
 from review_orchestrator.pi_agent import PiAgentClientError, PiAgentSession
+from review_orchestrator.providers import ProviderRegistry
 from review_orchestrator.worker import (
-    build_worker_provider_registry,
     process_agent_task_timeouts,
     process_next_agent_task,
 )
+
+
+def github_registry(client) -> ProviderRegistry:
+    return ProviderRegistry([GitHubAdapter(client)])
 
 
 class FakeGitHubClient:
@@ -274,9 +278,7 @@ async def _deliver_once(session, github_client, *, worker_id="publisher-1"):
     return await process_next_delivery(
         session,
         worker_id=worker_id,
-        provider_registry=build_worker_provider_registry(
-            github_client=github_client
-        ),
+        provider_registry=github_registry(github_client),
         retry_delay_seconds=0,
     )
 
@@ -302,7 +304,7 @@ async def _run_command_until(
             settings=settings,
             pi_agent_client=pi_agent_client,
             worker_id=f"worker-{index}",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
         await _deliver_once(
             session,
@@ -422,7 +424,7 @@ async def test_agent_does_not_start_until_placeholder_retry_succeeds(
             settings=settings,
             pi_agent_client=pi_agent_client,
             worker_id="worker-1",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
         assert waiting is not None
         waiting_state = (waiting.status, waiting.stage)
@@ -520,7 +522,7 @@ async def test_newer_command_gets_placeholder_but_waits_for_older_pr_task(
             settings=command_settings(tmp_path),
             pi_agent_client=pi_agent_client,
             worker_id="worker-1",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
         await _deliver_once(session, github_client)
         waiting = await process_next_agent_task(
@@ -528,7 +530,7 @@ async def test_newer_command_gets_placeholder_but_waits_for_older_pr_task(
             settings=command_settings(tmp_path),
             pi_agent_client=pi_agent_client,
             worker_id="worker-2",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
         await _deliver_once(session, github_client)
 
@@ -620,7 +622,7 @@ async def test_command_retries_infrastructure_start_with_same_idempotency_key(
             settings=settings,
             pi_agent_client=pi_agent_client,
             worker_id="worker-1",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
         await _deliver_once(session, github_client)
         retrying = await process_next_agent_task(
@@ -628,7 +630,7 @@ async def test_command_retries_infrastructure_start_with_same_idempotency_key(
             settings=settings,
             pi_agent_client=pi_agent_client,
             worker_id="worker-2",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
         retrying_state = (retrying.status, retrying.stage) if retrying else None
         completed = await _run_command_until(
@@ -666,7 +668,7 @@ async def test_final_comment_publish_retries_without_rerunning_agent(
             settings=settings,
             pi_agent_client=pi_agent_client,
             worker_id="worker-1",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
         await _deliver_once(session, github_client)
         publishing = await process_next_agent_task(
@@ -674,7 +676,7 @@ async def test_final_comment_publish_retries_without_rerunning_agent(
             settings=settings,
             pi_agent_client=pi_agent_client,
             worker_id="worker-2",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
         publishing_state = (
             (publishing.status, publishing.stage) if publishing else None
@@ -718,7 +720,7 @@ async def test_failure_comment_publish_retries_until_placeholder_is_terminal(
             settings=settings,
             pi_agent_client=pi_agent_client,
             worker_id="worker-1",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
         await _deliver_once(session, github_client)
         publishing = await process_next_agent_task(
@@ -726,7 +728,7 @@ async def test_failure_comment_publish_retries_until_placeholder_is_terminal(
             settings=settings,
             pi_agent_client=pi_agent_client,
             worker_id="worker-2",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
         publishing_state = (
             (publishing.status, publishing.stage) if publishing else None
@@ -770,7 +772,7 @@ async def test_command_soft_and_hard_timeout_refresh_same_placeholder(
             settings=settings,
             pi_agent_client=pi_agent_client,
             worker_id="worker-1",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
         await _deliver_once(session, github_client)
         running = await process_next_agent_task(
@@ -778,7 +780,7 @@ async def test_command_soft_and_hard_timeout_refresh_same_placeholder(
             settings=settings,
             pi_agent_client=pi_agent_client,
             worker_id="worker-2",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
         assert running is not None
         assert running.status == "running"
@@ -789,7 +791,7 @@ async def test_command_soft_and_hard_timeout_refresh_same_placeholder(
             session,
             settings=settings,
             pi_agent_client=pi_agent_client,
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
             now=started_at + timedelta(seconds=11),
         )
         await _deliver_once(session, github_client)
@@ -797,7 +799,7 @@ async def test_command_soft_and_hard_timeout_refresh_same_placeholder(
             session,
             settings=settings,
             pi_agent_client=pi_agent_client,
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
             now=started_at + timedelta(seconds=21),
         )
         await _deliver_once(session, github_client)
@@ -847,7 +849,7 @@ async def test_hard_timeout_does_not_discard_result_waiting_for_provider_publish
             session,
             settings=settings,
             pi_agent_client=pi_agent_client,
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
             now=utc_now(),
         )
 
@@ -887,7 +889,7 @@ async def test_pending_pr_close_cancellation_updates_task_placeholder(
             settings=command_settings(tmp_path),
             pi_agent_client=pi_agent_client,
             worker_id="worker-1",
-            github_client=github_client,
+            provider_registry=github_registry(github_client),
         )
         await _deliver_once(session, github_client)
         await session.refresh(cancelled)

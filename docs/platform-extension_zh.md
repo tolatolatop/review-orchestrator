@@ -1,5 +1,8 @@
 # 平台 Provider 扩展指南
 
+需要按步骤实施和验收新平台时，请直接使用独立的
+[《新平台接入与验证手册》](new-platform-onboarding_zh.md)。
+
 Review Orchestrator 以 GitHub 作为参考 provider，并已包含初步的 GitLab 实现。
 数据模型、API schema、webhook 接入和 worker 操作都携带 `provider` 字段，并通过
 provider adapter 路由平台行为。本文说明如何在不破坏现有 provider 的前提下，
@@ -8,6 +11,36 @@ provider adapter 路由平台行为。本文说明如何在不破坏现有 provi
 目标形态是在外部平台行为周围建立一个小而清晰的 provider adapter 边界。Review
 run 生命周期、pi-agent session 编排、workspace 准备、结果解析、finding 对账和
 重试策略应继续保持 provider-agnostic。
+
+## Platform、Provider、Registry 三层架构
+
+平台集成拆成三个明确层次：
+
+```text
+Provider Core HTTP -> Provider 协议转换 -> Platform API/client/鉴权
+                                              ^
+                                              |
+                                  Registry 构造与生命周期
+```
+
+- `Platform` 持有 SDK 或 HTTP client、平台原生 API、平台配置，以及
+  `get_credential(target, scope)`。首版 scope 为 `webhook`、`git:read`、
+  `comment:write`、`query:read`。
+- `Provider` 只负责 webhook 标准化、Git checkout 解析、评论发布转换和类型化
+  query 转换。它接收 Platform 注入，不读取环境变量，也不创建 client。
+- `ProviderRegistry` 选择启用的插件、构造 Platform/Provider runtime、检查重复
+  key、按 key 路由，并在应用关闭时统一关闭所拥有的 Platform client。
+
+Provider Core 提供四个 Bearer 保护的入口：
+
+- `POST /v1/webhooks/{provider}/normalize`
+- `POST /v1/git/{provider}/resolve-checkout`
+- `POST /v1/comments/{provider}/publish`
+- `POST /v1/query/{provider}`
+
+请求只包含目标和业务参数，不包含平台凭据。`PROVIDER_CORE_API_TOKEN` 保护该边界，
+未配置时四个接口 fail closed。现有 `/api/v1/webhooks/{provider}` 继续作为
+Orchestrator inbox 入口，负责持久化标准化事件。
 
 ## 当前 GitHub MVP
 
@@ -29,34 +62,39 @@ GitHub 支持当前覆盖：
 - 通过 `ReviewCommentRef` 跟踪 summary comment 和 line comment 引用。
 - 当 finding 无法映射到 changed file 中可评论的行时，降级为 summary-only。
 
-代码中仍然可见的 provider-specific 集成点：
+分层实现说明：
 
-- 每个 adapter 仍负责所属平台的请求头、签名格式、事件名、payload 路径、client
-  和认证设置。
-- Workspace clone URL 和凭据准备仍包含 worker adapter 操作之外的 provider-aware
-  行为。
-- GitHub 支持 line comment；GitLab 当前返回 summary-only 统计。
+- 每个 Provider 负责所属平台的请求头、签名格式、事件名和 payload 映射；Platform
+  负责 client 与认证设置。
+- Workspace clone URL 和凭据准备统一通过 Provider checkout 合约与 Platform scope
+  凭据完成。
+- GitHub 声明 line-comment 能力；GitLab 不声明该能力，只发布 summary。
 - Review thread resolve 和 provider-specific rate-limit backoff 尚未进入最小
   adapter 契约。
 
-不要在第二个平台证明需求之前就重命名或泛化所有 GitHub 代码。应该添加能让下一个
-provider 复用内部契约的最小 adapter surface。
+核心现在按能力协议路由。平台只实现自己支持的操作；缺失必需能力会明确失败，缺失
+可选行评论能力则记录 summary-only 降级告警。
 
-## Provider 边界
+## Provider 与 Platform 边界
 
-Provider adapter 负责外部平台相关能力：
+Provider 负责协议转换：
 
 - Webhook 请求头校验和签名验证。
 - 原始 payload 解析和 delivery ID 提取。
 - 将事件标准化为下文列出的内部事件名。
 - Pull request 或 merge request metadata 提取。
-- Changed file 和 diff metadata 获取。
+- Changed file 和 diff metadata 转换。
 - Line-level finding 的可评论位置映射。
-- Summary comment 创建和更新。
-- Line comment 或 review thread 创建和更新。
-- 平台支持时的 review thread resolve 或 stale comment 处理。
-- Rate limit、retry-after、permission、not-found 错误映射。
-- 基于 provider-specific secret 查找 token 并构造 API client。
+- Summary、line、agent comment 请求转换。
+- 平台支持时的 review thread 状态转换。
+- 将平台原生异常转换为统一 capability/operation 错误。
+
+Platform 负责原生集成：
+
+- SDK 或 HTTP client 的构造与生命周期。
+- 原生 PR/MR、change、comment、status API 调用。
+- Rate limit、retry-after、permission、not-found 处理。
+- 按 scope 获取、刷新和缓存静态或临时凭据。
 
 Orchestrator core 负责共享行为：
 
@@ -68,14 +106,28 @@ Orchestrator core 负责共享行为：
 - Review result schema 校验和 fingerprint 生成。
 - 对无法发布为 line comment 的 finding 执行 summary-only 降级。
 
-## Adapter 契约
+## 插件与能力契约
 
-新 review-triggering provider 的最小 adapter 契约是：
+Provider Core 合约提供稳定的 `key` 和四个操作：
+
+```python
+class Provider(Protocol):
+    key: str
+
+    async def normalize_webhook(self, headers, raw_body): ...
+    async def resolve_git_checkout(self, request): ...
+    async def publish_comments(self, request): ...
+    async def query(self, request): ...
+```
+
+现有 Orchestrator 路径继续保留细粒度、可运行时检查的能力协议，兼容 Worker、
+Workspace、Delivery 和 diagnostics：
 
 ```python
 class ProviderAdapter(Protocol):
     provider: str
 
+class WebhookCapability(ProviderAdapter, Protocol):
     def parse_webhook(
         self,
         *,
@@ -84,16 +136,24 @@ class ProviderAdapter(Protocol):
         settings: Settings,
     ) -> ParsedProviderWebhook: ...
 
+class WorkspaceCheckoutCapability(ProviderAdapter, Protocol):
+    async def get_workspace_checkout(
+        self, repo_full_name: str, *, clone_url: str | None = None
+    ) -> ProviderWorkspaceCheckout: ...
+
+class PullRequestCapability(ProviderAdapter, Protocol):
     async def get_pull_request_context(
         self,
         task: AgentTask,
     ) -> PullRequestContext | None: ...
 
+class ChangedFilesCapability(ProviderAdapter, Protocol):
     async def list_changed_files(
         self,
         review_run: ReviewRun,
     ) -> list[ChangedFile]: ...
 
+class ReviewSummaryCapability(ProviderAdapter, Protocol):
     async def publish_summary_comment(
         self,
         session: AsyncSession,
@@ -103,6 +163,7 @@ class ProviderAdapter(Protocol):
         finding_stats: dict[str, int] | None = None,
     ) -> ReviewCommentRef | None: ...
 
+class LineCommentsCapability(ProviderAdapter, Protocol):
     async def publish_line_comments(
         self,
         session: AsyncSession,
@@ -112,24 +173,44 @@ class ProviderAdapter(Protocol):
     ) -> dict[str, int]: ...
 ```
 
-`parse_webhook` 由 API registry 用于 webhook 接入。Worker 侧也通过同一个
-adapter 对象完成 PR context hydration、changed-file lookup、summary
-发布和 line comment 发布。暂不支持 line comment 的 provider 应让
-`publish_line_comments` 返回全零统计，并保持该 provider 的
-`ReviewConfig.line_comments_enabled` 关闭。
+另外还有 AgentTask 评论、权限诊断和资源链接等可选协议。Registry 通过
+`capability()` 和 `require_capability()` 查询能力，应用层不再用 `hasattr` 猜测。
 
-Worker 启动时应只构造一次持有 client 的 registry，并在 task 处理、review 处理和
-timeout 扫描中复用。操作未配置时，adapter 抛出 `ProviderCapabilityError`；平台
-client 或 SDK 失败时，adapter 将其转换成带有 `provider` 和 `operation` 属性的
-`ProviderOperationError`。Worker 只处理共享的 `ProviderError` 边界，不应导入
-平台专属的 client error。
+Webhook adapter 必须为触发 review 的事件附带完整 `PullRequestSnapshot`。业务服务
+只持久化归一化快照，不读取平台 Payload 路径，因此接入新平台不需要修改
+`services.py`。
+
+插件负责构造及生命周期：
+
+```python
+class ProviderPlugin(Protocol):
+    provider: str
+    kind: str
+    display_name: str
+
+    def build(self, context: ProviderBuildContext) -> ProviderRuntime: ...
+```
+
+API 和 Worker 都调用 `create_provider_registry(settings)`。只有
+`PROVIDERS_ENABLED` 中的插件会被构造；设置为 `gitlab` 时不会创建或校验 GitHub。
+`ProviderRegistry.aclose()` 统一关闭插件拥有的 Client。
+
+外部包可以直接注册，无需修改本仓库：
+
+```toml
+[project.entry-points."review_orchestrator.providers"]
+forge = "company_forge.plugin:ForgePlugin"
+```
+
+缺失必需操作时 adapter 抛出 `ProviderCapabilityError`；平台 SDK 失败统一转换为带
+`provider` 和 `operation` 属性的 `ProviderOperationError`。
 
 无论外部平台使用什么术语，内部都使用这些数据形状：
 
 | 内部形状 | 必需字段 | 说明 |
 | --- | --- | --- |
-| `ProviderWebhookEvent` | `provider`, `delivery_id`, `provider_event`, `provider_action`, `internal_event`, `repository`, `pull_request_number`, `head_sha`, `status`, `raw_payload` | `pull_request_number` 也用于 GitLab merge request 和 Azure pull request。优先存储稳定的人类可见 MR/PR 编号。 |
-| `ProviderPullRequestContext` | `provider`, `repo_full_name`, `pull_request_number`, `base_sha`, `head_sha`, `base_ref`, `head_ref`, `author_login`, `html_url`, `status`, `is_fork` | 当平台存在与 PR/MR number 不同的不透明 ID 时，保存在 `provider_pr_id`。 |
+| `ProviderWebhookEvent` | 事件标识、内部动作标志、可选 `pull_request` | 原始 Payload 只用于审计；核心编排使用归一化字段。 |
+| `PullRequestSnapshot` | 仓库、编号、head SHA、refs、作者、状态和 URL | 不透明的平台仓库/PR ID 仍分别保存。 |
 | `ProviderChangedFile` | `path`, `status`, `patch`, `commentable_lines`, `provider_position` | `commentable_lines` 是 orchestrator 面向内部的发布门禁。`provider_position` 可保存 GitLab diff position 或 Azure thread context。 |
 | `ProviderCommentRef` | `provider_comment_id`, `provider_thread_id`, `comment_type`, `status` | 外部 ID 按字符串保存，不要假设它们是 GitHub 数字 ID。 |
 
@@ -372,10 +453,12 @@ degradation：
 添加 provider 时使用此 checklist：
 
 - 添加 provider settings 和 `.env.example` 条目。
-- 添加 adapter module，覆盖 webhook parsing、signature validation、event
-  normalization 和 PR context extraction。
-- 将 adapter 注册到 `/api/v1/webhooks/{provider}`。
+- 添加封装原生 API、scope 凭据和 `aclose()` 的 Platform 对象。
+- 添加实现四类 Provider Core 转换的 Provider 对象。
+- 添加返回 `ProviderRuntime(provider=..., close=platform.aclose)` 的 factory，
+  并注册 plugin key。
 - 添加 provider webhook fixtures 和 normalizer tests。
+- 添加 checkout、comment、query、凭据刷新和生命周期合约测试。
 - 添加 service tests，证明 inbox idempotency 和 review-run creation。
 - 添加 changed-file fixtures 和 commentability mapping tests。
 - 启用 publishing 前添加 summary comment contract tests。
@@ -386,13 +469,13 @@ degradation：
 
 ## 风险与后续工作
 
-当前代码缺少具体的 adapter registry 和 provider-neutral webhook event type。对
-GitHub MVP 来说这是可接受的，但第一个非 GitHub provider 应在加入大量
-provider-specific 分支前先引入 registry。
+Provider Core 已有类型化 comment 合约；为保持兼容，旧 Orchestrator publishing
+能力仍携带数据库 session 和 domain model。应继续把这些调用封装在
+Provider/Platform runtime 内，并在逐步收敛旧能力时避免把平台凭据放入
+Orchestrator 请求。
 
-Provider comment publishing 也尚未成为完整 adapter。不要把 finding reconciliation
-耦合到任何单一 provider 的 diff-position 模型。稳定的内部契约是
-`commentable_lines`，并携带 provider-specific metadata。
+不要把 finding reconciliation 耦合到任何单一 provider 的 diff-position 模型。
+稳定的内部契约是 `commentable_lines`，并携带 provider-specific metadata。
 
 不要要求所有 provider 第一天就支持同一组功能。新 provider 的最小安全基线是
 webhook ingest、PR context、review-run creation、workspace preparation、result

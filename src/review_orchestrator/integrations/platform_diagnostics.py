@@ -17,9 +17,12 @@ from review_orchestrator.infrastructure.config import Settings
 from review_orchestrator.integrations.github import (
     GitHubClient,
     GitHubClientError,
-    create_github_client,
 )
 from review_orchestrator.integrations.github_auth import GitHubAuthenticationError
+from review_orchestrator.integrations.providers import (
+    PlatformDiagnosticsCapability,
+    ProviderRegistry,
+)
 
 
 async def diagnose_platform_permissions(
@@ -28,6 +31,7 @@ async def diagnose_platform_permissions(
     *,
     transport: httpx.AsyncBaseTransport | None = None,
     github_client: GitHubClient | None = None,
+    provider_registry: ProviderRegistry | None = None,
 ) -> PlatformPermissionDiagnosticResponse:
     """Run non-mutating checks against the configured provider API.
 
@@ -35,33 +39,42 @@ async def diagnose_platform_permissions(
     the result deliberately reports ``unknown`` instead of creating a probe
     comment or claiming that access was verified.
     """
-    if payload.provider == "github":
-        return await _diagnose_github(
-            settings,
-            payload,
-            transport=transport,
-            github_client=github_client,
+    owns_registry = provider_registry is None
+    if provider_registry is None:
+        from review_orchestrator.integrations.provider_plugins import (
+            create_provider_registry,
         )
-    return await _diagnose_gitlab(settings, payload, transport=transport)
+
+        overrides = {"github": github_client} if github_client is not None else None
+        provider_registry = create_provider_registry(
+            settings,
+            client_overrides=overrides,
+            diagnostics_transport=transport,
+        )
+    try:
+        diagnostics = provider_registry.require_capability(
+            payload.provider,
+            PlatformDiagnosticsCapability,
+            operation="diagnose_permissions",
+        )
+        return await diagnostics.diagnose_permissions(payload)
+    finally:
+        if owns_registry:
+            await provider_registry.aclose()
 
 
-async def _diagnose_github(
+async def diagnose_github_permissions(
     settings: Settings,
     payload: PlatformPermissionDiagnosticRequest,
     *,
     transport: httpx.AsyncBaseTransport | None,
-    github_client: GitHubClient | None,
+    github_client: GitHubClient,
 ) -> PlatformPermissionDiagnosticResponse:
-    owns_client = github_client is None
     try:
-        github_client = github_client or create_github_client(settings)
         token = await github_client.get_token(payload.repo_full_name)
         app_permissions = await github_client.get_permissions(payload.repo_full_name)
     except (GitHubAuthenticationError, GitHubClientError):
         return _credential_failure(payload)
-    finally:
-        if owns_client and github_client is not None:
-            await github_client.aclose()
 
     if not token:
         return _unconfigured(
@@ -214,7 +227,7 @@ async def _append_github_pr_check(
     checks.append(_read_check("pull_request_read", "pull request", response))
 
 
-async def _diagnose_gitlab(
+async def diagnose_gitlab_permissions(
     settings: Settings,
     payload: PlatformPermissionDiagnosticRequest,
     *,

@@ -8,7 +8,6 @@ import socket
 
 from review_orchestrator.application.delivery import process_next_delivery
 from review_orchestrator.application.worker import (
-    build_worker_provider_registry,
     process_agent_task_timeouts,
     process_next_agent_task,
     process_next_review_run,
@@ -20,9 +19,8 @@ from review_orchestrator.infrastructure.db import (
     create_session_factory,
     init_models,
 )
-from review_orchestrator.integrations.github import create_github_client
-from review_orchestrator.integrations.gitlab import GitLabClient
 from review_orchestrator.integrations.pi_agent import PiAgentClient
+from review_orchestrator.integrations.provider_plugins import create_provider_registry
 
 
 def main() -> None:
@@ -46,7 +44,7 @@ async def run_worker(
     worker_id: str | None = None,
 ) -> None:
     engine = create_engine(settings)
-    github_client = None
+    provider_registry = None
     try:
         await init_models(engine)
         session_factory = create_session_factory(engine)
@@ -56,16 +54,7 @@ async def run_worker(
             api_token=settings.pi_agent_runtime_token,
             timeout=settings.pi_agent_timeout_seconds,
         )
-        github_client = create_github_client(settings)
-        gitlab_client = GitLabClient(
-            api_base_url=settings.gitlab_api_base_url,
-            token=settings.gitlab_api_token,
-            timeout=settings.provider_api_timeout_seconds,
-        )
-        provider_registry = build_worker_provider_registry(
-            github_client=github_client,
-            gitlab_client=gitlab_client,
-        )
+        provider_registry = create_provider_registry(settings)
 
         while True:
             async with session_factory() as session:
@@ -103,7 +92,6 @@ async def run_worker(
                     settings=settings,
                     pi_agent_client=pi_agent_client,
                     worker_id=resolved_worker_id,
-                    github_client=github_client,
                     provider_registry=provider_registry,
                 )
             if once:
@@ -112,8 +100,8 @@ async def run_worker(
                 await asyncio.sleep(settings.worker_poll_interval_seconds)
     finally:
         try:
-            if github_client is not None:
-                await github_client.aclose()
+            if provider_registry is not None:
+                await provider_registry.aclose()
         finally:
             await engine.dispose()
 

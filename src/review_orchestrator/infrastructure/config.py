@@ -73,7 +73,10 @@ class Settings(BaseSettings):
     gitlab_api_base_url: str = "https://gitlab.com/api/v4"
     gitlab_api_token: str | None = Field(
         default=None,
-        description="GitLab API token used by the worker for MR lookup and notes.",
+        description=(
+            "GitLab token used by the worker for MR lookup, private repository "
+            "checkout, and notes."
+        ),
     )
     platform_diagnostics_timeout_seconds: float = Field(
         default=10.0,
@@ -84,6 +87,19 @@ class Settings(BaseSettings):
         default=30.0,
         gt=0,
         description="HTTP timeout for GitHub and GitLab API requests.",
+    )
+    provider_core_api_token: str | None = Field(
+        default=None,
+        description=(
+            "Bearer token protecting the provider-neutral /v1 Provider Core API."
+        ),
+    )
+    providers_enabled: str = Field(
+        default="github,gitlab",
+        description=(
+            "Comma-separated provider plugin keys. Disabled providers are not "
+            "constructed or validated by API and worker processes."
+        ),
     )
     workspace_root: str = "./.workspaces"
     git_cache_root: str = "./.git-cache"

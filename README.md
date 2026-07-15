@@ -50,6 +50,14 @@ GitCode, and other providers is documented in
 [`docs/platform-extension.md`](docs/platform-extension.md). A Chinese version is
 also available at
 [`docs/platform-extension_zh.md`](docs/platform-extension_zh.md).
+For an implementation-ready Chinese onboarding and validation checklist, see
+[`docs/new-platform-onboarding_zh.md`](docs/new-platform-onboarding_zh.md).
+
+API and worker processes share one capability-aware provider plugin registry.
+Set `PROVIDERS_ENABLED=gitlab` for a GitLab-only deployment; GitHub clients and
+credentials are not initialized in that mode. Installed third-party plugins can
+register through the `review_orchestrator.providers` Python entry-point group,
+so adding a platform does not require application, worker, or workspace changes.
 
 Default database:
 
@@ -78,6 +86,10 @@ locally:
 - `POST /api/v1/diagnostics/platform-permissions`
 - `POST /api/v1/webhooks/{provider}`
 - `GET /api/v1/review-runs`
+- `POST /v1/webhooks/{provider}/normalize`
+- `POST /v1/git/{provider}/resolve-checkout`
+- `POST /v1/comments/{provider}/publish`
+- `POST /v1/query/{provider}`
 - `GET /api/v1/review-runs/{review_run_id}`
 - `POST /api/v1/review-runs/{review_run_id}/session/start`
 - `POST /api/v1/review-runs/{review_run_id}/session/sync`
@@ -115,6 +127,14 @@ rerun endpoint. Rerun uses a caller-supplied idempotency key and records an
 internal `review_requested / rerun` event. Stale revisions, closed pull requests,
 and revisions with active runs are rejected while retaining the event and its
 explainable error code in the operator dashboard.
+
+The four `/v1` Provider Core endpoints are provider-neutral. Their request
+bodies contain a provider target and business parameters, never a GitHub,
+GitLab, or other platform credential. Configure `PROVIDER_CORE_API_TOKEN` and
+send it as `Authorization: Bearer ...`; these endpoints return `503` while the
+token is unset. Platform credentials remain inside the configured Platform
+object and are selected by the `webhook`, `git:read`, `comment:write`, or
+`query:read` scope.
 
 ### Platform permission diagnostics
 
@@ -308,8 +328,11 @@ Prepare a workspace:
 ```
 
 When GitHub App authentication is configured, the service obtains checkout
-credentials automatically. `auth.token_ref` remains available only for the
-legacy static-token mode.
+credentials automatically. Worker-created workspaces resolve their clone URL
+and credentials through the task's provider adapter; GitLab uses
+`GITLAB_API_BASE_URL` and `GITLAB_API_TOKEN`, including for self-hosted and
+private repositories. `auth.token_ref` remains available only for the legacy
+static-token mode.
 
 The response returns `workspace_path`, `base_sha`, and `head_sha`. Callers can run
 their own diff commands from that path:

@@ -1,4 +1,7 @@
 from review_orchestrator.config import Settings
+from review_orchestrator.github import GitHubAdapter
+from review_orchestrator.gitlab import GitLabAdapter
+from review_orchestrator.providers import ProviderRegistry, ProviderRuntime
 from review_orchestrator.worker_cli import run_worker
 
 
@@ -36,6 +39,15 @@ async def test_worker_builds_and_reuses_one_provider_registry(monkeypatch) -> No
     engine = FakeEngine()
     github_client = FakeGitHubClient()
     gitlab_client = FakeGitLabClient()
+    provider_registry = ProviderRegistry(
+        runtimes=[
+            ProviderRuntime(
+                GitHubAdapter(github_client),
+                close=github_client.aclose,
+            ),
+            ProviderRuntime(GitLabAdapter(gitlab_client)),
+        ]
+    )
     registries = []
 
     async def init_models(fake_engine) -> None:
@@ -58,7 +70,6 @@ async def test_worker_builds_and_reuses_one_provider_registry(monkeypatch) -> No
 
     async def process_review_run(session, **kwargs):
         del session
-        assert kwargs["github_client"] is github_client
         registries.append(kwargs["provider_registry"])
         return None
 
@@ -76,13 +87,8 @@ async def test_worker_builds_and_reuses_one_provider_registry(monkeypatch) -> No
     )
     monkeypatch.setattr(
         worker_cli,
-        "create_github_client",
-        lambda settings: github_client,
-    )
-    monkeypatch.setattr(
-        worker_cli,
-        "GitLabClient",
-        lambda **kwargs: gitlab_client,
+        "create_provider_registry",
+        lambda settings: provider_registry,
     )
     monkeypatch.setattr(worker_cli, "process_review_run_timeouts", process_timeouts)
     monkeypatch.setattr(worker_cli, "process_agent_task_timeouts", process_timeouts)

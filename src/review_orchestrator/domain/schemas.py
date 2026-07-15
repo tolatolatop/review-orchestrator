@@ -244,7 +244,11 @@ class WebhookAccepted(BaseModel):
 
 
 class PlatformPermissionDiagnosticRequest(BaseModel):
-    provider: str = Field(pattern="^(github|gitlab)$")
+    provider: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+    )
     repo_full_name: str = Field(
         min_length=3,
         max_length=512,
@@ -257,9 +261,18 @@ class PlatformPermissionDiagnosticRequest(BaseModel):
         parts = self.repo_full_name.split("/")
         if any(part in {".", ".."} for part in parts):
             raise ValueError("repo_full_name contains an invalid path segment")
-        if self.provider == "github" and len(parts) != 2:
-            raise ValueError("GitHub repo_full_name must be owner/repository")
         return self
+
+
+class ProviderInfo(BaseModel):
+    key: str
+    kind: str
+    display_name: str
+    capabilities: list[str] = Field(default_factory=list)
+
+
+class ProviderListResponse(BaseModel):
+    items: list[ProviderInfo] = Field(default_factory=list)
 
 
 class PlatformPermissionCheck(BaseModel):
@@ -567,7 +580,7 @@ class WorkspaceStatus(StrEnum):
 
 class WorkspaceRepository(BaseModel):
     full_name: str = Field(min_length=1, max_length=512)
-    clone_url: str = Field(min_length=1, max_length=2048)
+    clone_url: str | None = Field(default=None, min_length=1, max_length=2048)
 
 
 class WorkspacePullRequest(BaseModel):

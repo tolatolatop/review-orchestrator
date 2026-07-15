@@ -53,6 +53,8 @@ from review_orchestrator.domain.schemas import (
     PlatformPermissionDiagnosticResponse,
     ProviderEventInboxDetail,
     ProviderEventInboxListResponse,
+    ProviderInfo,
+    ProviderListResponse,
     PullRequestWorkspaceCleanupRequest,
     ResourcePoolListResponse,
     ResourcePoolRead,
@@ -91,20 +93,26 @@ from review_orchestrator.infrastructure.workspaces import (
     prepare_workspace,
     release_workspace,
 )
-from review_orchestrator.integrations.github import GitHubAdapter
-from review_orchestrator.integrations.gitlab import GitLabAdapter
 from review_orchestrator.integrations.pi_agent import PiAgentClient
 from review_orchestrator.integrations.platform_diagnostics import (
     diagnose_platform_permissions,
 )
 from review_orchestrator.integrations.providers import (
+    ProviderCapabilityError,
     ProviderRegistry,
     ProviderWebhookError,
+    WebhookCapability,
 )
 
 router = APIRouter(prefix="/api/v1")
 session_dependency = Depends(get_session)
-provider_registry = ProviderRegistry([GitHubAdapter(), GitLabAdapter()])
+
+
+def get_configured_provider_registry(request: Request) -> ProviderRegistry:
+    injected = getattr(request.app.state, "provider_registry", None)
+    if injected is not None:
+        return injected
+    raise RuntimeError("Provider registry was not initialized by the application.")
 
 
 def _review_request_rejection_detail(exc: ReviewRequestRejected) -> dict:
@@ -127,10 +135,35 @@ async def diagnose_platform_permissions_endpoint(
     injected = getattr(request.app.state, "platform_permission_probe", None)
     if injected is not None:
         return await injected(request.app.state.settings, payload)
-    return await diagnose_platform_permissions(
-        request.app.state.settings,
-        payload,
-        github_client=request.app.state.github_client,
+    registry = get_configured_provider_registry(request)
+    try:
+        return await diagnose_platform_permissions(
+            request.app.state.settings,
+            payload,
+            provider_registry=registry,
+        )
+    except ProviderCapabilityError as exc:
+        status_code = (
+            status.HTTP_404_NOT_FOUND
+            if registry.get(payload.provider) is None
+            else status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+
+@router.get("/providers", response_model=ProviderListResponse)
+async def list_providers_endpoint(request: Request) -> ProviderListResponse:
+    registry = get_configured_provider_registry(request)
+    return ProviderListResponse(
+        items=[
+            ProviderInfo(
+                key=descriptor.key,
+                kind=descriptor.kind,
+                display_name=descriptor.display_name,
+                capabilities=sorted(registry.capabilities(descriptor.key)),
+            )
+            for descriptor in registry.descriptors()
+        ]
     )
 
 
@@ -181,7 +214,8 @@ async def accept_webhook(
     request: Request,
     session: AsyncSession = session_dependency,
 ) -> WebhookAccepted:
-    adapter = provider_registry.get(provider)
+    registry = get_configured_provider_registry(request)
+    adapter = registry.capability(provider, WebhookCapability)
     if adapter is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -453,6 +487,7 @@ async def update_delivery_scheduling_endpoint(
 @router.get("/agent-tasks", response_model=AgentTaskListResponse)
 @router.get("/observability/agent-tasks", response_model=AgentTaskListResponse)
 async def list_agent_tasks_endpoint(
+    request: Request,
     status_filter: str | None = Query(
         default=None,
         alias="status",
@@ -471,6 +506,7 @@ async def list_agent_tasks_endpoint(
 ) -> AgentTaskListResponse:
     return await list_agent_tasks(
         session,
+        provider_registry=get_configured_provider_registry(request),
         status=status_filter,
         provider=provider,
         repo_full_name=repo_full_name,
@@ -487,9 +523,14 @@ async def list_agent_tasks_endpoint(
 @router.get("/observability/agent-tasks/{task_id}", response_model=AgentTaskDetail)
 async def get_agent_task_endpoint(
     task_id: str,
+    request: Request,
     session: AsyncSession = session_dependency,
 ) -> AgentTaskDetail:
-    task = await get_agent_task_detail(session, task_id)
+    task = await get_agent_task_detail(
+        session,
+        task_id,
+        provider_registry=get_configured_provider_registry(request),
+    )
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return task
@@ -523,9 +564,7 @@ async def cancel_agent_task_endpoint(
     session: AsyncSession = session_dependency,
     pi_agent_client: PiAgentClient = pi_agent_client_dependency,
 ) -> AgentTaskDetail:
-    registry = ProviderRegistry(
-        [GitHubAdapter(request.app.state.github_client), GitLabAdapter()]
-    )
+    registry = get_configured_provider_registry(request)
     try:
         task = await cancel_agent_task(
             session,
@@ -537,7 +576,11 @@ async def cancel_agent_task_endpoint(
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    detail = await get_agent_task_detail(session, task.id)
+    detail = await get_agent_task_detail(
+        session,
+        task.id,
+        provider_registry=registry,
+    )
     assert detail is not None
     return detail
 
@@ -549,6 +592,7 @@ async def cancel_agent_task_endpoint(
 )
 async def retry_agent_task_endpoint(
     task_id: str,
+    request: Request,
     session: AsyncSession = session_dependency,
 ) -> AgentTaskDetail:
     try:
@@ -557,7 +601,11 @@ async def retry_agent_task_endpoint(
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    detail = await get_agent_task_detail(session, task.id)
+    detail = await get_agent_task_detail(
+        session,
+        task.id,
+        provider_registry=get_configured_provider_registry(request),
+    )
     assert detail is not None
     return detail
 
@@ -823,7 +871,7 @@ async def prepare_workspace_endpoint(
         session,
         request.app.state.settings,
         payload,
-        github_client=request.app.state.github_client,
+        provider_registry=get_configured_provider_registry(request),
     )
 
 

@@ -38,14 +38,6 @@ from review_orchestrator.domain.review_results import ChangedFile
 from review_orchestrator.domain.schemas import WorkspacePrepareRequest
 from review_orchestrator.infrastructure.config import Settings
 from review_orchestrator.infrastructure.workspaces import prepare_workspace
-from review_orchestrator.integrations.github import (
-    GitHubAdapter,
-    GitHubClient,
-)
-from review_orchestrator.integrations.gitlab import (
-    GitLabAdapter,
-    GitLabClient,
-)
 from review_orchestrator.integrations.pi_agent import (
     AgentDomainPreset,
     AgentInstructionHistoryItem,
@@ -56,9 +48,13 @@ from review_orchestrator.integrations.pi_agent import (
     PiAgentClientError,
 )
 from review_orchestrator.integrations.providers import (
-    ProviderAdapter,
+    AgentTaskCommentsCapability,
+    ChangedFilesCapability,
+    LineCommentsCapability,
     ProviderError,
     ProviderRegistry,
+    PullRequestCapability,
+    ReviewSummaryCapability,
 )
 
 WORKER_ACTIVE_STATUSES = {"queued", "running"}
@@ -67,19 +63,6 @@ TIMEOUT_EVENTS = {
     "soft": "review_run.soft_timeout",
     "hard": "review_run.hard_timeout",
 }
-
-
-def build_worker_provider_registry(
-    *,
-    github_client: GitHubClient | None = None,
-    gitlab_client: GitLabClient | None = None,
-) -> ProviderRegistry:
-    adapters: list[ProviderAdapter] = []
-    if github_client is not None:
-        adapters.append(GitHubAdapter(github_client))
-    if gitlab_client is not None:
-        adapters.append(GitLabAdapter(gitlab_client))
-    return ProviderRegistry(adapters)
 
 
 async def acquire_next_review_run(
@@ -140,8 +123,6 @@ async def process_next_agent_task(
     worker_id: str,
     settings: Settings | None = None,
     pi_agent_client: PiAgentClient | None = None,
-    github_client: GitHubClient | None = None,
-    gitlab_client: GitLabClient | None = None,
     provider_registry: ProviderRegistry | None = None,
 ) -> AgentTask | None:
     task = await acquire_next_agent_task(
@@ -152,12 +133,20 @@ async def process_next_agent_task(
     )
     if task is None:
         return None
-    registry = provider_registry or build_worker_provider_registry(
-        github_client=github_client,
-        gitlab_client=gitlab_client,
-    )
+    registry = provider_registry or ProviderRegistry()
 
     if task.task_type == "message_command":
+        if registry.capability(task.provider, AgentTaskCommentsCapability) is None:
+            return await _fail_command_agent_task(
+                session,
+                task,
+                failure_code="provider_capability_missing",
+                error=(
+                    f"Provider {task.provider!r} does not support agent task "
+                    "comment publishing."
+                ),
+                provider_registry=registry,
+            )
         if settings is None or pi_agent_client is None:
             return await _fail_command_agent_task(
                 session,
@@ -174,7 +163,6 @@ async def process_next_agent_task(
                 task,
                 settings=settings,
                 pi_agent_client=pi_agent_client,
-                github_client=github_client,
                 provider_registry=registry,
             )
         except Exception as exc:
@@ -257,7 +245,6 @@ async def _process_command_agent_task(
     *,
     settings: Settings,
     pi_agent_client: PiAgentClient,
-    github_client: GitHubClient | None,
     provider_registry: ProviderRegistry,
 ) -> AgentTask:
     if task.response_comment_id is None and task.stage == "placeholder_pending":
@@ -382,7 +369,7 @@ async def _process_command_agent_task(
                 session,
                 settings,
                 _workspace_request_from_context(context),
-                github_client=github_client if task.provider == "github" else None,
+                provider_registry=provider_registry,
             )
         except Exception as exc:
             return await _fail_command_agent_task(
@@ -862,8 +849,6 @@ async def process_next_review_run(
     settings: Settings,
     pi_agent_client: PiAgentClient,
     worker_id: str,
-    github_client: GitHubClient | None = None,
-    gitlab_client: GitLabClient | None = None,
     provider_registry: ProviderRegistry | None = None,
 ) -> ReviewRun | None:
     review_run = await acquire_next_review_run(
@@ -874,18 +859,30 @@ async def process_next_review_run(
     )
     if review_run is None:
         return None
-    registry = provider_registry or build_worker_provider_registry(
-        github_client=github_client,
-        gitlab_client=gitlab_client,
-    )
+    registry = provider_registry or ProviderRegistry()
+
+    try:
+        registry.require_capability(
+            review_run.provider,
+            ReviewSummaryCapability,
+            operation="publish_review_summary",
+        )
+    except ProviderError as exc:
+        review_run.status = "failed"
+        review_run.failure_code = "provider_capability_missing"
+        review_run.error = str(exc)
+        review_run.completed_at = utc_now()
+        session.add(review_run)
+        await session.commit()
+        await session.refresh(review_run)
+        await release_review_run_lock(session, review_run.id)
+        return review_run
 
     try:
         if _should_publish_reviewing(review_run):
             await publish_review_run_status_comment(
                 session,
                 review_run,
-                github_client=github_client,
-                gitlab_client=gitlab_client,
                 provider_registry=registry,
                 status_text="reviewing",
             )
@@ -902,8 +899,6 @@ async def process_next_review_run(
             await publish_review_run_status_comment(
                 session,
                 review_run,
-                github_client=github_client,
-                gitlab_client=gitlab_client,
                 provider_registry=registry,
                 status_text="failed",
             )
@@ -915,9 +910,7 @@ async def process_next_review_run(
                     session,
                     settings,
                     _workspace_request_from_context(context),
-                    github_client=(
-                        github_client if review_run.provider == "github" else None
-                    ),
+                    provider_registry=registry,
                 )
             except Exception as exc:
                 review_run.status = "failed"
@@ -929,8 +922,6 @@ async def process_next_review_run(
                 await publish_review_run_status_comment(
                     session,
                     review_run,
-                    github_client=github_client,
-                    gitlab_client=gitlab_client,
                     provider_registry=registry,
                     status_text="failed",
                 )
@@ -945,8 +936,6 @@ async def process_next_review_run(
                 await publish_review_run_status_comment(
                     session,
                     review_run,
-                    github_client=github_client,
-                    gitlab_client=gitlab_client,
                     provider_registry=registry,
                     status_text="failed",
                 )
@@ -974,8 +963,6 @@ async def process_next_review_run(
                 await publish_review_run_status_comment(
                     session,
                     review_run,
-                    github_client=github_client,
-                    gitlab_client=gitlab_client,
                     provider_registry=registry,
                     status_text="failed",
                 )
@@ -995,8 +982,6 @@ async def process_next_review_run(
             await publish_review_run_status_comment(
                 session,
                 review_run,
-                github_client=github_client,
-                gitlab_client=gitlab_client,
                 provider_registry=registry,
                 status_text="failed",
             )
@@ -1044,8 +1029,6 @@ async def process_next_review_run(
             await publish_review_run_status_comment(
                 session,
                 review_run,
-                github_client=github_client,
-                gitlab_client=gitlab_client,
                 provider_registry=registry,
                 status_text="failed",
             )
@@ -1062,11 +1045,29 @@ async def process_next_review_run(
             status_text="completed",
         )
         if config.line_comments_enabled:
-            await _enqueue_review_line_comments(
-                session,
-                review_run,
-                changed_files=changed_files,
-            )
+            if registry.capability(
+                review_run.provider,
+                LineCommentsCapability,
+            ) is not None:
+                await _enqueue_review_line_comments(
+                    session,
+                    review_run,
+                    changed_files=changed_files,
+                )
+            else:
+                warnings = list(review_run.validation_warnings_json or [])
+                warnings.append(
+                    {
+                        "code": "line_comments_unsupported",
+                        "message": (
+                            f"Provider {review_run.provider!r} does not support line "
+                            "comments; the summary was queued for delivery."
+                        ),
+                    }
+                )
+                review_run.validation_warnings_json = warnings
+                session.add(review_run)
+                await session.commit()
         return await session.get(ReviewRun, review_run.id)
     except Exception as exc:
         review_run.status = "failed"
@@ -1079,8 +1080,6 @@ async def process_next_review_run(
         await publish_review_run_status_comment(
             session,
             review_run,
-            github_client=github_client,
-            gitlab_client=gitlab_client,
             provider_registry=registry,
             status_text="failed",
         )
@@ -1102,16 +1101,11 @@ async def process_agent_task_timeouts(
     *,
     settings: Settings,
     pi_agent_client: PiAgentClient,
-    github_client: GitHubClient | None = None,
-    gitlab_client: GitLabClient | None = None,
     provider_registry: ProviderRegistry | None = None,
     now: datetime | None = None,
 ) -> list[AgentTask]:
     now = now or utc_now()
-    registry = provider_registry or build_worker_provider_registry(
-        github_client=github_client,
-        gitlab_client=gitlab_client,
-    )
+    registry = provider_registry or ProviderRegistry()
     result = await session.execute(
         select(AgentTask).where(
             AgentTask.task_type == "message_command",
@@ -1171,16 +1165,11 @@ async def process_review_run_timeouts(
     *,
     settings: Settings,
     pi_agent_client: PiAgentClient,
-    github_client: GitHubClient | None = None,
-    gitlab_client: GitLabClient | None = None,
     provider_registry: ProviderRegistry | None = None,
     now: datetime | None = None,
 ) -> list[ReviewRun]:
     now = now or utc_now()
-    registry = provider_registry or build_worker_provider_registry(
-        github_client=github_client,
-        gitlab_client=gitlab_client,
-    )
+    registry = provider_registry or ProviderRegistry()
     result = await session.execute(
         select(ReviewRun).where(
             ReviewRun.status.in_(WORKER_ACTIVE_STATUSES),
@@ -1211,8 +1200,6 @@ async def process_review_run_timeouts(
             await publish_review_run_status_comment(
                 session,
                 refreshed,
-                github_client=github_client,
-                gitlab_client=gitlab_client,
                 provider_registry=registry,
                 status_text="failed",
             )
@@ -1235,8 +1222,6 @@ async def process_review_run_timeouts(
             await publish_review_run_status_comment(
                 session,
                 refreshed,
-                github_client=github_client,
-                gitlab_client=gitlab_client,
                 provider_registry=registry,
                 status_text="delayed",
             )
@@ -1248,12 +1233,10 @@ async def publish_review_run_status_comment(
     session: AsyncSession,
     review_run: ReviewRun,
     *,
-    github_client: GitHubClient | None = None,
-    gitlab_client: GitLabClient | None = None,
     provider_registry: ProviderRegistry | None = None,
     status_text: str,
 ) -> None:
-    del github_client, gitlab_client, provider_registry
+    del provider_registry
     terminal = status_text in {"completed", "failed"}
     if terminal:
         review_run.execution_status = status_text
@@ -1491,7 +1474,6 @@ def _workspace_request_from_context(
             "provider": context.provider,
             "repository": {
                 "full_name": context.repo_full_name,
-                "clone_url": _clone_url(context),
             },
             "pull_request": {
                 "number": context.pull_request_number,
@@ -1503,21 +1485,13 @@ def _workspace_request_from_context(
     )
 
 
-def _clone_url(context: PullRequestContext) -> str:
-    if context.provider == "github":
-        return f"https://github.com/{context.repo_full_name}.git"
-    if context.provider == "gitlab":
-        return f"https://gitlab.com/{context.repo_full_name}.git"
-    return context.html_url or context.repo_full_name
-
-
 async def _hydrate_task_context(
     session: AsyncSession,
     task: AgentTask,
     *,
     provider_registry: ProviderRegistry,
 ) -> PullRequestContext | None:
-    adapter = provider_registry.get(task.provider)
+    adapter = provider_registry.capability(task.provider, PullRequestCapability)
     if adapter is None:
         return None
     context = await adapter.get_pull_request_context(task)
@@ -1541,7 +1515,10 @@ async def _fetch_changed_files(
     provider_registry: ProviderRegistry,
 ) -> list[ChangedFile]:
     try:
-        adapter = provider_registry.get(review_run.provider)
+        adapter = provider_registry.capability(
+            review_run.provider,
+            ChangedFilesCapability,
+        )
         if adapter is None:
             return []
         return await adapter.list_changed_files(review_run)

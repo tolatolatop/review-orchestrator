@@ -6,8 +6,12 @@ from fastapi.testclient import TestClient
 
 from review_orchestrator.config import Settings
 from review_orchestrator.db import create_engine, create_session_factory, init_models
-from review_orchestrator.github import GitHubClientError
+from review_orchestrator.github import GitHubAdapter, GitHubClientError
 from review_orchestrator.main import create_app
+from review_orchestrator.providers import (
+    ProviderRegistry,
+    ProviderWorkspaceCheckout,
+)
 from review_orchestrator.schemas import WorkspacePrepareRequest
 from review_orchestrator.workspaces import (
     GitCommandError,
@@ -269,6 +273,7 @@ def test_prepare_git_workspace_passes_token_in_environment_only(
 
 class FakeWorkspaceGitHubClient:
     def __init__(self) -> None:
+        self.api_base_url = "https://api.github.com"
         self.repositories: list[str] = []
 
     async def get_token(self, repo_full_name: str) -> str:
@@ -298,13 +303,104 @@ async def test_prepare_workspace_resolves_dynamic_token_by_repository(
                 session,
                 settings,
                 request,
-                github_client=github_client,
+                provider_registry=ProviderRegistry(
+                    [GitHubAdapter(github_client)]
+                ),
             )
     finally:
         await engine.dispose()
 
     assert result.status == "ready"
     assert github_client.repositories == ["example/repo"]
+
+
+class FakeWorkspaceProvider:
+    provider = "forge"
+
+    def __init__(self, clone_url: str) -> None:
+        self.clone_url = clone_url
+        self.repositories: list[str] = []
+
+    async def get_workspace_checkout(
+        self,
+        repo_full_name: str,
+        *,
+        clone_url: str | None = None,
+    ) -> ProviderWorkspaceCheckout:
+        self.repositories.append(repo_full_name)
+        return ProviderWorkspaceCheckout(
+            clone_url=clone_url or self.clone_url,
+            auth_token="forge-secret",
+            auth_username="oauth2",
+        )
+
+
+async def test_prepare_workspace_uses_task_provider_checkout(
+    tmp_path: Path,
+) -> None:
+    source_repo, base_sha, head_sha = make_source_repo(tmp_path)
+    request = WorkspacePrepareRequest.model_validate(
+        {
+            "provider": "forge",
+            "repository": {"full_name": "group/repo"},
+            "pull_request": {
+                "number": 7,
+                "base_sha": base_sha,
+                "head_sha": head_sha,
+            },
+        }
+    )
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path}/forge.db",
+        workspace_root=str(tmp_path / "workspaces"),
+        git_cache_root=str(tmp_path / "cache"),
+    )
+    engine = create_engine(settings)
+    await init_models(engine)
+    session_factory = create_session_factory(engine)
+    provider = FakeWorkspaceProvider(str(source_repo))
+    try:
+        async with session_factory() as session:
+            result = await prepare_workspace(
+                session,
+                settings,
+                request,
+                provider_registry=ProviderRegistry([provider]),
+            )
+    finally:
+        await engine.dispose()
+
+    assert result.status == "ready"
+    assert provider.repositories == ["group/repo"]
+    assert "/forge/" in result.workspace_path
+    assert run(["git", "rev-parse", "HEAD"], Path(result.workspace_path)) == head_sha
+
+
+def test_gitlab_token_uses_provider_specific_git_username() -> None:
+    request = WorkspacePrepareRequest.model_validate(
+        {
+            "provider": "gitlab",
+            "repository": {
+                "full_name": "group/private-repo",
+                "clone_url": "https://gitlab.example/group/private-repo.git",
+            },
+            "pull_request": {
+                "number": 1,
+                "base_sha": "a" * 40,
+                "head_sha": "b" * 40,
+            },
+        }
+    )
+
+    env = _git_env(
+        request,
+        auth_token="gitlab-secret",
+        auth_username="oauth2",
+    )
+
+    assert env["GIT_CONFIG_KEY_0"] == (
+        "url.https://oauth2:gitlab-secret@gitlab.example/.insteadOf"
+    )
 
 
 @pytest.mark.parametrize(
@@ -416,14 +512,16 @@ def test_workspace_endpoints_cover_missing_and_expired_cleanup(tmp_path: Path) -
 def test_prepare_workspace_rejects_unsupported_provider(tmp_path: Path) -> None:
     source_repo, base_sha, head_sha = make_source_repo(tmp_path)
     payload = workspace_payload(source_repo, base_sha, head_sha)
-    payload["provider"] = "gitlab"
+    payload["provider"] = "unsupported"
 
     with make_client(tmp_path) as client:
         response = client.post("/api/v1/workspaces/prepare", json=payload)
 
     assert response.status_code == 200
     assert response.json()["status"] == "failed"
-    assert response.json()["failure_message"] == "Unsupported provider: gitlab"
+    assert response.json()["failure_message"] == (
+        "Provider 'unsupported' does not support get_workspace_checkout."
+    )
 
 
 def test_force_refresh_reuses_record_and_refreshes_git_cache(tmp_path: Path) -> None:
@@ -530,6 +628,8 @@ def test_expired_cleanup_deletes_only_expired_workspace(tmp_path: Path) -> None:
 
 
 class FailingWorkspaceGitHubClient:
+    api_base_url = "https://api.github.com"
+
     async def get_token(self, _repo_full_name: str) -> str:
         raise GitHubClientError("installation token unavailable")
 
@@ -554,7 +654,9 @@ async def test_prepare_workspace_persists_auth_failure(tmp_path: Path) -> None:
                 session,
                 settings,
                 request,
-                github_client=FailingWorkspaceGitHubClient(),  # type: ignore[arg-type]
+                provider_registry=ProviderRegistry(
+                    [GitHubAdapter(FailingWorkspaceGitHubClient())]  # type: ignore[arg-type]
+                ),
             )
     finally:
         await engine.dispose()

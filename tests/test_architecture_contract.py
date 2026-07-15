@@ -22,7 +22,12 @@ def test_public_route_inventory_survives_directory_refactors() -> None:
         ("GET", "/health"),
         ("GET", "/dashboard/"),
         ("GET", "/reviews/"),
+        ("GET", "/api/v1/providers"),
         ("POST", "/api/v1/webhooks/{provider}"),
+        ("POST", "/v1/webhooks/{provider}/normalize"),
+        ("POST", "/v1/git/{provider}/resolve-checkout"),
+        ("POST", "/v1/comments/{provider}/publish"),
+        ("POST", "/v1/query/{provider}"),
         ("GET", "/api/v1/provider-events"),
         ("GET", "/api/v1/agent-tasks"),
         ("POST", "/api/v1/agent-tasks/{task_id}/cancel"),
@@ -76,8 +81,9 @@ def test_legacy_modules_are_true_aliases_of_layered_implementations() -> None:
         "review_orchestrator.platform_diagnostics": (
             "review_orchestrator.integrations.platform_diagnostics"
         ),
-        "review_orchestrator.providers": (
-            "review_orchestrator.integrations.providers"
+        "review_orchestrator.providers": ("review_orchestrator.integrations.providers"),
+        "review_orchestrator.provider_plugins": (
+            "review_orchestrator.integrations.provider_plugins"
         ),
         "review_orchestrator.reconciliation": (
             "review_orchestrator.domain.reconciliation"
@@ -114,6 +120,7 @@ def test_layered_implementations_do_not_import_legacy_aliases() -> None:
         "pi_agent",
         "platform_diagnostics",
         "providers",
+        "provider_plugins",
         "reconciliation",
         "review_results",
         "reviews_dashboard",
@@ -140,3 +147,19 @@ def test_layered_implementations_do_not_import_legacy_aliases() -> None:
                 f"from {name} import" in source or f"import {name}" in source
                 for name in forbidden
             ), source_path
+
+
+def test_core_execution_paths_do_not_branch_on_builtin_platform_names() -> None:
+    package_root = Path(__file__).parents[1] / "src" / "review_orchestrator"
+    core_paths = [
+        package_root / "application" / "delivery.py",
+        package_root / "application" / "services.py",
+        package_root / "application" / "worker.py",
+        package_root / "infrastructure" / "workspaces.py",
+        package_root / "presentation" / "api.py",
+    ]
+
+    for path in core_paths:
+        source = path.read_text(encoding="utf-8").lower()
+        assert "github" not in source, path
+        assert "gitlab" not in source, path

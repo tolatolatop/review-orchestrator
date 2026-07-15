@@ -11,6 +11,40 @@ behavior. Review run lifecycle, pi-agent session orchestration, workspace
 preparation, result parsing, finding reconciliation, and retry policy should stay
 provider-agnostic.
 
+## Three-Layer Provider Architecture
+
+Platform integrations are split into three explicit layers:
+
+```text
+Provider Core HTTP -> Provider protocol conversion -> Platform API/client/auth
+                                                    ^
+                                                    |
+                                      Registry construction and lifecycle
+```
+
+- `Platform` owns the SDK or HTTP client, native API operations, platform
+  configuration, and `get_credential(target, scope)`. The initial scopes are
+  `webhook`, `git:read`, `comment:write`, and `query:read`.
+- `Provider` owns only webhook normalization, Git checkout resolution, comment
+  publication conversion, and typed platform-query conversion. It receives a
+  Platform instance and never reads environment variables or constructs a
+  client.
+- `ProviderRegistry` selects enabled plugins, builds Platform/Provider runtimes,
+  rejects duplicate keys, routes by provider key, and closes owned Platform
+  clients at application shutdown.
+
+Provider Core exposes these Bearer-protected endpoints:
+
+- `POST /v1/webhooks/{provider}/normalize`
+- `POST /v1/git/{provider}/resolve-checkout`
+- `POST /v1/comments/{provider}/publish`
+- `POST /v1/query/{provider}`
+
+Requests contain targets and business parameters, not platform credentials.
+`PROVIDER_CORE_API_TOKEN` protects this service boundary and fails closed when
+unset. The existing `/api/v1/webhooks/{provider}` route remains the orchestrator
+inbox endpoint and persists normalized events.
+
 ## Current GitHub MVP
 
 GitHub support currently covers:
@@ -32,35 +66,42 @@ GitHub support currently covers:
 - Summary-only fallback when a finding cannot be mapped to a changed,
   commentable line.
 
-Provider-specific integration points that remain visible in the code:
+Layered implementation notes:
 
-- Each adapter still owns its platform's header names, signature format, event
-  names, payload paths, client, and authentication settings.
-- Workspace clone URL and credential preparation still has provider-aware
-  behavior outside the worker adapter operations.
-- GitHub supports line comments; GitLab currently returns summary-only stats.
+- Each Provider owns its platform's header names, signature format, event names,
+  and payload mapping; its Platform owns clients and authentication settings.
+- Workspace clone URL and credential preparation route through the Provider
+  checkout contract and Platform-scoped credentials.
+- GitHub declares the line-comment capability; GitLab omits it and publishes a
+  summary only.
 - Review thread resolution and provider-specific rate-limit backoff are not yet
   part of the minimum adapter contract.
 
-Do not rename or generalize all GitHub code before another provider proves the
-need. Add the smallest adapter surface that lets the next provider use the same
-internal contracts.
+The core now routes through capability protocols. A provider implements only the
+operations it supports; missing required capabilities fail explicitly and
+optional line-comment support degrades to a recorded summary-only warning.
 
-## Provider Boundary
+## Provider And Platform Boundaries
 
-A provider adapter owns external platform concerns:
+A Provider owns protocol conversion concerns:
 
 - Webhook header validation and signature verification.
 - Raw payload parsing and delivery ID extraction.
 - Event normalization into the internal event names listed below.
 - Pull request or merge request metadata extraction.
-- Changed-file and diff metadata retrieval.
+- Changed-file and diff metadata conversion.
 - Commentability mapping for line-level findings.
-- Summary comment create/update behavior.
-- Line comment or review thread create/update behavior.
-- Review thread resolution or stale-comment handling when supported.
-- Provider rate limit, retry-after, permission, and not-found error mapping.
-- Token lookup and API client construction from provider-specific secrets.
+- Summary, line, and agent comment request conversion.
+- Review thread state conversion when supported.
+- Conversion of native errors into provider-neutral capability and operation
+  errors.
+
+A Platform owns native integration concerns:
+
+- SDK or HTTP client construction and lifecycle.
+- Native pull-request, change, comment, and status API calls.
+- Rate limit, retry-after, permission, and not-found handling.
+- Static or temporary credential lookup, refresh, and caching by scope.
 
 The orchestrator core owns shared behavior:
 
@@ -72,14 +113,29 @@ The orchestrator core owns shared behavior:
 - Review result schema validation and fingerprint generation.
 - Summary-only fallback for findings that cannot be line-commented.
 
-## Adapter Contract
+## Plugin and Capability Contracts
 
-The minimum adapter contract for a new review-triggering provider is:
+The Provider Core contract supplies a stable `key` and four operations:
+
+```python
+class Provider(Protocol):
+    key: str
+
+    async def normalize_webhook(self, headers, raw_body): ...
+    async def resolve_git_checkout(self, request): ...
+    async def publish_comments(self, request): ...
+    async def query(self, request): ...
+```
+
+The existing orchestrator paths also retain granular, runtime-checkable
+capability protocols for Worker, Workspace, Delivery, and diagnostics
+compatibility:
 
 ```python
 class ProviderAdapter(Protocol):
     provider: str
 
+class WebhookCapability(ProviderAdapter, Protocol):
     def parse_webhook(
         self,
         *,
@@ -88,16 +144,24 @@ class ProviderAdapter(Protocol):
         settings: Settings,
     ) -> ParsedProviderWebhook: ...
 
+class WorkspaceCheckoutCapability(ProviderAdapter, Protocol):
+    async def get_workspace_checkout(
+        self, repo_full_name: str, *, clone_url: str | None = None
+    ) -> ProviderWorkspaceCheckout: ...
+
+class PullRequestCapability(ProviderAdapter, Protocol):
     async def get_pull_request_context(
         self,
         task: AgentTask,
     ) -> PullRequestContext | None: ...
 
+class ChangedFilesCapability(ProviderAdapter, Protocol):
     async def list_changed_files(
         self,
         review_run: ReviewRun,
     ) -> list[ChangedFile]: ...
 
+class ReviewSummaryCapability(ProviderAdapter, Protocol):
     async def publish_summary_comment(
         self,
         session: AsyncSession,
@@ -107,6 +171,7 @@ class ProviderAdapter(Protocol):
         finding_stats: dict[str, int] | None = None,
     ) -> ReviewCommentRef | None: ...
 
+class LineCommentsCapability(ProviderAdapter, Protocol):
     async def publish_line_comments(
         self,
         session: AsyncSession,
@@ -116,25 +181,47 @@ class ProviderAdapter(Protocol):
     ) -> dict[str, int]: ...
 ```
 
-`parse_webhook` is used by the API registry for webhook intake. Worker-side
-flows use the same adapter object for PR context hydration, changed-file lookup,
-summary publishing, and line comment publishing. Providers that do not support
-line comments yet should return zeroed publish stats from `publish_line_comments`
-and keep `ReviewConfig.line_comments_enabled` disabled for that provider.
+Additional optional protocols cover agent-task comments, permission diagnostics,
+and resource links. The registry exposes `capability()` and
+`require_capability()`; application code never probes methods with `hasattr`.
 
-Construct the client-bearing worker registry once when the worker starts and
-reuse that registry for task processing, review processing, and timeout scans.
-Adapters raise `ProviderCapabilityError` when an operation is not configured and
-translate platform client or SDK failures into `ProviderOperationError`, with
-`provider` and `operation` attributes. Worker code handles the shared
-`ProviderError` boundary and must not import platform-specific client errors.
+Webhook parsers must attach a complete `PullRequestSnapshot` to normalized
+review-triggering events. The application persists that snapshot without reading
+provider payload paths. Therefore a new platform does not add branches to
+`services.py`.
+
+A plugin owns construction and lifecycle:
+
+```python
+class ProviderPlugin(Protocol):
+    provider: str
+    kind: str
+    display_name: str
+
+    def build(self, context: ProviderBuildContext) -> ProviderRuntime: ...
+```
+
+API and worker processes both call `create_provider_registry(settings)`. Only
+keys in `PROVIDERS_ENABLED` are built. A GitLab-only process does not construct or
+validate GitHub. `ProviderRegistry.aclose()` closes all plugin-owned clients.
+
+External packages register without modifying this repository:
+
+```toml
+[project.entry-points."review_orchestrator.providers"]
+forge = "company_forge.plugin:ForgePlugin"
+```
+
+Adapters raise `ProviderCapabilityError` for unavailable required operations and
+translate SDK failures into `ProviderOperationError` with `provider` and
+`operation` attributes.
 
 Use these internal data shapes regardless of external provider vocabulary:
 
 | Internal shape | Required fields | Notes |
 | --- | --- | --- |
-| `ProviderWebhookEvent` | `provider`, `delivery_id`, `provider_event`, `provider_action`, `internal_event`, `repository`, `pull_request_number`, `head_sha`, `status`, `raw_payload` | `pull_request_number` is also used for GitLab merge requests and Azure pull requests. It is the stable human-facing MR/PR number when available. |
-| `ProviderPullRequestContext` | `provider`, `repo_full_name`, `pull_request_number`, `base_sha`, `head_sha`, `base_ref`, `head_ref`, `author_login`, `html_url`, `status`, `is_fork` | Keep `provider_pr_id` for opaque platform IDs that differ from PR/MR number. |
+| `ProviderWebhookEvent` | event identity, internal action flags, optional `pull_request` | Raw payload is retained only for audit; core orchestration uses normalized fields. |
+| `PullRequestSnapshot` | repository, number, head SHA, refs, author, status and URLs | Keep provider repository/PR IDs for opaque platform identifiers. |
 | `ProviderChangedFile` | `path`, `status`, `patch`, `commentable_lines`, `provider_position` | `commentable_lines` is the orchestrator-facing gate. `provider_position` may store GitLab diff positions or Azure thread context. |
 | `ProviderCommentRef` | `provider_comment_id`, `provider_thread_id`, `comment_type`, `status` | Store external IDs without assuming numeric GitHub IDs. |
 
@@ -398,10 +485,12 @@ for equivalent events. They should also assert graceful degradation:
 Use this checklist when adding a provider:
 
 - Add provider settings and `.env.example` entries.
-- Add adapter module with webhook parsing, signature validation, event
-  normalization, and PR context extraction.
-- Register the adapter behind `/api/v1/webhooks/{provider}`.
+- Add a Platform object with native APIs, scoped credentials, and `aclose()`.
+- Add a Provider object implementing the four Provider Core conversions.
+- Add a factory returning `ProviderRuntime(provider=..., close=platform.aclose)`
+  and register its plugin key.
 - Add provider webhook fixtures and normalizer tests.
+- Add checkout, comment, query, credential-refresh, and lifecycle contract tests.
 - Add service tests proving inbox idempotency and review-run creation.
 - Add changed-file fixtures and commentability mapping tests.
 - Add summary comment contract tests before enabling publishing.
@@ -412,15 +501,15 @@ Use this checklist when adding a provider:
 
 ## Risks And Follow-Up Work
 
-The current code lacks a concrete adapter registry and provider-neutral webhook
-event type. That is acceptable for the GitHub MVP, but the first non-GitHub
-provider should introduce the registry before adding large provider-specific
-branches to the API route.
+Provider Core has a typed comment contract, while the legacy orchestrator
+publishing capabilities still carry database sessions and domain models for
+backward compatibility. Keep those calls behind the Provider/Platform runtime;
+do not move credentials into Orchestrator requests while the legacy capabilities
+are gradually converged.
 
-Provider comment publishing is also not yet a full adapter. Avoid coupling
-finding reconciliation to any one provider's diff-position model. The stable
-internal contract is `commentable_lines` plus provider-specific metadata carried
-alongside it.
+Avoid coupling finding reconciliation to any one provider's diff-position model.
+The stable internal contract is `commentable_lines` plus provider-specific
+metadata carried alongside it.
 
 Do not make all providers support the same feature set on day one. The minimum
 safe baseline for a new provider is webhook ingest, PR context, review-run

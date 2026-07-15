@@ -30,9 +30,9 @@ class FakeResponse:
         return json.dumps(self.payload).encode()
 
 
-def diagnostic_response(status: str = "healthy") -> dict:
+def diagnostic_response(status: str = "healthy", provider: str = "github") -> dict:
     return {
-        "provider": "github",
+        "provider": provider,
         "repo_full_name": "example/repo",
         "pull_request_number": 42,
         "status": status,
@@ -83,9 +83,7 @@ def test_script_calls_deployed_endpoint_and_returns_healthy(
         "https://review.example/api/v1/diagnostics/platform-permissions"
     )
     assert request.headers["X-review-token"] == "operator-secret"
-    assert request.headers["User-agent"] == (
-        "review-orchestrator-permission-check/1.0"
-    )
+    assert request.headers["User-agent"] == ("review-orchestrator-permission-check/1.0")
     assert json.loads(request.data) == {
         "provider": "github",
         "repo_full_name": "example/repo",
@@ -113,6 +111,26 @@ def test_script_json_output_and_degraded_exit_code(capsys) -> None:
 
     assert exit_code == EXIT_DEGRADED
     assert json.loads(capsys.readouterr().out)["status"] == "degraded"
+
+
+def test_script_accepts_a_third_party_provider_key(capsys) -> None:
+    with patch.object(
+        script,
+        "urlopen",
+        return_value=FakeResponse(diagnostic_response(provider="gitmilk")),
+    ):
+        exit_code = main(
+            [
+                "--provider",
+                "GitMilk",
+                "--repository",
+                "group/project",
+                "--json",
+            ]
+        )
+
+    assert exit_code == EXIT_HEALTHY
+    assert json.loads(capsys.readouterr().out)["provider"] == "gitmilk"
 
 
 def test_script_reports_connection_error_without_traceback(capsys) -> None:

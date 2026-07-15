@@ -18,7 +18,13 @@ from review_orchestrator.domain.models import (
     utc_now,
 )
 from review_orchestrator.domain.review_results import ChangedFile
-from review_orchestrator.integrations.providers import ProviderError, ProviderRegistry
+from review_orchestrator.integrations.providers import (
+    AgentTaskCommentsCapability,
+    LineCommentsCapability,
+    ProviderError,
+    ProviderRegistry,
+    ReviewSummaryCapability,
+)
 
 
 async def enqueue_delivery(
@@ -189,17 +195,15 @@ async def _execute_delivery(
     delivery: DeliveryOutbox,
     provider_registry: ProviderRegistry,
 ) -> str | None:
-    adapter = provider_registry.get(delivery.provider)
-    if adapter is None:
-        raise ProviderError(
-            f"Provider {delivery.provider} is not configured.",
-            provider=delivery.provider,
-            operation=delivery.operation,
-        )
     payload = delivery.payload_json
     if delivery.operation == "agent_task_comment":
         if not isinstance(task, AgentTask):
             raise TypeError("agent_task_comment requires an AgentTask.")
+        adapter = provider_registry.require_capability(
+            delivery.provider,
+            AgentTaskCommentsCapability,
+            operation=delivery.operation,
+        )
         return await adapter.publish_agent_task_comment(
             session,
             task,
@@ -208,6 +212,11 @@ async def _execute_delivery(
     if delivery.operation == "review_summary":
         if not isinstance(task, ReviewRun):
             raise TypeError("review_summary requires a ReviewRun.")
+        adapter = provider_registry.require_capability(
+            delivery.provider,
+            ReviewSummaryCapability,
+            operation=delivery.operation,
+        )
         original_failure_code = task.failure_code
         original_error = task.error
         result = await adapter.publish_summary_comment(
@@ -231,6 +240,11 @@ async def _execute_delivery(
     if delivery.operation == "review_line_comments":
         if not isinstance(task, ReviewRun):
             raise TypeError("review_line_comments requires a ReviewRun.")
+        adapter = provider_registry.require_capability(
+            delivery.provider,
+            LineCommentsCapability,
+            operation=delivery.operation,
+        )
         changed_files = [
             ChangedFile.model_validate(item)
             for item in payload.get("changed_files", [])
