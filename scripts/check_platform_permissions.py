@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -15,6 +16,16 @@ EXIT_HEALTHY = 0
 EXIT_DEGRADED = 1
 EXIT_FAILED = 2
 EXIT_REQUEST_ERROR = 3
+PROVIDER_KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def provider_key(value: str) -> str:
+    normalized = value.strip().lower()
+    if not PROVIDER_KEY_PATTERN.fullmatch(normalized):
+        raise argparse.ArgumentTypeError(
+            "provider must match ^[a-z0-9][a-z0-9_-]{0,63}$"
+        )
+    return normalized
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,7 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
             "http://localhost:8000)."
         ),
     )
-    parser.add_argument("--provider", required=True, choices=("github", "gitlab"))
+    parser.add_argument(
+        "--provider",
+        required=True,
+        type=provider_key,
+        help="Registered provider key, for example github, gitlab, or gitmilk.",
+    )
     parser.add_argument(
         "--repository",
         required=True,
@@ -73,10 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.pull_request is not None:
         payload["pull_request_number"] = args.pull_request
 
-    url = (
-        f"{args.base_url.rstrip('/')}"
-        "/api/v1/diagnostics/platform-permissions"
-    )
+    url = f"{args.base_url.rstrip('/')}/api/v1/diagnostics/platform-permissions"
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",

@@ -50,6 +50,8 @@ GitCode, and other providers is documented in
 [`docs/platform-extension.md`](docs/platform-extension.md). A Chinese version is
 also available at
 [`docs/platform-extension_zh.md`](docs/platform-extension_zh.md).
+For an implementation-ready Chinese onboarding and validation checklist, see
+[`docs/new-platform-onboarding_zh.md`](docs/new-platform-onboarding_zh.md).
 
 API and worker processes share one capability-aware provider plugin registry.
 Set `PROVIDERS_ENABLED=gitlab` for a GitLab-only deployment; GitHub clients and

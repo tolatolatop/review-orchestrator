@@ -1,5 +1,8 @@
 # 平台 Provider 扩展指南
 
+需要按步骤实施和验收新平台时，请直接使用独立的
+[《新平台接入与验证手册》](new-platform-onboarding_zh.md)。
+
 Review Orchestrator 以 GitHub 作为参考 provider，并已包含初步的 GitLab 实现。
 数据模型、API schema、webhook 接入和 worker 操作都携带 `provider` 字段，并通过
 provider adapter 路由平台行为。本文说明如何在不破坏现有 provider 的前提下，
