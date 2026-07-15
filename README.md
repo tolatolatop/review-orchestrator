@@ -22,9 +22,10 @@ sessions.
 ```bash
 uv sync
 cp .env.example .env
-uv run uvicorn review_orchestrator.main:app --reload
+uv run uvicorn review_orchestrator.presentation.main:app --reload
 uv run ruff check .
 uv run pytest
+uv run pytest --cov=review_orchestrator --cov-branch
 npm --prefix pi-agent-runtime ci
 npm --prefix pi-agent-runtime test
 npm --prefix pi-agent-runtime audit --audit-level=high
@@ -35,6 +36,11 @@ The BDD/E2E scenario matrix and local-only fixture strategy are documented in
 temporary git repository, fixture GitHub payloads, and a fake pi-agent client;
 optional real PostgreSQL/LLM/GitHub integration tests are intentionally not
 part of the default command.
+
+The responsibility-oriented source layout and legacy import compatibility
+policy are documented in [`docs/architecture_zh.md`](docs/architecture_zh.md).
+The pre-refactor coverage findings and final verification evidence are in
+[`docs/test-coverage-audit_zh.md`](docs/test-coverage-audit_zh.md).
 
 Deployment guidance for local, test, and production environments is documented
 in [`docs/deployment.md`](docs/deployment.md).

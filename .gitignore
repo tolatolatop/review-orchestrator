@@ -3,6 +3,8 @@ node_modules/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+.coverage
+.coverage-*
 *.pyc
 *.db
 *.sqlite3

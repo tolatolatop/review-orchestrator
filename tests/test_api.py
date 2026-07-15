@@ -1704,3 +1704,100 @@ def test_human_message_is_forwarded_to_pi_agent_session(tmp_path: Path) -> None:
     assert fake_pi_agent.sent_messages == [
         ("session-1", "Yes, this is intentional.", "answer")
     ]
+
+
+def test_public_api_not_found_contracts(tmp_path: Path) -> None:
+    """All resource endpoints must keep a stable 404 contract during reorganization."""
+    requests = [
+        ("GET", "/api/v1/provider-events/missing", None),
+        ("GET", "/api/v1/agent-tasks/missing", None),
+        ("GET", "/api/v1/agent-tasks/missing/agent-session", None),
+        ("POST", "/api/v1/agent-tasks/missing/cancel", None),
+        ("POST", "/api/v1/agent-tasks/missing/retry", None),
+        ("GET", "/api/v1/review-runs/missing", None),
+        ("GET", "/api/v1/observability/review-runs/missing/agent-session", None),
+        (
+            "POST",
+            "/api/v1/review-runs/missing/session/start",
+            {"workspace_path": "/tmp/missing"},
+        ),
+        ("POST", "/api/v1/review-runs/missing/session/sync", None),
+        (
+            "POST",
+            "/api/v1/review-runs/missing/session/cancel",
+            {"reason": "test"},
+        ),
+        (
+            "POST",
+            "/api/v1/review-runs/missing/session/messages",
+            {"message": "answer", "delivery": "answer"},
+        ),
+        (
+            "POST",
+            "/api/v1/review-runs/missing/result",
+            {"raw_output": {"summary": "none", "findings": []}},
+        ),
+        ("POST", "/api/v1/review-runs/missing/retry", None),
+        ("POST", "/api/v1/review-runs/missing/cancel", None),
+        ("GET", "/api/v1/workspaces/missing", None),
+        ("POST", "/api/v1/workspaces/missing/lease", {}),
+        ("POST", "/api/v1/workspace-leases/missing/release", None),
+        ("POST", "/api/v1/workspaces/missing/cleanup", {"force": False}),
+    ]
+
+    with make_client(tmp_path) as client:
+        for method, path, body in requests:
+            response = client.request(method, path, json=body)
+            assert response.status_code == 404, (method, path, response.text)
+
+
+def test_webhook_rejects_unknown_provider_and_malformed_payload(tmp_path: Path) -> None:
+    malformed = b"not-json"
+    with make_signed_client(tmp_path) as client:
+        unsupported = client.post("/api/v1/webhooks/unknown", content=b"{}")
+        invalid = client.post(
+            "/api/v1/webhooks/github",
+            content=malformed,
+            headers=github_headers(malformed, delivery_id="malformed"),
+        )
+
+    assert unsupported.status_code == 404
+    assert unsupported.json()["detail"] == "Unsupported provider: unknown"
+    assert invalid.status_code == 400
+
+
+def test_runtime_required_endpoint_fails_cleanly_when_disabled(tmp_path: Path) -> None:
+    with make_client_with_settings(tmp_path, pi_agent_base_url=None) as client:
+        response = client.get("/api/v1/agent-tasks/missing/agent-session")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "pi-agent runtime base URL is not configured."
+    )
+
+
+def test_retry_failed_review_run_creates_next_attempt(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+
+    async def mark_failed(client: TestClient, review_run_id: str) -> None:
+        async with client.app.state.session_factory() as session:
+            review_run = await session.get(ReviewRun, review_run_id)
+            assert review_run is not None
+            review_run.status = "failed"
+            review_run.failure_code = "agent_failed"
+            await session.commit()
+
+    with make_client(tmp_path) as client:
+        original = client.post("/api/v1/review-runs", json=payload).json()
+        client.portal.call(mark_failed, client, original["id"])
+        response = client.post(f"/api/v1/review-runs/{original['id']}/retry")
+
+    assert response.status_code == 202
+    assert response.json()["review_run_id"] != original["id"]
+    assert response.json()["status"] == "queued"
