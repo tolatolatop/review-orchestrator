@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -19,18 +19,24 @@ import {
 
 import {
   agentRegistry,
-  changeSummaryAgent,
   codeReviewAgent,
   prAssistantAgent,
   validateStartRequest,
 } from "../dist/server.js";
+import { changeSummaryAgent } from "../dist/agents/change-summary.js";
 import {
   AgentConfigurationError,
   AgentRegistry,
   resolveAgentConfiguration,
+  resolveDomainPreset,
   validateAgentInput,
 } from "../dist/agent/registry.js";
-import { AgentRunner, finalizeAgentRun } from "../dist/agent/runner.js";
+import { TaskOverlayExecutionEnvironmentProvider } from "../dist/agent/environment.js";
+import {
+  AgentRunner,
+  buildSessionArchive,
+  finalizeAgentRun,
+} from "../dist/agent/runner.js";
 import { composeSkillPrompt, loadAgentSkills } from "../dist/agent/skills.js";
 import { consumeToolCall, consumeTurn } from "../dist/agent/limits.js";
 
@@ -57,7 +63,6 @@ function configuration(definition, overrides = {}) {
       ),
       ...(overrides.profile === undefined ? {} : { profile: overrides.profile }),
       ...(overrides.skills === undefined ? {} : { skills: overrides.skills }),
-      ...(overrides.model === undefined ? {} : { model: overrides.model }),
     },
     {
       provider: "openai",
@@ -89,66 +94,110 @@ function sessionRecord(workspace, definition, resolved, input) {
     tools: [],
     execution_limits: resolved.limits,
     execution_counters: { turns: 0, toolCalls: 0 },
-    interaction_policy: resolved.interactionPolicy,
     created_at: timestamp,
     updated_at: timestamp,
     events: [],
   };
 }
 
-test("builtin registry exposes versioned agents including a non-legacy third agent", () => {
+test("builtin registry exposes one installed definition per production agent", () => {
   assert.deepEqual(
     agentRegistry.list().map((agent) => `${agent.id}@${agent.version}`),
-    ["code-review@1.0.0", "pr-assistant@1.0.0", "change-summary@1.0.0"],
+    ["code-review@1.0.0", "pr-assistant@1.0.0"],
   );
   assert.equal(agentRegistry.resolveLegacy("review").id, "code-review");
-  assert.equal(agentRegistry.resolve("change-summary").legacyKind, undefined);
+  assert.throws(() => agentRegistry.resolve("change-summary"), /Unknown agent/);
 });
 
-test("generic start contract validates agent input without a kind branch", () => {
+test("generic start contract accepts only domain preset selectors", () => {
   const request = validateStartRequest({
-    agent_id: "change-summary",
-    agent_version: "1.0.0",
+    agent_id: "code-review",
+    task_type: "code-review",
+    repository_skills: ["builtin:code-review"],
     workspace_path: "/workspaces/repo",
-    profile: "deep",
-    input: {
-      repository_context: repository,
-      audience: "release-manager",
-      focus: "database compatibility",
-    },
+    input: repository,
   });
-  assert.equal(request.kind, "agent");
-  assert.equal(request.agent_id, "change-summary");
-  assert.equal(request.profile, "deep");
+  assert.equal(request.kind, "review");
+  assert.equal(request.agent_id, "code-review");
+  assert.equal(request.task_type, "code-review");
+  assert.deepEqual(request.repository_skills, ["builtin:code-review"]);
   assert.throws(
     () => validateStartRequest({
-      agent_id: "change-summary",
+      agent_id: "code-review",
+      agent_version: "1.0.0",
+      task_type: "code-review",
       workspace_path: "/workspaces/repo",
-      input: { repository_context: { ...repository, pr_number: 0 } },
+      input: repository,
     }),
-    /Invalid input for agent change-summary/,
+    /agent_version is not a Runtime request override/,
   );
 });
 
-test("profiles change effective model, skills, and execution limits", () => {
-  const resolved = configuration(codeReviewAgent, {
-    profile: "strict",
-    model: { thinking_level: "minimal" },
+test("domain preset composition applies field-specific ownership", () => {
+  const { configuration: resolved, preset } = resolveDomainPreset(
+    {
+      agentId: "pr-assistant",
+      taskType: "message-command",
+      repositorySkills: ["npm:@example/repository-skill"],
+    },
+    prAssistantAgent,
+    {
+      provider: "openai",
+      model: "gpt-5.4",
+      thinkingLevel: "high",
+    },
+  );
+
+  assert.equal(resolved.profileName, "default");
+  assert.equal(resolved.skills.primary, "npm:@example/repository-skill");
+  assert.deepEqual(resolved.tools, [
+    "repository.list-files",
+    "repository.read-file",
+    "repository.search-code",
+    "repository.git-diff",
+    "workspace.write-file",
+    "workspace.shell",
+  ]);
+  assert.equal(preset.model.id, "gpt-5.4");
+  assert.equal(preset.composition.agent.id, "pr-assistant");
+  assert.equal(preset.composition.agent.version, "1.0.0");
+  assert.match(preset.composition.agent.digest, /^[0-9a-f]{64}$/);
+  assert.deepEqual(preset.composition.repository, {
+    skills: ["npm:@example/repository-skill"],
   });
-  assert.equal(resolved.thinkingLevel, "xhigh");
-  assert.deepEqual(resolved.skills, {
-    primary: "code-review",
-    supporting: ["security-analysis"],
+  assert.deepEqual(preset.composition.task_type, {
+    id: "message-command",
+    profile: "default",
   });
-  assert.equal(resolved.limits.maxTurns, 40);
-  assert.equal(resolved.limits.maxToolCalls, 160);
+  assert.throws(
+    () => resolveDomainPreset(
+      {
+        agentId: "pr-assistant",
+        taskType: "arbitrary-profile",
+        repositorySkills: [],
+      },
+      prAssistantAgent,
+      { provider: "openai", model: "gpt-5.4", thinkingLevel: "high" },
+    ),
+    /does not support task type/,
+  );
+});
+
+test("installed named presets can change tools and execution limits", () => {
+  const resolved = configuration(changeSummaryAgent, {
+    profile: "deep",
+    input: { repository_context: repository },
+  });
+  assert.equal(resolved.thinkingLevel, "high");
+  assert.equal(resolved.limits.maxTurns, 24);
+  assert.equal(resolved.limits.maxToolCalls, 80);
   const concise = configuration(changeSummaryAgent, {
     profile: "concise",
     input: { repository_context: repository },
   });
   assert.deepEqual(concise.tools, ["repository.git-diff"]);
   assert.throws(
-    () => configuration(codeReviewAgent, { profile: "does-not-exist" }),
+    () => configuration(codeReviewAgent, { profile: "strict" }),
     /Unknown profile/,
   );
   assert.throws(
@@ -180,6 +229,53 @@ test("skill composition is deterministic and records content digests", async () 
   assert.match(prompt, /Apply this as supporting guidance/);
 });
 
+test("task overlay clones a prebuilt npm Skill environment", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-agent-environment-"));
+  try {
+    const template = join(root, "template");
+    const packageRoot = join(template, "node_modules", "example-agent-skill");
+    await mkdir(packageRoot, { recursive: true });
+    await writeFile(
+      join(packageRoot, "package.json"),
+      JSON.stringify({ name: "example-agent-skill", piAgentSkill: "SKILL.md" }),
+    );
+    await writeFile(
+      join(packageRoot, "SKILL.md"),
+      "---\nname: example-agent-skill\n---\nUse the prebuilt package.\n",
+    );
+    const resolved = configuration(codeReviewAgent);
+    const record = sessionRecord(root, codeReviewAgent, resolved, repository);
+    record.id = "overlay-test";
+    const provider = new TaskOverlayExecutionEnvironmentProvider({
+      stateRoot: join(root, "state"),
+      skillsRoot: resolve("skills"),
+      templateRoot: template,
+    });
+    const environment = await provider.prepare(record, {
+      primary: "npm:example-agent-skill",
+      supporting: ["builtin:security-analysis"],
+    });
+    const loaded = await loadAgentSkills(
+      resolve("skills"),
+      {
+        primary: "npm:example-agent-skill",
+        supporting: ["builtin:security-analysis"],
+      },
+      environment.skillPaths,
+    );
+
+    assert.equal(environment.mode, "task-overlay");
+    assert.equal(environment.template, template);
+    assert.match(environment.processEnv.PATH, /task-environments\/overlay-test/);
+    assert.deepEqual(loaded.map((skill) => `${skill.role}:${skill.name}`), [
+      "primary:example-agent-skill",
+      "supporting:security-analysis",
+    ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("agent tool selection is allow-listed and completion is schema driven", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-agent-framework-tools-"));
   try {
@@ -202,6 +298,8 @@ test("agent tool selection is allow-listed and completion is schema driven", asy
       "read_file",
       "search_code",
       "git_diff",
+      "write_file",
+      "shell",
       "submit_change_summary",
     ]);
     assert.equal(tools.some((tool) => tool.name === "request_human_input"), false);
@@ -239,7 +337,7 @@ test("prompt builders are stable and keep prior exchanges as delimited context",
     codeReviewAgent.buildPrompt({
       input: repository,
       repository,
-      profile: "fast",
+      profile: "default",
       skills: { primary: "code-review", supporting: [] },
     }),
     [
@@ -247,7 +345,7 @@ test("prompt builders are stable and keep prior exchanges as delimited context",
       "Provider: github",
       "Base commit: aaaaaaaa",
       "Head commit: bbbbbbbb",
-      "Profile: fast",
+      "Profile: default",
       "Inspect the complete base...head diff and relevant repository context.",
       "When finished, call submit_review with the final structured result.",
     ].join("\n"),
@@ -339,6 +437,29 @@ test("an agent that omits its completion tool fails with a uniform reason", () =
     "Agent code-review ended without calling submit_review.",
   );
   assert.deepEqual(events, [{ type: "session_failed", stage: "missing_result" }]);
+});
+
+test("runtime archive contains the full session branch, context, and stats", () => {
+  const header = { id: "session-1", version: 3 };
+  const entries = [
+    { type: "message", message: { role: "user", content: "Review this." } },
+    { type: "message", message: { role: "assistant", content: "Done." } },
+  ];
+  const branch = [entries[0]];
+  const context = { messages: entries.map((entry) => entry.message) };
+  const stats = { inputTokens: 12, outputTokens: 5, turns: 1 };
+  const archive = buildSessionArchive({
+    sessionManager: {
+      getHeader: () => header,
+      getEntries: () => entries,
+      getBranch: () => branch,
+      buildSessionContext: () => context,
+    },
+    getSessionStats: () => stats,
+  });
+
+  assert.deepEqual(archive, { header, entries, branch, context, stats });
+  assert.notEqual(archive.entries, entries);
 });
 
 test("a new agent definition registers without changing the registry or runner", () => {

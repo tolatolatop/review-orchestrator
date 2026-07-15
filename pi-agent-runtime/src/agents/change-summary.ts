@@ -35,7 +35,7 @@ export const changeSummaryAgent: AgentDefinition = {
     }),
   },
   defaultSkills: { primary: "change-summary", supporting: [] },
-  allowSkillOverride: true,
+  allowRepositorySkills: true,
   tools: [...repositoryTools],
   profiles: {
     default: {
@@ -53,13 +53,9 @@ export const changeSummaryAgent: AgentDefinition = {
       limits: { maxTurns: 24, maxToolCalls: 80 },
     },
   },
+  taskTypeProfiles: { "change-summary": "default" },
   defaultProfile: "default",
   modelPolicy: permissiveModelPolicy,
-  interactionPolicy: {
-    allowHumanInput: false,
-    allowSteer: true,
-    allowFollowUp: true,
-  },
   limits: {
     maxTurns: 14,
     maxToolCalls: 50,

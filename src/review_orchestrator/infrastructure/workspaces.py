@@ -374,6 +374,8 @@ def _prepare_git_workspace(
         ],
         env=env,
     )
+    if paths.repo_path.exists():
+        paths.repo_path.chmod(0o700)
 
 
 def _ensure_cache(cache_path: Path, clone_url: str, env: dict[str, str]) -> None:

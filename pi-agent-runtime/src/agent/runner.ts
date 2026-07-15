@@ -12,6 +12,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 import { createCompletionTool, createDefaultToolRegistry, type ToolRegistry } from "../tools/index.js";
+import {
+  type ExecutionEnvironmentProvider,
+  type PreparedExecutionEnvironment,
+  TaskOverlayExecutionEnvironmentProvider,
+} from "./environment.js";
 import { consumeToolCall, consumeTurn } from "./limits.js";
 import { composeSkillPrompt, loadAgentSkills } from "./skills.js";
 import type {
@@ -31,6 +36,14 @@ export interface AgentRunnerOptions {
   skillsRoot: string;
   agentDir: string;
   modelsFile: string;
+  environmentTemplateRoot?: string;
+  environmentRoot?: string;
+  taskUidMin?: number;
+  taskUidMax?: number;
+  taskGid?: number;
+  workspaceOwnerUid?: number;
+  workspaceOwnerGid?: number;
+  environmentProvider?: ExecutionEnvironmentProvider;
   toolRegistry?: ToolRegistry;
   addEvent(record: SessionRecord, event: Omit<RuntimeEvent, "at">): void;
   persist(record: SessionRecord): Promise<void>;
@@ -39,20 +52,50 @@ export interface AgentRunnerOptions {
 export class AgentRunner {
   readonly #options: AgentRunnerOptions;
   readonly #tools: ToolRegistry;
+  readonly #environmentProvider: ExecutionEnvironmentProvider;
 
   constructor(options: AgentRunnerOptions) {
     this.#options = options;
     this.#tools = options.toolRegistry ?? createDefaultToolRegistry();
+    this.#environmentProvider = options.environmentProvider
+      ?? new TaskOverlayExecutionEnvironmentProvider({
+        stateRoot: options.environmentRoot ?? options.stateRoot,
+        skillsRoot: options.skillsRoot,
+        ...(options.environmentTemplateRoot === undefined
+          ? {}
+          : { templateRoot: options.environmentTemplateRoot }),
+        ...(options.taskUidMin === undefined
+          ? {}
+          : { taskUidMin: options.taskUidMin }),
+        ...(options.taskUidMax === undefined
+          ? {}
+          : { taskUidMax: options.taskUidMax }),
+        ...(options.taskGid === undefined ? {} : { taskGid: options.taskGid }),
+        ...(options.workspaceOwnerUid === undefined
+          ? {}
+          : { workspaceOwnerUid: options.workspaceOwnerUid }),
+        ...(options.workspaceOwnerGid === undefined
+          ? {}
+          : { workspaceOwnerGid: options.workspaceOwnerGid }),
+      });
   }
 
   createTools(
     record: SessionRecord,
     configuration: ResolvedAgentConfiguration,
+    environment?: PreparedExecutionEnvironment,
   ): RuntimeTool[] {
     const definition = configuration.definition;
     const context: AgentToolContext = {
       record,
       repository: record.repository_context,
+      ...(environment === undefined ? {} : { processEnv: environment.processEnv }),
+      ...(environment?.processUid === undefined
+        ? {}
+        : { processUid: environment.processUid }),
+      ...(environment?.processGid === undefined
+        ? {}
+        : { processGid: environment.processGid }),
       addEvent: (event) => this.#options.addEvent(record, event),
       validateOutput: async (output: JsonObject) => {
         await definition.validateOutput?.(output, {
@@ -74,6 +117,7 @@ export class AgentRunner {
     record: SessionRecord,
     configuration: ResolvedAgentConfiguration,
   ): Promise<void> {
+    let environment: PreparedExecutionEnvironment | undefined;
     try {
       record.status = "preparing";
       record.stage = "preparing";
@@ -83,10 +127,31 @@ export class AgentRunner {
         primary: configuration.skills.primary,
         supporting: [...configuration.skills.supporting],
       };
-      const loadedSkills = await loadAgentSkills(this.#options.skillsRoot, selection);
+      environment = await this.#environmentProvider.prepare(record, selection);
+      record.execution_environment = {
+        mode: environment.mode,
+        root: environment.root,
+        template: environment.template,
+        ...(environment.processUid === undefined
+          ? {}
+          : { task_uid: environment.processUid }),
+        credential_separation:
+          environment.processUid !== undefined
+          && environment.processUid !== process.getuid?.(),
+      };
+      const loadedSkills = await loadAgentSkills(
+        this.#options.skillsRoot,
+        selection,
+        environment.skillPaths,
+      );
+      record.skills = loadedSkills.map((skill) => skill.name);
       record.skill_digests = Object.fromEntries(
         loadedSkills.map((skill) => [skill.name, skill.digest]),
       );
+      if (record.resolved_preset !== undefined) {
+        record.resolved_preset.skill_digests = { ...record.skill_digests };
+        record.resolved_preset.environment.template = environment.template;
+      }
       const skillPaths = loadedSkills.map((skill) => skill.path);
 
       const authStorage = createAuthStorage(this.#options.agentDir, record.provider);
@@ -135,7 +200,7 @@ export class AgentRunner {
       const sessionDirectory = join(this.#options.stateRoot, "pi-sessions", record.id);
       await mkdir(sessionDirectory, { recursive: true });
       const sessionManager = SessionManager.create(record.workspace_path, sessionDirectory);
-      const customTools = this.createTools(record, configuration);
+      const customTools = this.createTools(record, configuration, environment);
       const activeTools = customTools.map((tool) => tool.name);
       record.tools = activeTools;
       const { session } = await createAgentSession({
@@ -221,8 +286,17 @@ export class AgentRunner {
         this.#options.addEvent(record, { type: "session_failed", stage: record.stage });
       }
     } finally {
+      if (record.session !== undefined) {
+        record.session_archive = buildSessionArchive(record.session);
+      }
       record.updated_at = new Date().toISOString();
-      await this.#options.persist(record);
+      try {
+        await this.#options.persist(record);
+      } finally {
+        if (environment !== undefined) {
+          await this.#environmentProvider.dispose(environment).catch(() => undefined);
+        }
+      }
     }
   }
 
@@ -237,6 +311,17 @@ export class AgentRunner {
     });
     void record.session?.abort();
   }
+}
+
+export function buildSessionArchive(session: SessionRecord["session"]): JsonObject {
+  if (session === undefined) return {};
+  return JSON.parse(JSON.stringify({
+    header: session.sessionManager.getHeader(),
+    entries: session.sessionManager.getEntries(),
+    branch: session.sessionManager.getBranch(),
+    context: session.sessionManager.buildSessionContext(),
+    stats: session.getSessionStats(),
+  })) as JsonObject;
 }
 
 export function finalizeAgentRun(

@@ -5,28 +5,21 @@ services:
     image: review-orchestrator-pi-agent:0.80.7
     environment:
       PI_AGENT_STATE_ROOT: /var/lib/pi-agent
+      PI_AGENT_TASK_ENVIRONMENT_ROOT: /var/lib/pi-agent-task
       PI_AGENT_WORKSPACE_ROOT: /var/lib/review-orchestrator/workspaces
+      PI_AGENT_ENVIRONMENT_TEMPLATE_ROOT: /opt/pi-agent/environment-template
+      PI_AGENT_TASK_UID_MIN: 20000
+      PI_AGENT_TASK_UID_MAX: 60000
+      PI_AGENT_TASK_GID: 65532
+      PI_AGENT_WORKSPACE_OWNER_UID: 1000
+      PI_AGENT_WORKSPACE_OWNER_GID: 1000
       PI_AGENT_SKILLS_ROOT: /opt/pi-agent/skills
       PI_AGENT_MODELS_FILE: /etc/pi-agent/models.json
       PI_AGENT_RUNTIME_TOKEN: ${PI_AGENT_RUNTIME_TOKEN:-}
       PI_AGENT_PROVIDER: ${PI_AGENT_PROVIDER:-openai}
       PI_AGENT_MODEL: ${PI_AGENT_MODEL:-gpt-5.4}
       PI_AGENT_THINKING_LEVEL: ${PI_AGENT_THINKING_LEVEL:-high}
-      PI_AGENT_REVIEW_SKILL: ${PI_AGENT_REVIEW_SKILL:-code-review}
-      PI_AGENT_REVIEW_PROFILE: ${PI_AGENT_REVIEW_PROFILE:-default}
-      PI_AGENT_COMMAND_SKILL: ${AGENT_COMMAND_SKILL:-pr-assistant}
       PI_AGENT_MODEL_BASE_URL: ${PI_AGENT_MODEL_BASE_URL:-}
-      PI_AGENT_REVIEW_AGENT: ${PI_AGENT_REVIEW_AGENT:-code-review}
-      AGENT_COMMAND_AGENT: ${AGENT_COMMAND_AGENT:-pr-assistant}
-      AGENT_COMMAND_ENABLED: ${AGENT_COMMAND_ENABLED:-true}
-      AGENT_COMMAND_SKILL: ${AGENT_COMMAND_SKILL:-pr-assistant}
-      AGENT_COMMAND_PROFILE: ${AGENT_COMMAND_PROFILE:-default}
-      AGENT_TASK_SOFT_TIMEOUT_SECONDS: ${AGENT_TASK_SOFT_TIMEOUT_SECONDS:-120}
-      AGENT_TASK_TIMEOUT_SECONDS: ${AGENT_TASK_TIMEOUT_SECONDS:-600}
-      AGENT_TASK_MAX_HISTORY_TURNS: ${AGENT_TASK_MAX_HISTORY_TURNS:-6}
-      AGENT_TASK_MAX_HISTORY_CHARS: ${AGENT_TASK_MAX_HISTORY_CHARS:-24000}
-      AGENT_TASK_ALLOWED_ASSOCIATIONS: ${AGENT_TASK_ALLOWED_ASSOCIATIONS:-OWNER,MEMBER,COLLABORATOR}
-      AGENT_TASK_MAX_COMMAND_CHARS: ${AGENT_TASK_MAX_COMMAND_CHARS:-8000}
       PI_AGENT_LLM_API_KEY: ${PI_AGENT_LLM_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -36,14 +29,22 @@ services:
       - "127.0.0.1:${PI_AGENT_RUNTIME_PORT:-3210}:3210"
     volumes:
       - pi_agent_state:/var/lib/pi-agent
-      - review_orchestrator_data:/var/lib/review-orchestrator:ro
+      - review_workspace:/var/lib/review-orchestrator/workspaces
       - ${PI_AGENT_SKILLS_PATH:-./pi-agent-runtime/skills}:/opt/pi-agent/skills:ro
       - ${PI_AGENT_CONFIG_PATH:-./pi-agent-runtime/config}:/etc/pi-agent:ro
+      - ${PI_AGENT_ENVIRONMENT_TEMPLATE_PATH:-./pi-agent-runtime/environment-template}:/opt/pi-agent/environment-template:ro
     read_only: true
     tmpfs:
       - /tmp:size=256m,mode=1777
+      - /var/lib/pi-agent-task:size=1g,mode=0755
     cap_drop:
       - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
     security_opt:
       - no-new-privileges:true
     pids_limit: 256
@@ -65,16 +66,15 @@ services:
       GIT_CACHE_ROOT: /var/lib/review-orchestrator/git-cache
       PI_AGENT_BASE_URL: http://pi-agent-runtime:3210
       PI_AGENT_RUNTIME_TOKEN: ${PI_AGENT_RUNTIME_TOKEN:-}
-      PI_AGENT_PROVIDER: ${PI_AGENT_PROVIDER:-openai}
-      PI_AGENT_MODEL: ${PI_AGENT_MODEL:-gpt-5.4}
-      PI_AGENT_THINKING_LEVEL: ${PI_AGENT_THINKING_LEVEL:-high}
-      PI_AGENT_MODEL_BASE_URL: ${PI_AGENT_MODEL_BASE_URL:-}
       PI_AGENT_REVIEW_AGENT: ${PI_AGENT_REVIEW_AGENT:-code-review}
+      PI_AGENT_REVIEW_SKILL: ${PI_AGENT_REVIEW_SKILL:-code-review}
       AGENT_COMMAND_AGENT: ${AGENT_COMMAND_AGENT:-pr-assistant}
+      AGENT_COMMAND_SKILL: ${AGENT_COMMAND_SKILL:-pr-assistant}
     ports:
       - "${PORT:-8000}:8000"
     volumes:
       - review_orchestrator_data:/var/lib/review-orchestrator
+      - review_workspace:/var/lib/review-orchestrator/workspaces
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -96,3 +96,4 @@ services:
 volumes:
   pi_agent_state:
   review_orchestrator_data:
+  review_workspace:

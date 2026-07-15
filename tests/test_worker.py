@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from review_orchestrator.application.delivery import process_next_delivery
 from review_orchestrator.config import Settings
 from review_orchestrator.db import create_engine, create_session_factory, init_models
 from review_orchestrator.github import GitHubClientError
@@ -23,6 +24,7 @@ from review_orchestrator.schemas import ReviewRunCreate
 from review_orchestrator.services import create_review_run
 from review_orchestrator.worker import (
     acquire_next_review_run,
+    build_worker_provider_registry,
     emit_timeout_event,
     process_next_agent_task,
     process_next_review_run,
@@ -263,6 +265,33 @@ async def session_factory(tmp_path: Path):
         yield factory
     finally:
         await engine.dispose()
+
+
+async def deliver_all(
+    session,
+    *,
+    provider_registry: ProviderRegistry,
+    max_deliveries: int = 20,
+) -> None:
+    for index in range(max_deliveries):
+        delivered = await process_next_delivery(
+            session,
+            worker_id=f"test-publisher-{index}",
+            provider_registry=provider_registry,
+            retry_delay_seconds=0,
+        )
+        if delivered is None:
+            return
+    raise AssertionError("Delivery outbox did not drain.")
+
+
+async def deliver_github_all(session, github_client) -> None:
+    await deliver_all(
+        session,
+        provider_registry=build_worker_provider_registry(
+            github_client=github_client
+        ),
+    )
 
 
 async def test_worker_acquires_and_releases_review_run_lock(session_factory) -> None:
@@ -566,6 +595,10 @@ async def test_agent_task_worker_uses_custom_provider_registry(
             worker_id="worker-1",
             provider_registry=ProviderRegistry([adapter]),
         )
+        await deliver_all(
+            session,
+            provider_registry=ProviderRegistry([adapter]),
+        )
 
     assert processed is not None
     assert processed.status == "completed"
@@ -591,6 +624,10 @@ async def test_agent_task_provider_failure_uses_same_registry_for_summary(
         processed = await process_next_agent_task(
             session,
             worker_id="worker-1",
+            provider_registry=ProviderRegistry([adapter]),
+        )
+        await deliver_all(
+            session,
             provider_registry=ProviderRegistry([adapter]),
         )
 
@@ -626,6 +663,12 @@ async def test_agent_task_hydrate_failure_marks_failed_and_publishes_summary(
             session,
             worker_id="worker-1",
             github_client=github_client,
+        )
+        await deliver_all(
+            session,
+            provider_registry=build_worker_provider_registry(
+                github_client=github_client
+            ),
         )
 
     assert processed is not None
@@ -686,7 +729,8 @@ async def test_review_worker_releases_lock_when_pi_agent_result_not_ready(
     assert processed.status == "running"
     assert processed.stage == "analyzing"
     assert processed.lock_owner is None
-    assert processed.locked_until is not None
+    assert processed.locked_until is None
+    assert processed.available_at is not None
 
 
 async def test_waiting_review_run_backs_off_and_queued_run_is_prioritized(
@@ -755,13 +799,16 @@ async def test_changed_files_failure_degrades_to_summary_only_collection(
         session.add(review_run)
         await session.commit()
 
+        github_client = FailingChangedFilesGitHubClient()
         processed = await process_next_review_run(
             session,
             settings=settings,
             pi_agent_client=ResultPiAgentClient(),
             worker_id="worker-1",
-            github_client=FailingChangedFilesGitHubClient(),
+            github_client=github_client,
         )
+        await deliver_github_all(session, github_client)
+        await session.refresh(processed)
 
     assert processed is not None
     assert processed.status == "completed"
@@ -808,13 +855,16 @@ async def test_worker_collects_structured_no_findings_result(
         session.add(review_run)
         await session.commit()
 
+        github_client = FakeGitHubClient()
         processed = await process_next_review_run(
             session,
             settings=settings,
             pi_agent_client=NoFindingsPiAgentClient(),
             worker_id="worker-1",
-            github_client=FakeGitHubClient(),
+            github_client=github_client,
         )
+        await deliver_github_all(session, github_client)
+        await session.refresh(processed)
 
     assert processed is not None
     assert processed.status == "completed"
@@ -857,13 +907,16 @@ async def test_worker_collects_structured_result_without_event_scraping(
         session.add(review_run)
         await session.commit()
 
+        github_client = FakeGitHubClient()
         processed = await process_next_review_run(
             session,
             settings=settings,
             pi_agent_client=NoFindingsPiAgentClient(),
             worker_id="worker-1",
-            github_client=FakeGitHubClient(),
+            github_client=github_client,
         )
+        await deliver_github_all(session, github_client)
+        await session.refresh(processed)
 
     assert processed is not None
     assert processed.status == "completed"
@@ -913,6 +966,8 @@ async def test_review_worker_publishes_failed_summary_on_pi_agent_start_failure(
             worker_id="worker-1",
             github_client=github_client,
         )
+        await deliver_github_all(session, github_client)
+        await session.refresh(processed)
 
     assert processed is not None
     assert processed.status == "failed"
@@ -966,6 +1021,8 @@ async def test_review_worker_retries_transient_pi_agent_start_failure(
             worker_id="worker-1",
             github_client=github_client,
         )
+        await deliver_github_all(session, github_client)
+        await session.refresh(processed)
 
     assert processed is not None
     assert processed.status == "running"
@@ -973,7 +1030,8 @@ async def test_review_worker_retries_transient_pi_agent_start_failure(
     assert processed.agent_session_id is None
     assert processed.failure_code is None
     assert processed.lock_owner is None
-    assert processed.locked_until is not None
+    assert processed.locked_until is None
+    assert processed.available_at is not None
     assert processed.validation_warnings_json == [
         {
             "code": "pi_agent_start_retry",
@@ -1086,6 +1144,8 @@ async def test_review_worker_fails_after_pi_agent_start_retries_are_exhausted(
             worker_id="worker-1",
             github_client=github_client,
         )
+        await deliver_github_all(session, github_client)
+        await session.refresh(processed)
 
     assert processed is not None
     assert processed.status == "failed"
@@ -1306,6 +1366,8 @@ async def test_review_worker_publishes_failed_summary_on_invalid_result(
             worker_id="worker-1",
             github_client=github_client,
         )
+        await deliver_github_all(session, github_client)
+        await session.refresh(processed)
 
     assert processed is not None
     assert processed.status == "failed"
@@ -1366,6 +1428,8 @@ async def test_review_worker_marks_failed_on_unexpected_result_collection_error(
             worker_id="worker-1",
             github_client=github_client,
         )
+        await deliver_github_all(session, github_client)
+        await session.refresh(processed)
 
     assert processed is not None
     assert processed.status == "failed"
@@ -1415,6 +1479,9 @@ async def test_review_run_timeouts_publish_summary_and_cancel_pi_agent(
             pi_agent_client=pi_agent_client,
             github_client=github_client,
         )
+        await deliver_github_all(session, github_client)
+        for review_run in touched:
+            await session.refresh(review_run)
 
     statuses = {run.pull_request_number: run.status for run in touched}
     assert statuses == {41: "running", 42: "failed"}
@@ -1477,6 +1544,8 @@ async def test_soft_timeout_summary_is_not_overwritten_by_same_worker_pass(
             worker_id="worker-1",
             github_client=github_client,
         )
+        await deliver_github_all(session, github_client)
+        await session.refresh(processed)
 
     assert processed is not None
     assert processed.status == "running"

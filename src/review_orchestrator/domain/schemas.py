@@ -1,8 +1,9 @@
 """API and application data contracts."""
 
+from __future__ import annotations
+
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -13,6 +14,7 @@ from review_orchestrator.infrastructure.observability import ObservabilityListEn
 class ReviewRunStatus(StrEnum):
     queued = "queued"
     running = "running"
+    awaiting_delivery = "awaiting_delivery"
     completed = "completed"
     failed = "failed"
     cancelled = "cancelled"
@@ -176,30 +178,13 @@ class ReviewRunDetail(ReviewRunListItem):
 
 
 class ReviewSessionStart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     workspace_path: str | None = Field(default=None, min_length=1)
-    skill: str | None = Field(
-        default=None,
-        pattern=r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
-    )
-    profile: str | None = Field(default=None, min_length=1, max_length=128)
-    provider: str | None = Field(default=None, min_length=1, max_length=64)
-    model: str | None = Field(default=None, min_length=1, max_length=128)
-    thinking_level: str | None = Field(
-        default=None,
-        pattern="^(minimal|low|medium|high|xhigh)$",
-    )
-    model_base_url: str | None = Field(default=None, min_length=1, max_length=2048)
 
 
 class ReviewSessionCancel(BaseModel):
     reason: str = Field(default="cancelled", min_length=1, max_length=1000)
-
-
-class ReviewSessionMessage(BaseModel):
-    message: str = Field(min_length=1, max_length=8000)
-    delivery: Literal["answer", "steer", "follow_up"] = Field(
-        default="steer",
-    )
 
 
 class ReviewResultCollect(BaseModel):
@@ -233,7 +218,7 @@ class PlatformPermissionDiagnosticRequest(BaseModel):
     pull_request_number: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
-    def validate_repository_path(self) -> "PlatformPermissionDiagnosticRequest":
+    def validate_repository_path(self) -> PlatformPermissionDiagnosticRequest:
         parts = self.repo_full_name.split("/")
         if any(part in {".", ".."} for part in parts):
             raise ValueError("repo_full_name contains an invalid path segment")
@@ -289,6 +274,165 @@ class ProviderEventInboxListResponse(ObservabilityListEnvelope):
 class ProviderEventInboxDetail(ProviderEventInboxSummary):
     dedupe_key: str
     payload: dict | None = None
+
+
+class TaskSummary(BaseModel):
+    id: str
+    kind: str
+    capability_id: str
+    status: str
+    stage: str | None = None
+    execution_status: str
+    delivery_status: str
+    queue: str
+    priority: int
+    effective_priority: int
+    available_at: datetime
+    deadline_at: datetime | None = None
+    dedupe_key: str | None = None
+    concurrency_key: str | None = None
+    resource_class: str
+    resource_context: dict | None = None
+    max_attempts: int
+    lock_owner: str | None = None
+    locked_until: datetime | None = None
+    domain_metadata: dict = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+
+class TaskListResponse(ObservabilityListEnvelope):
+    items: list[TaskSummary]
+
+
+class TaskAttemptSummary(BaseModel):
+    id: str
+    task_id: str
+    attempt_no: int
+    status: str
+    stage: str | None = None
+    agent_run_id: str | None = None
+    workspace_id: str | None = None
+    workspace_path: str | None = None
+    resolved_preset: dict | None = None
+    usage: dict | None = None
+    failure_category: str | None = None
+    error_message: str | None = None
+    started_at: datetime
+    completed_at: datetime | None = None
+
+
+class SessionArchiveRead(BaseModel):
+    id: str
+    task_id: str
+    task_attempt: TaskAttemptSummary | None = None
+    agent_run_id: str
+    session: dict
+    task_metadata: dict
+    workspace_diff: str | None = None
+    workspace_diff_truncated: bool
+    redaction_version: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class SessionArchiveListResponse(BaseModel):
+    items: list[SessionArchiveRead]
+
+
+class TaskSchedulingUpdate(BaseModel):
+    queue: str | None = Field(default=None, min_length=1, max_length=64)
+    priority: int | None = Field(default=None, ge=0, le=100)
+    available_at: datetime | None = None
+    resource_class: str | None = Field(default=None, min_length=1, max_length=64)
+    resource_context: dict[
+        str,
+        str | list[str] | TaskResourceRequest,
+    ] | None = None
+
+    @model_validator(mode="after")
+    def require_update(self) -> TaskSchedulingUpdate:
+        if all(
+            value is None
+            for value in (
+                self.queue,
+                self.priority,
+                self.available_at,
+                self.resource_class,
+                self.resource_context,
+            )
+        ):
+            raise ValueError("At least one scheduling field is required.")
+        return self
+
+
+class TaskResourceRequest(BaseModel):
+    keys: list[str] = Field(min_length=1)
+    units: int = Field(default=1, gt=0)
+
+
+class ResourcePoolRead(BaseModel):
+    resource_key: str
+    dimension: str
+    capacity: int
+    active_units: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class ResourcePoolListResponse(BaseModel):
+    items: list[ResourcePoolRead]
+
+
+class ResourcePoolUpdate(BaseModel):
+    capacity: int = Field(gt=0)
+    dimension: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class DeliveryOutboxSummary(BaseModel):
+    id: str
+    task_id: str
+    provider: str
+    operation: str
+    destination_key: str
+    idempotency_key: str
+    mandatory: bool
+    status: str
+    queue: str
+    priority: int
+    available_at: datetime
+    attempt: int
+    max_attempts: int
+    provider_message_id: str | None = None
+    last_error: str | None = None
+    delivered_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class DeliveryOutboxListResponse(ObservabilityListEnvelope):
+    items: list[DeliveryOutboxSummary]
+
+
+class DeliverySchedulingUpdate(BaseModel):
+    queue: str | None = Field(default=None, min_length=1, max_length=64)
+    priority: int | None = Field(default=None, ge=0, le=100)
+    available_at: datetime | None = None
+    max_attempts: int | None = Field(default=None, gt=0, le=100)
+
+    @model_validator(mode="after")
+    def require_update(self) -> DeliverySchedulingUpdate:
+        if all(
+            value is None
+            for value in (
+                self.queue,
+                self.priority,
+                self.available_at,
+                self.max_attempts,
+            )
+        ):
+            raise ValueError("At least one delivery scheduling field is required.")
+        return self
 
 
 class AgentTaskQueueHealth(BaseModel):
@@ -353,12 +497,6 @@ class ReviewRunActionResult(BaseModel):
     status: ReviewRunStatus
 
 
-class AgentPendingInput(BaseModel):
-    id: str
-    question: str
-    choices: list[str] | None = None
-
-
 class PiAgentSessionDiagnostics(BaseModel):
     review_run_id: str | None = None
     agent_task_ids: list[str] = Field(default_factory=list)
@@ -373,7 +511,6 @@ class PiAgentSessionDiagnostics(BaseModel):
     agent_thinking_level: str | None = None
     execution_status: str | None = None
     execution_stage: str | None = None
-    pending_input: AgentPendingInput | None = None
     event_count: int = 0
     session_available: bool = False
     live_status_available: bool = False

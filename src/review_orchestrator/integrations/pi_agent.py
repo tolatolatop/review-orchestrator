@@ -32,12 +32,6 @@ class PiAgentSessionStatus(StrEnum):
     cancelled = "cancelled"
 
 
-class PiAgentPendingInput(BaseModel):
-    id: str
-    question: str
-    choices: list[str] | None = None
-
-
 class AgentInstructionRepositoryContext(BaseModel):
     provider: str
     repo_full_name: str
@@ -89,6 +83,14 @@ class AgentTaskResult(BaseModel):
     references: list[AgentTaskReference] = Field(default_factory=list, max_length=50)
 
 
+class AgentDomainPreset(BaseModel):
+    """Only domain-owned selectors accepted by the thin Runtime."""
+
+    agent_id: str = Field(min_length=1, max_length=128)
+    task_type: str = Field(min_length=1, max_length=128)
+    repository_skills: list[str] = Field(default_factory=list)
+
+
 class PiAgentRuntimeEvent(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -118,11 +120,12 @@ class PiAgentSession(BaseModel):
     tools: list[str] = Field(default_factory=list)
     execution_limits: dict[str, int] = Field(default_factory=dict)
     execution_counters: dict[str, int] = Field(default_factory=dict)
-    interaction_policy: dict[str, bool] = Field(default_factory=dict)
+    resolved_preset: dict[str, Any] | None = None
+    execution_environment: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
+    session_archive: dict[str, Any] | None = None
     error: str | None = None
     session_file: str | None = None
-    pending_input: PiAgentPendingInput | None = None
     events: list[PiAgentRuntimeEvent] = Field(default_factory=list)
 
 
@@ -144,43 +147,22 @@ class PiAgentClient:
         self,
         review_input: ReviewSkillInput,
         *,
-        skill: str,
-        profile: str,
-        provider: str,
-        model: str,
-        thinking_level: str,
-        model_base_url: str | None = None,
-        agent_id: str = "code-review",
-        agent_version: str | None = None,
+        preset: AgentDomainPreset,
     ) -> PiAgentSession:
         return await self.start_agent_session(
-            agent_id=agent_id,
-            agent_version=agent_version,
+            preset=preset,
             workspace_path=review_input.workspace_path,
             input_data=review_input.model_dump(),
             title=(
                 f"Review PR #{review_input.pr_number}: {review_input.repo_full_name}"
             ),
-            skills=[skill],
-            profile=profile,
-            provider=provider,
-            model=model,
-            thinking_level=thinking_level,
-            model_base_url=model_base_url,
         )
 
     async def start_instruction_session(
         self,
         instruction: AgentInstructionInput,
         *,
-        skill: str,
-        profile: str,
-        provider: str,
-        model: str,
-        thinking_level: str,
-        model_base_url: str | None = None,
-        agent_id: str = "pr-assistant",
-        agent_version: str | None = None,
+        preset: AgentDomainPreset,
     ) -> PiAgentSession:
         instruction_payload: dict[str, Any] = {
             "text": instruction.text,
@@ -190,8 +172,7 @@ class PiAgentClient:
         if instruction.source_url:
             instruction_payload["source_url"] = instruction.source_url
         return await self.start_agent_session(
-            agent_id=agent_id,
-            agent_version=agent_version,
+            preset=preset,
             workspace_path=instruction.workspace_path,
             input_data={
                 "repository_context": instruction.repository_context.model_dump(),
@@ -202,66 +183,32 @@ class PiAgentClient:
                 f"PR #{instruction.repository_context.pr_number} command from "
                 f"{instruction.author_login}"
             ),
-            skills=[skill],
-            profile=profile,
-            provider=provider,
-            model=model,
-            thinking_level=thinking_level,
-            model_base_url=model_base_url,
         )
 
     async def start_agent_session(
         self,
         *,
-        agent_id: str,
+        preset: AgentDomainPreset,
         workspace_path: str,
         input_data: dict[str, Any],
-        agent_version: str | None = None,
         idempotency_key: str | None = None,
         title: str | None = None,
-        skills: list[str] | None = None,
-        profile: str | None = None,
-        provider: str | None = None,
-        model: str | None = None,
-        thinking_level: str | None = None,
-        model_base_url: str | None = None,
     ) -> PiAgentSession:
         response = await self._request(
             "POST",
             "/v1/sessions",
             json=self._agent_start_payload(
-                agent_id=agent_id,
-                agent_version=agent_version,
+                preset=preset,
                 workspace_path=workspace_path,
                 input_data=input_data,
                 idempotency_key=idempotency_key,
                 title=title,
-                skills=skills,
-                profile=profile,
-                provider=provider,
-                model=model,
-                thinking_level=thinking_level,
-                model_base_url=model_base_url,
             ),
         )
         return PiAgentSession.model_validate(response)
 
     async def get_session(self, session_id: str) -> PiAgentSession:
         response = await self._request("GET", f"/v1/sessions/{session_id}")
-        return PiAgentSession.model_validate(response)
-
-    async def send_message(
-        self,
-        session_id: str,
-        message: str,
-        *,
-        delivery: Literal["answer", "steer", "follow_up"] = "steer",
-    ) -> PiAgentSession:
-        response = await self._request(
-            "POST",
-            f"/v1/sessions/{session_id}/messages",
-            json={"message": message, "delivery": delivery},
-        )
         return PiAgentSession.model_validate(response)
 
     async def cancel_session(self, session_id: str) -> PiAgentSession:
@@ -272,38 +219,22 @@ class PiAgentClient:
         self,
         review_input: ReviewSkillInput,
         *,
-        skill: str,
-        profile: str,
-        provider: str,
-        model: str,
-        thinking_level: str,
-        model_base_url: str | None,
+        preset: AgentDomainPreset,
     ) -> dict[str, Any]:
         return self._agent_start_payload(
-            agent_id="code-review",
+            preset=preset,
             workspace_path=review_input.workspace_path,
             input_data=review_input.model_dump(),
             title=(
                 f"Review PR #{review_input.pr_number}: {review_input.repo_full_name}"
             ),
-            skills=[skill],
-            profile=profile,
-            provider=provider,
-            model=model,
-            thinking_level=thinking_level,
-            model_base_url=model_base_url,
         )
 
     def _instruction_start_payload(
         self,
         instruction: AgentInstructionInput,
         *,
-        skill: str,
-        profile: str,
-        provider: str,
-        model: str,
-        thinking_level: str,
-        model_base_url: str | None,
+        preset: AgentDomainPreset,
     ) -> dict[str, Any]:
         instruction_payload: dict[str, Any] = {
             "text": instruction.text,
@@ -313,7 +244,7 @@ class PiAgentClient:
         if instruction.source_url:
             instruction_payload["source_url"] = instruction.source_url
         return self._agent_start_payload(
-            agent_id="pr-assistant",
+            preset=preset,
             workspace_path=instruction.workspace_path,
             input_data={
                 "repository_context": instruction.repository_context.model_dump(),
@@ -324,56 +255,28 @@ class PiAgentClient:
                 f"PR #{instruction.repository_context.pr_number} command from "
                 f"{instruction.author_login}"
             ),
-            skills=[skill],
-            profile=profile,
-            provider=provider,
-            model=model,
-            thinking_level=thinking_level,
-            model_base_url=model_base_url,
         )
 
     def _agent_start_payload(
         self,
         *,
-        agent_id: str,
+        preset: AgentDomainPreset,
         workspace_path: str,
         input_data: dict[str, Any],
-        agent_version: str | None = None,
         idempotency_key: str | None = None,
         title: str | None = None,
-        skills: list[str] | None = None,
-        profile: str | None = None,
-        provider: str | None = None,
-        model: str | None = None,
-        thinking_level: str | None = None,
-        model_base_url: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "agent_id": agent_id,
+            "agent_id": preset.agent_id,
+            "task_type": preset.task_type,
+            "repository_skills": preset.repository_skills,
             "workspace_path": workspace_path,
             "input": input_data,
         }
-        if agent_version:
-            payload["agent_version"] = agent_version
         if idempotency_key:
             payload["idempotency_key"] = idempotency_key
         if title:
             payload["title"] = title
-        if skills is not None:
-            payload["skills"] = skills
-        if profile:
-            payload["profile"] = profile
-        model_config: dict[str, str] = {}
-        if provider:
-            model_config["provider"] = provider
-        if model:
-            model_config["id"] = model
-        if thinking_level:
-            model_config["thinking_level"] = thinking_level
-        if model_base_url:
-            model_config["base_url"] = model_base_url
-        if model_config:
-            payload["model"] = model_config
         return payload
 
     async def _request(

@@ -9,17 +9,23 @@ def root_files() -> tuple[str, str]:
     )
 
 
-def test_pi_agent_runtime_is_isolated_and_workspace_is_read_only() -> None:
+def test_pi_agent_runtime_is_isolated_with_a_writable_task_workspace() -> None:
     compose, _ = root_files()
     runtime = compose.split("  pi-agent-runtime:", 1)[1].split(
         "  review-orchestrator:", 1
     )[0]
 
     assert "review-orchestrator-pi-agent:0.80.7" in runtime
-    assert "review_orchestrator_data:/var/lib/review-orchestrator:ro" in runtime
+    assert "review_workspace:/var/lib/review-orchestrator/workspaces" in runtime
+    assert "review_orchestrator_data:/var/lib/review-orchestrator" not in runtime
     assert "pi_agent_state:/var/lib/pi-agent" in runtime
     assert "read_only: true" in runtime
     assert "cap_drop:\n      - ALL" in runtime
+    assert "cap_add:" in runtime
+    assert "- SETUID" in runtime
+    assert "PI_AGENT_TASK_UID_MIN: 20000" in runtime
+    assert "PI_AGENT_TASK_UID_MAX: 60000" in runtime
+    assert "PI_AGENT_TASK_ENVIRONMENT_ROOT: /var/lib/pi-agent-task" in runtime
     assert "no-new-privileges:true" in runtime
     assert "/var/run/docker.sock" not in runtime
     assert "/run/secrets" not in runtime
@@ -43,8 +49,9 @@ def test_pi_agent_runtime_supports_configurable_models_and_skills() -> None:
     ) in compose
     assert "PI_AGENT_PROVIDER=openai" in example_env
     assert "PI_AGENT_SKILLS_PATH=./pi-agent-runtime/skills" in example_env
-    assert "PI_AGENT_COMMAND_SKILL: ${AGENT_COMMAND_SKILL:-pr-assistant}" in compose
     assert "AGENT_COMMAND_SKILL=pr-assistant" in example_env
+    assert "PI_AGENT_ENVIRONMENT_TEMPLATE_ROOT:" in compose
+    assert "PI_AGENT_ENVIRONMENT_TEMPLATE_PATH=" in example_env
 
 
 def test_worker_receives_message_command_timeout_and_history_configuration() -> None:

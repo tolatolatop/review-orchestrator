@@ -32,7 +32,6 @@ def test_public_route_inventory_survives_directory_refactors() -> None:
         ("GET", "/api/v1/review-runs/{review_run_id}"),
         ("POST", "/api/v1/review-runs/{review_run_id}/session/start"),
         ("POST", "/api/v1/review-runs/{review_run_id}/session/sync"),
-        ("POST", "/api/v1/review-runs/{review_run_id}/session/messages"),
         ("POST", "/api/v1/review-runs/{review_run_id}/session/cancel"),
         ("POST", "/api/v1/review-runs/{review_run_id}/result"),
         ("POST", "/api/v1/review-runs/{review_run_id}/retry"),

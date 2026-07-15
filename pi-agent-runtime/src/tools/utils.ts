@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 const MAX_TOOL_OUTPUT_BYTES = 500_000;
 
@@ -32,19 +32,63 @@ export async function resolveWorkspacePath(
   throw new Error("Path resolves outside the agent workspace.");
 }
 
+export async function resolveWorkspaceWritePath(
+  workspace: string,
+  requested: string,
+): Promise<string> {
+  const normalized = validateRelativePath(requested);
+  if (normalized === ".") throw new Error("A file path is required.");
+  const workspaceRoot = await realpath(workspace);
+  const requestedTarget = resolve(workspaceRoot, normalized);
+  const existingTarget = await realpath(requestedTarget).catch(() => undefined);
+  if (existingTarget !== undefined) {
+    const existingRel = relative(workspaceRoot, existingTarget);
+    if (
+      !existingRel.startsWith(`..${sep}`)
+      && existingRel !== ".."
+      && !isAbsolute(existingRel)
+    ) {
+      return existingTarget;
+    }
+    throw new Error("Path resolves outside the agent workspace.");
+  }
+  let existing = dirname(requestedTarget);
+  while (true) {
+    const resolvedExisting = await realpath(existing).catch(() => undefined);
+    if (resolvedExisting !== undefined) {
+      const rel = relative(workspaceRoot, resolvedExisting);
+      if (rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel)) break;
+      return requestedTarget;
+    }
+    const parent = dirname(existing);
+    if (parent === existing) break;
+    existing = parent;
+  }
+  throw new Error("Path resolves outside the agent workspace.");
+}
+
 export async function runProcess(
   command: string,
   args: string[],
   cwd: string,
   signal?: AbortSignal,
   timeoutMs = 30_000,
+  extraEnv: Record<string, string> = {},
+  uid?: number,
+  gid?: number,
 ): Promise<ProcessResult> {
   return await new Promise<ProcessResult>((resolvePromise, rejectPromise) => {
     const child = spawn(command, args, {
       cwd,
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
-      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C.UTF-8" },
+      env: {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        LANG: "C.UTF-8",
+        ...extraEnv,
+      },
+      ...(uid === undefined ? {} : { uid }),
+      ...(gid === undefined ? {} : { gid }),
     });
     let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);

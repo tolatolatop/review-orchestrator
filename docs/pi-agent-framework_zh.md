@@ -1,170 +1,148 @@
-# pi-agent Agent 框架
+# pi-agent 独立 Runtime 与扩展契约
 
-`pi-agent-runtime` 是一个按 Agent Definition 执行任务的 runtime。Review 和 PR
-问答是内置 Agent，不再是 Runner 中的固定执行分支。旧的 `kind=review` 和
-`kind=instruction` 只在 HTTP 输入边界映射到对应 Agent。
+状态：已按 Agent/Task 重规划实现。
 
-## Agent 模型
+## 1. 模块边界
 
-每个 Agent 完整声明：
-
-- 稳定的 `id` 和语义化 `version`；
-- TypeBox 输入和输出 Schema；
-- 标题、任务 Prompt 和 System Prompt；
-- 主 Skill、辅助 Skills 及是否允许调用方覆盖；
-- Tool Registry 中允许使用的工具；
-- 模型覆盖策略和允许的 thinking level；
-- 人工输入、steer 和 follow-up 交互策略；
-- 最大 turn、工具调用和结果字节数；
-- 唯一的结构化结果提交工具。
-
-核心契约位于：
+pi-agent Runtime 是独立 Node 模块，只负责一次 Agent Run：
 
 ```text
-pi-agent-runtime/src/
-├── agent/
-│   ├── types.ts       # Agent Definition 和运行时状态契约
-│   ├── registry.ts    # Agent 注册、版本解析、输入输出校验、Profile 解析
-│   ├── runner.ts      # 通用 pi SDK 执行循环
-│   ├── skills.ts      # 多 Skill 加载、顺序组合和 SHA-256 摘要
-│   └── limits.ts      # turn/tool-call 预算
-├── agents/
-│   ├── code-review.ts
-│   ├── pr-assistant.ts
-│   └── change-summary.ts
-└── tools/
-    ├── registry.ts
-    ├── repository.ts
-    ├── interaction.ts
-    └── completion.ts
+run(installed agent, domain preset, session input, workspace path)
+  -> pi Session + explicit Tools
+  -> structured result + permanent archive payload
 ```
 
-Runner 只依赖 `AgentDefinition`，不判断 Agent ID、Review 类型或结果工具名称。
+Runtime 不负责 Provider 事件、Git clone/fetch、业务重试、Task 调度或评论投递。
+这些能力属于 Python Orchestrator。Runtime 也不把 Session 当成业务 Task 状态源。
 
-## 内置 Agent
+生产注册只包含：
 
-| Agent | 版本 | Profile | 结果工具 | 说明 |
-| --- | --- | --- | --- | --- |
-| `code-review` | `1.0.0` | `default`, `fast`, `strict` | `submit_review` | 结构化 PR 缺陷审查。`strict` 自动组合 `security-analysis` Skill。 |
-| `pr-assistant` | `1.0.0` | `default`, `concise`, `thorough`, `strict` | `submit_task_result` | 使用只读证据回答 PR 命令。 |
-| `change-summary` | `1.0.0` | `default`, `concise`, `deep` | `submit_change_summary` | 面向开发、Review 或发布角色解释变更，用于验证非 Review Agent 的扩展能力。 |
+| Agent | Task Type | 完成 Tool |
+| --- | --- | --- |
+| `code-review` | `code-review` | `submit_review` |
+| `pr-assistant` | `message-command` | `submit_task_result` |
 
-`GET /v1/agents` 返回注册 Agent 的版本、Profile、Schema、Skill、Tool、模型策略、
-交互策略和执行限制。
+`change-summary` 仅保留为测试 fixture，用来验证 AgentDefinition/Runner 的扩展性，
+不注册为生产能力，也没有 Catalog API。
 
-## 通用启动协议
+## 2. 启动契约与 preset
 
-新调用方应使用 `agent_id + agent_version + input`：
+`POST /v1/sessions` 的可配置选择量只有：
 
 ```json
 {
-  "agent_id": "change-summary",
-  "agent_version": "1.0.0",
-  "workspace_path": "/var/lib/review-orchestrator/workspaces/.../repo",
-  "profile": "deep",
-  "skills": ["change-summary"],
-  "input": {
-    "repository_context": {
-      "provider": "github",
-      "repo_full_name": "example/repo",
-      "pr_number": 42,
-      "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-    },
-    "audience": "release-manager",
-    "focus": "database compatibility"
-  }
+  "agent_id": "pr-assistant",
+  "task_type": "message-command",
+  "repository_skills": ["builtin:pr-assistant"],
+  "workspace_path": "/workspaces/.../repo",
+  "input": {},
+  "idempotency_key": "agent-task:<id>:attempt:1"
 }
 ```
 
-Runtime 在创建 Session 前完成 Agent 版本解析、输入 Schema、Profile、Skill 名称和
-模型策略校验。Python `PiAgentClient.start_agent_session()` 暴露同一个通用协议；
-`start_session()` 和 `start_instruction_session()` 是现有业务的类型化包装。
+请求不能提交 `agent_version`、`profile`、`model`、`base_url` 或任意 `skills`
+覆盖。模型及 Base URL 是 Runtime 部署配置；Task Type 只能映射到 Agent 内已经安装
+的命名 preset。
 
-## Profile 解析
+解析使用字段级所有权：
 
-Profile 是实际执行配置，而非元数据字符串。解析顺序是：
+1. Agent definition 提供 system instructions、默认 Skill、Tool、模型规则、预算和结果 Schema；
+2. Repository Skills 只改变 Skill refs；
+3. Task Type 选择 Agent 内部命名 preset，并对该 preset 拥有的 Tool、预算等字段取最终值；
+4. Skill 不增加 Tool，Tool 之间的依赖也不由框架推断。
 
-1. Runtime 部署默认模型形成基础配置；
-2. 应用合法的 Session 模型和 Skill 覆盖；
-3. 应用命名 Profile 的模型、Skill、Tool 和预算覆盖；
-4. 最后使用 Agent 固有 allowlist 校验结果。
+Runtime 返回并持久化 `resolved_preset`，包含：
 
-未知 Profile、非法 thinking level、越过模型策略或重复 Tool 会在启动前失败。
+- Agent ID、发布版本和 definition digest；
+- 三层组合来源；
+- 模型、thinking level；
+- Skill refs 与内容 digest；
+- 显式 Tool 列表；
+- turn/tool/result 限制；
+- Execution Environment 类型和模板。
 
-## Skill 组合
+同一 Runtime 不根据请求动态路由多个语义版本。升级通过发布新的 Runtime 完成，
+审计依赖 definition digest 和 Runtime release。
 
-Agent 区分一个主 Skill 和零到多个辅助 Skill。加载顺序固定为主 Skill在前，辅助
-Skill 按定义顺序追加。Runtime 校验目录名与 `SKILL.md` frontmatter 的 `name`
-一致，将所有 Skill 内容组合进 System Prompt，并在 Session 中记录每个文件的
-SHA-256 摘要。
+## 3. Skill 来源
 
-Skill 只能提供行为指导，不能自行扩大 Agent 的 Tool 权限或替换完成协议。
+Skill ref 支持三种形式：
 
-## Tool 与完成协议
+- `builtin:<name>` 或兼容的裸 `<name>`：读取只读 `PI_AGENT_SKILLS_ROOT`；
+- `prebuilt:<name>`：读取克隆模板的 `skills/<name>/SKILL.md`；
+- `npm:<package>`：在 Task overlay 中执行正常的 `npm install`；package 可用
+  `piAgentSkill` 指定 `SKILL.md` 路径，也可写成 `npm:<package>::<path>`。
 
-Agent Definition 使用注册 ID 选择工具，例如：
+Skill 安装脚本和后续命令拥有 Task 环境内的完整执行能力。框架不建设 Skill 沙箱，
+但安装只修改 Task overlay，不修改 builtin 或 prebuilt 模板。Skill 名称、来源、安装结果
+和内容 digest 随 Session/Task 元数据保存。
 
-```ts
-tools: [
-  "repository.list-files",
-  "repository.read-file",
-  "repository.search-code",
-  "repository.git-diff",
-]
-```
+## 4. Tool 能力
 
-Tool Registry 将 ID 解析为 pi SDK 工具，并拒绝未知 ID 或重复的运行时工具名称。
-结果提交工具由 `AgentResultDefinition` 通用创建，执行时依次校验：
+两个生产 Agent 均显式获得：
 
-1. 只能提交一次；
-2. 结果符合 Agent 输出 Schema；
-3. JSON 字节数没有超过 Agent/Profile 限制；
-4. 通过 Agent 可选的语义校验，例如引用文件和行号；
-5. 校验成功后才把 Session 标记为 `completed`。
+- `repository.list-files`；
+- `repository.read-file`；
+- `repository.search-code`；
+- `repository.git-diff`；
+- `workspace.write-file`；
+- `workspace.shell`；
+- 与结果 Schema 一一对应的唯一完成 Tool。
 
-Agent 正常结束但没有调用完成工具时统一进入 `missing_result`。
+Agent 可以修改 Workspace、安装依赖、执行构建和测试。路径型 Tool 拒绝 `..`、绝对路径
+和 symlink escape。Shell 可以在 Workspace 内使用任意命令，但没有 Provider/Git/Runtime
+凭据，也不负责发布评论或 push。
 
-## 交互和执行预算
+Tool Registry 是独立的 `id -> factory` 映射。注册 Tool 不声明依赖，加载 Skill 也不会
+隐式注册 Tool；组合正确性由 Agent/Capability 作者和测试负责。
 
-Agent 独立声明是否允许：
+## 5. Execution Environment
 
-- `request_human_input`；
-- 运行中的 `steer`；
-- 当前工作完成后的 `follow_up`。
+默认是轻量级 B：长期 Controller 容器 + 每 Task 独立 Workspace、子进程和可丢弃 overlay。
 
-Runner 对每个 `turn_start` 和 `tool_execution_start` 计数。超过 Profile 解析后的预算
-会中止 SDK Session，并以 `execution_limit_exceeded` 失败。状态统一使用
-`starting`、`preparing`、`running`、`waiting_for_input`、
-`validating_result`、`completed`、`failed` 和 `cancelled`。
+`TaskOverlayExecutionEnvironmentProvider`：
 
-## 新增 Agent
+1. 克隆 `PI_AGENT_ENVIRONMENT_TEMPLATE_ROOT`；
+2. 在 overlay 中安装 npm Skill/package；
+3. 把 overlay 的 `node_modules/.bin` 加入 Task PATH；
+4. Agent Run 结束后删除整个 overlay。
 
-新增 Agent 只需要：
+Compose 把数据库/Git cache 与 Workspace 拆成不同 volume。Runtime 只挂载 Workspace，
+不挂载 Orchestrator 数据和 secrets。Controller 持有模型密钥并使用 root UID；shell/npm
+子进程从 20000～60000 的运行中 UID 池分配不同 UID。运行前 Workspace 临时交给该 Task
+UID，结束后恢复给 Orchestrator
+UID 1000。子进程环境只包含 PATH、HOME、LANG 和 npm cache，不继承 Runtime Token、
+模型 Key 或 Provider/Git 凭据。
 
-1. 在 `src/agents/` 新增一个实现 `AgentDefinition` 的模块；
-2. 在 `src/agents/index.ts` 注册该定义；
-3. 在 `skills/<name>/SKILL.md` 添加主 Skill，必要时添加辅助 Skill；
-4. 添加输入/输出、Prompt、Profile、Tool allowlist 和 pi faux-provider eval 测试。
+需要更强隔离时，可实现另一个 `ExecutionEnvironmentProvider`，用同一契约启动一次性
+OCI 容器；这不会改变 Task、SessionArchive 或 Delivery Outbox。
 
-不需要修改 `AgentRunner`、HTTP Session 路由、完成工具实现或现有 Agent。
+## 6. Session 与审计
 
-## 测试与评测
+Runtime 导出：
 
-```bash
-npm --prefix pi-agent-runtime test
-```
+- Session header 和全部 entries；
+- active branch；
+- pi 构建的 Session context；
+- token/turn 等 Session stats；
+- Tool events、结构化结果和执行环境元数据。
 
-测试覆盖：
+Orchestrator 对数据和 Workspace diff 脱敏后永久写入 `SessionArchive`，并关联
+`TaskAttempt`。当前目标是可解释，不承诺从归档精确重建模型调用。
 
-- Agent 注册、版本选择和重复注册；
-- 通用启动请求与输入 Schema；
-- 输出 Schema 和结果大小限制；
-- Prompt 快照；
-- Tool allowlist；
-- 主/辅助 Skill 顺序、frontmatter 和摘要；
-- Profile 对模型、Skill 和预算的真实影响；
-- turn/tool-call 预算；
-- 未调用完成工具；
-- 人工输入暂停和恢复；
-- `code-review`、`pr-assistant`、`change-summary` 的 pi SDK faux-provider eval。
+Runtime 不再提供 human-input、steer 或 follow-up 路由。控制面只保留 Session 查询、
+同步和取消。
+
+## 7. 新 Agent 的扩展步骤
+
+新增 Agent 需要：
+
+1. 实现 `AgentDefinition`：输入/输出 Schema、instructions、prompt builder、Task Type
+   preset、显式 Tool 和预算；
+2. 提供 builtin/prebuilt/npm Skill；
+3. 在 `agents/index.ts` 安装一个生产 definition；
+4. 在 Orchestrator 增加确定性 trigger/context/delivery 接线；
+5. 增加输入输出、preset、Tool allowlist、prompt snapshot 和 pi faux-provider eval。
+
+如果新能力只复用已有 Agent、Workspace、Context、Tool 和 Delivery，它应优先成为新的
+Task Type/Repository Skill 组合，而不是复制 Runner 或 Scheduler。

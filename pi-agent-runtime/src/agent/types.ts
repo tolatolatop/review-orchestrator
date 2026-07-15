@@ -25,13 +25,6 @@ export interface RepositoryContext {
   head_sha: string;
 }
 
-export interface ModelSelection {
-  provider?: string;
-  id?: string;
-  thinking_level?: string;
-  base_url?: string;
-}
-
 export interface SkillSelection {
   primary: string;
   supporting: string[];
@@ -56,19 +49,10 @@ export interface AgentExecutionCounters {
   toolCalls: number;
 }
 
-export interface AgentInteractionPolicy {
-  allowHumanInput: boolean;
-  allowSteer: boolean;
-  allowFollowUp: boolean;
-}
-
 export interface AgentModelPolicy {
   allowedThinkingLevels: ThinkingLevel[];
   allowedProviders?: string[];
   allowedModels?: string[];
-  allowProviderOverride: boolean;
-  allowModelOverride: boolean;
-  allowBaseUrlOverride: boolean;
 }
 
 export interface AgentProfile {
@@ -112,12 +96,12 @@ export interface AgentDefinition {
   inputSchema: TSchema;
   result: AgentResultDefinition;
   defaultSkills: SkillSelection;
-  allowSkillOverride: boolean;
+  allowRepositorySkills: boolean;
   tools: string[];
   profiles: Record<string, AgentProfile>;
+  taskTypeProfiles: Record<string, string>;
   defaultProfile: string;
   modelPolicy: AgentModelPolicy;
-  interactionPolicy: AgentInteractionPolicy;
   limits: AgentExecutionLimits;
   systemPrompt: string;
   title(input: JsonObject): string;
@@ -139,7 +123,31 @@ export interface ResolvedAgentConfiguration {
   thinkingLevel: ThinkingLevel;
   baseUrl?: string;
   limits: AgentExecutionLimits;
-  interactionPolicy: AgentInteractionPolicy;
+}
+
+export interface DomainPresetSelection {
+  agentId: string;
+  taskType: string;
+  repositorySkills: string[];
+}
+
+export interface ResolvedDomainPreset {
+  schema_version: "1";
+  composition: {
+    agent: { id: string; version: string; digest: string };
+    repository: { skills: string[] };
+    task_type: { id: string; profile: string };
+  };
+  model: {
+    provider: string;
+    id: string;
+    thinking_level: ThinkingLevel;
+  };
+  skills: string[];
+  skill_digests: Record<string, string>;
+  tools: string[];
+  limits: AgentExecutionLimits;
+  environment: { mode: "task-overlay"; template: string };
 }
 
 export interface RuntimeEvent {
@@ -147,14 +155,6 @@ export interface RuntimeEvent {
   type: string;
   stage: string;
   tool?: string;
-}
-
-export interface PendingInput {
-  id: string;
-  question: string;
-  choices?: string[];
-  resolve: (answer: string) => void;
-  reject: (error: Error) => void;
 }
 
 export interface SessionRecord {
@@ -178,20 +178,30 @@ export interface SessionRecord {
   tools: string[];
   execution_limits: AgentExecutionLimits;
   execution_counters: AgentExecutionCounters;
-  interaction_policy: AgentInteractionPolicy;
+  resolved_preset?: ResolvedDomainPreset;
+  execution_environment?: {
+    mode: "task-overlay";
+    root: string;
+    template: string;
+    task_uid?: number;
+    credential_separation: boolean;
+  };
   result?: JsonObject;
+  session_archive?: JsonObject;
   error?: string;
   session_file?: string;
   created_at: string;
   updated_at: string;
   events: RuntimeEvent[];
   session?: AgentSession;
-  pending?: PendingInput;
 }
 
 export interface AgentToolContext {
   record: SessionRecord;
   repository: RepositoryContext;
+  processEnv?: Record<string, string>;
+  processUid?: number;
+  processGid?: number;
   addEvent(event: Omit<RuntimeEvent, "at">): void;
   validateOutput(output: JsonObject): Promise<void>;
 }
@@ -210,5 +220,4 @@ export interface AgentInvocation {
   input: JsonObject;
   profile?: string;
   skills?: string[];
-  model?: ModelSelection;
 }

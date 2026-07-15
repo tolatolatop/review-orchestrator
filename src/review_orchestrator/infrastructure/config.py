@@ -37,15 +37,7 @@ class Settings(BaseSettings):
         description="Bearer token used to authenticate to the pi-agent runtime.",
     )
     pi_agent_review_skill: str = "code-review"
-    pi_agent_review_profile: str = "default"
     pi_agent_review_agent: str = "code-review"
-    pi_agent_provider: str = "openai"
-    pi_agent_model: str = "gpt-5.4"
-    pi_agent_thinking_level: str = Field(
-        default="high",
-        pattern="^(minimal|low|medium|high|xhigh)$",
-    )
-    pi_agent_model_base_url: str | None = None
     pi_agent_timeout_seconds: float = Field(
         default=30.0,
         gt=0,
@@ -65,7 +57,6 @@ class Settings(BaseSettings):
     review_bot_login: str = "review-agent"
     agent_command_enabled: bool = True
     agent_command_skill: str = "pr-assistant"
-    agent_command_profile: str = "default"
     agent_command_agent: str = "pr-assistant"
     agent_task_soft_timeout_seconds: int = Field(default=120, gt=0)
     agent_task_timeout_seconds: int = Field(default=600, gt=0)
@@ -100,6 +91,11 @@ class Settings(BaseSettings):
     review_run_soft_timeout_seconds: int = 900
     worker_poll_interval_seconds: float = Field(default=5.0, gt=0)
     worker_lock_seconds: int = Field(default=300, gt=0)
+    task_priority_aging_seconds: int = Field(default=300, gt=0)
+    task_scheduler_scan_limit: int = Field(default=64, gt=0, le=1000)
+    task_resource_capacities: str = (
+        "user=4,repository=4,pr=1,pr_head=1,comment=1,model=4,concurrency=1"
+    )
     retry_max_attempts: int = 2
     retry_initial_delay_seconds: int = 60
 

@@ -1,11 +1,24 @@
-import { readFile, readdir, stat } from "node:fs/promises";
-import { join, relative, sep } from "node:path";
+import {
+  chown,
+  mkdir,
+  readFile,
+  readdir,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { dirname, join, relative, sep } from "node:path";
 
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 import type { AgentToolContext, RuntimeTool } from "../agent/types.js";
-import { resolveWorkspacePath, runProcess, textToolResult, validateRelativePath } from "./utils.js";
+import {
+  resolveWorkspacePath,
+  resolveWorkspaceWritePath,
+  runProcess,
+  textToolResult,
+  validateRelativePath,
+} from "./utils.js";
 
 export function createListFilesTool(context: AgentToolContext): RuntimeTool {
   return defineTool({
@@ -75,6 +88,82 @@ export function createReadFileTool(context: AgentToolContext): RuntimeTool {
         total_lines: lines.length,
         truncated: start + selected.length < lines.length,
       });
+    },
+  });
+}
+
+export function createWriteFileTool(context: AgentToolContext): RuntimeTool {
+  return defineTool({
+    name: "write_file",
+    label: "Write file",
+    description: "Create or replace a UTF-8 file inside the Task workspace.",
+    promptSnippet: "Write a file in the Task workspace",
+    parameters: Type.Object({
+      path: Type.String({ description: "Repository-relative file path" }),
+      content: Type.String({ maxLength: 2_000_000 }),
+    }),
+    async execute(_toolCallId, params) {
+      const target = await resolveWorkspaceWritePath(
+        context.record.workspace_path,
+        params.path,
+      );
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(target, params.content, "utf8");
+      if (context.processUid !== undefined && context.processGid !== undefined) {
+        await chown(target, context.processUid, context.processGid);
+        let directory = dirname(target);
+        while (directory !== context.record.workspace_path) {
+          await chown(directory, context.processUid, context.processGid);
+          const parent = dirname(directory);
+          if (parent === directory) break;
+          directory = parent;
+        }
+      }
+      const bytes = Buffer.byteLength(params.content);
+      return textToolResult(`Wrote ${bytes} bytes to ${params.path}.`, {
+        path: params.path,
+        bytes,
+      });
+    },
+  });
+}
+
+export function createShellTool(context: AgentToolContext): RuntimeTool {
+  return defineTool({
+    name: "shell",
+    label: "Shell",
+    description: "Run a shell command with full access to the Task workspace.",
+    promptSnippet: "Run build, test, analysis, and file-management commands",
+    parameters: Type.Object({
+      command: Type.String({ minLength: 1, maxLength: 20_000 }),
+      cwd: Type.Optional(Type.String({ description: "Repository-relative working directory" })),
+      timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 600 })),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const cwd = await resolveWorkspacePath(
+        context.record.workspace_path,
+        params.cwd ?? ".",
+      );
+      const metadata = await stat(cwd);
+      if (!metadata.isDirectory()) throw new Error("shell cwd must be a directory.");
+      const result = await runProcess(
+        "/bin/sh",
+        ["-lc", params.command],
+        cwd,
+        signal,
+        (params.timeout_seconds ?? 120) * 1000,
+        context.processEnv,
+        context.processUid,
+        context.processGid,
+      );
+      const output = [
+        result.stdout,
+        result.stderr ? `\n[stderr]\n${result.stderr}` : "",
+      ].join("");
+      return textToolResult(
+        output || `(command exited ${result.exitCode} with no output)`,
+        { exit_code: result.exitCode, truncated: result.truncated },
+      );
     },
   });
 }

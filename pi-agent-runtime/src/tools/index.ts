@@ -1,9 +1,10 @@
-import { createRequestHumanInputTool } from "./interaction.js";
 import {
   createGitDiffTool,
   createListFilesTool,
   createReadFileTool,
   createSearchCodeTool,
+  createShellTool,
+  createWriteFileTool,
 } from "./repository.js";
 import { ToolRegistry } from "./registry.js";
 
@@ -13,7 +14,8 @@ export function createDefaultToolRegistry(): ToolRegistry {
   registry.register("repository.read-file", createReadFileTool);
   registry.register("repository.search-code", createSearchCodeTool);
   registry.register("repository.git-diff", createGitDiffTool);
-  registry.register("interaction.request-human-input", createRequestHumanInputTool);
+  registry.register("workspace.write-file", createWriteFileTool);
+  registry.register("workspace.shell", createShellTool);
   return registry;
 }
 

@@ -192,7 +192,6 @@ stored in the database with conservative defaults:
 - `auto_retry_invalid_agent_result = false`
 - `auto_retry_infra_failure = true`
 - `default_review_skill = code-review`
-- `default_review_profile = default`
 
 Workspace storage defaults:
 
@@ -212,28 +211,27 @@ pi-agent runtime integration:
 
 ### pi-agent Integration
 
-The Review Orchestrator owns `review_run` state. A dedicated service embeds the
-pi-agent SDK behind a versioned Agent Definition/Registry/Runner framework:
+The Review Orchestrator owns Task state. A separate thin Runtime embeds the
+pi-agent SDK behind installed Agent definitions:
 
 1. `session/start` converts an existing `review_run` plus a workspace path into a
    small `ReviewSkillInput` commit-range reference and creates a persisted
    pi-agent session.
-2. The selected Agent definition composes its profiles, skills, tool allow-list,
-   model policy, interaction policy, execution limits, and structured result schema.
-   The runtime has no
-   Docker socket, Linux capabilities, or writable repository mount.
-3. `session/sync` polls runtime state, including `waiting_for_input`; operators
-   answer or steer through `session/messages`.
+2. The control plane sends only `agent_id + repository_skills + task_type`.
+   Runtime resolves the installed Agent base, Repository Skills and named Task
+   Type preset into a frozen `resolved_preset`; requests cannot override model,
+   Base URL, profile, Tool implementations, or Agent version.
+3. Each run receives a writable Task Workspace and a disposable dependency
+   overlay cloned from builtin/prebuilt content. Skills may be installed with
+   npm, while Tools remain independently and explicitly configured.
 4. `session/cancel` marks the run cancelled and aborts the pi-agent session.
 5. The worker collects the structured `submit_review` result, validates it with
-   `review_orchestrator.review_results`, stores the summary, and marks the run
-   completed.
+   `review_orchestrator.review_results`, permanently archives the redacted pi
+   Session plus Task metadata, and writes Provider delivery to the Outbox.
 
-The bundled runtime includes the versioned `code-review`, `pr-assistant`, and
-`change-summary` agents. It supports a primary skill plus ordered supporting skills,
-real named profiles, per-agent tools and completion schemas, and a generic
-`agent_id + agent_version + input` start contract. See
-`docs/pi-agent-framework_zh.md`. Custom model definitions can be placed in
+The production Runtime includes `code-review` and `pr-assistant`; additional
+definitions are installed code, not dynamically version-routed request data.
+Custom model definitions can be placed in
 `${PI_AGENT_CONFIG_PATH}/models.json`; see
 `pi-agent-runtime/config/models.example.json`.
 
@@ -241,8 +239,8 @@ real named profiles, per-agent tools and completion schemas, and a generic
 
 On a GitHub PR, a trusted `OWNER`, `MEMBER`, or `COLLABORATOR` can mention the
 configured `REVIEW_BOT_LOGIN` in an issue comment, submitted review, or review
-comment. The text after the mention becomes a read-only message command rather
-than an automatic review.
+comment. The text after the mention becomes a message command rather than an
+automatic review.
 
 The command path persists an `AgentTask`, creates one task-specific placeholder
 comment, prepares the same head-SHA-isolated workspace used by reviews, and
@@ -250,10 +248,11 @@ starts pi-agent in `instruction` mode with the `pr-assistant` skill. A validated
 `submit_task_result` answer replaces that exact placeholder. Failures,
 cancellation, soft timeout, and hard timeout also update the same comment.
 
-Commands for one PR execute FIFO. A new command receives a bounded history of
+Commands for one PR execute in Task priority/resource order. A new command receives a bounded history of
 the six most recent successful command/answer exchanges. It never creates a
-`ReviewRun` or `Finding`, and the runtime still has no shell, write, or edit
-tools.
+`ReviewRun` or `Finding`. The Agent can read, write, build, and test inside its
+Task Workspace, but does not receive Provider/Git/Runtime/model credentials and
+cannot publish comments directly.
 
 ### Workspace MVP Contract
 

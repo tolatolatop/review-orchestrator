@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import socket
 
+from review_orchestrator.application.delivery import process_next_delivery
 from review_orchestrator.application.worker import (
     build_worker_provider_registry,
     process_agent_task_timeouts,
@@ -68,6 +69,13 @@ async def run_worker(
 
         while True:
             async with session_factory() as session:
+                delivery = await process_next_delivery(
+                    session,
+                    worker_id=f"{resolved_worker_id}:delivery",
+                    provider_registry=provider_registry,
+                    retry_delay_seconds=settings.retry_initial_delay_seconds,
+                )
+            async with session_factory() as session:
                 await process_agent_task_timeouts(
                     session,
                     settings=settings,
@@ -100,7 +108,7 @@ async def run_worker(
                 )
             if once:
                 return
-            if agent_task is None and review_run is None:
+            if delivery is None and agent_task is None and review_run is None:
                 await asyncio.sleep(settings.worker_poll_interval_seconds)
     finally:
         try:

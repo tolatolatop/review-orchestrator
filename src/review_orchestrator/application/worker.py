@@ -8,9 +8,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from review_orchestrator.application.delivery import enqueue_delivery
+from review_orchestrator.application.scheduler import (
+    SchedulerPolicy,
+    claim_next_task,
+    policy_from_settings,
+    release_task_claim,
+)
 from review_orchestrator.application.services import (
     collect_review_result,
     create_review_run,
@@ -18,6 +25,7 @@ from review_orchestrator.application.services import (
     start_review_session,
     sync_review_session,
 )
+from review_orchestrator.application.session_archive import archive_agent_session
 from review_orchestrator.domain.models import (
     AgentTask,
     ProviderEventInbox,
@@ -38,6 +46,7 @@ from review_orchestrator.integrations.gitlab import (
     GitLabClient,
 )
 from review_orchestrator.integrations.pi_agent import (
+    AgentDomainPreset,
     AgentInstructionHistoryItem,
     AgentInstructionInput,
     AgentInstructionRepositoryContext,
@@ -78,37 +87,21 @@ async def acquire_next_review_run(
     worker_id: str,
     lock_seconds: int = 300,
     now: datetime | None = None,
+    policy: SchedulerPolicy | None = None,
 ) -> ReviewRun | None:
-    now = now or utc_now()
-    result = await session.execute(
-        select(ReviewRun)
-        .where(
-            or_(
-                ReviewRun.status == "queued",
-                ReviewRun.status == "running",
-            ),
-            or_(
-                ReviewRun.locked_until.is_(None),
-                ReviewRun.locked_until < now,
-            ),
-        )
-        .order_by(ReviewRun.status == "running", ReviewRun.created_at)
-        .limit(1)
+    task = await claim_next_task(
+        session,
+        worker_id=worker_id,
+        task_kinds={"review"},
+        lock_seconds=lock_seconds,
+        now=now,
+        policy=policy,
     )
-    review_run = result.scalar_one_or_none()
-    if review_run is None:
+    if task is None:
         return None
-
-    if review_run.status == "queued":
-        review_run.status = "running"
-        review_run.stage = "start"
-    review_run.lock_owner = worker_id
-    review_run.locked_until = now + timedelta(seconds=lock_seconds)
-    review_run.started_at = review_run.started_at or now
-    session.add(review_run)
-    await session.commit()
-    await session.refresh(review_run)
-    return review_run
+    if not isinstance(task, ReviewRun):
+        raise TypeError(f"Scheduler returned non-review task {task.id}.")
+    return task
 
 
 async def acquire_next_agent_task(
@@ -117,34 +110,26 @@ async def acquire_next_agent_task(
     worker_id: str,
     lock_seconds: int = 300,
     now: datetime | None = None,
+    policy: SchedulerPolicy | None = None,
 ) -> AgentTask | None:
-    now = now or utc_now()
-    result = await session.execute(
-        select(AgentTask)
-        .where(
-            or_(
-                AgentTask.status == "queued",
-                and_(
-                    AgentTask.task_type == "message_command",
-                    AgentTask.status == "running",
-                ),
-            ),
-            or_(AgentTask.locked_until.is_(None), AgentTask.locked_until < now),
-        )
-        .order_by(AgentTask.created_at)
-        .limit(1)
+    claimed = await claim_next_task(
+        session,
+        worker_id=worker_id,
+        task_kinds={"agent"},
+        lock_seconds=lock_seconds,
+        now=now,
+        policy=policy,
     )
-    task = result.scalar_one_or_none()
-    if task is None:
+    if claimed is None:
         return None
+    if not isinstance(claimed, AgentTask):
+        raise TypeError(f"Scheduler returned non-agent task {claimed.id}.")
+    task = claimed
     if task.task_type != "message_command":
-        task.status = "running"
         task.result_json = {"worker_id": worker_id}
-    task.lock_owner = worker_id
-    task.locked_until = now + timedelta(seconds=lock_seconds)
-    session.add(task)
-    await session.commit()
-    await session.refresh(task)
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
     return task
 
 
@@ -162,6 +147,7 @@ async def process_next_agent_task(
         session,
         worker_id=worker_id,
         lock_seconds=settings.worker_lock_seconds if settings else 300,
+        policy=policy_from_settings(settings) if settings else None,
     )
     if task is None:
         return None
@@ -269,18 +255,18 @@ async def _process_command_agent_task(
     github_client: GitHubClient | None,
     provider_registry: ProviderRegistry,
 ) -> AgentTask:
-    if task.response_comment_id is None or task.stage == "placeholder_pending":
-        try:
-            await _publish_agent_task_comment(
-                session, task, provider_registry=provider_registry, state="working"
-            )
-        except ProviderError as exc:
-            task.last_publish_error = str(exc)
-            task.error_message = str(exc)
-            session.add(task)
-            await session.commit()
-            await session.refresh(task)
-            return task
+    if task.response_comment_id is None and task.stage == "placeholder_pending":
+        task.status = "awaiting_delivery"
+        task.stage = "placeholder_delivery_pending"
+        await _enqueue_agent_task_comment(
+            session,
+            task,
+            state="working",
+            mandatory=True,
+            success_status="queued",
+            success_stage="placeholder_delivered",
+        )
+        return task
 
     if task.stage == "cancellation_pending":
         return await _cancel_command_agent_task(
@@ -316,7 +302,7 @@ async def _process_command_agent_task(
             AgentTask.repo_full_name == task.repo_full_name,
             AgentTask.pull_request_number == task.pull_request_number,
             AgentTask.task_type == "message_command",
-            AgentTask.status.in_({"queued", "running"}),
+            AgentTask.status.in_({"queued", "running", "awaiting_delivery"}),
             AgentTask.created_at < task.created_at,
         )
         .limit(1)
@@ -327,18 +313,12 @@ async def _process_command_agent_task(
         session.add(task)
         await session.commit()
         await session.refresh(task)
-        try:
-            await _publish_agent_task_comment(
-                session,
-                task,
-                provider_registry=provider_registry,
-                state="queued",
-            )
-        except ProviderError as exc:
-            task.last_publish_error = str(exc)
-            session.add(task)
-            await session.commit()
-            await session.refresh(task)
+        await _enqueue_agent_task_comment(
+            session,
+            task,
+            state="queued",
+            mandatory=False,
+        )
         return task
 
     context = await _task_context(session, task)
@@ -375,6 +355,7 @@ async def _process_command_agent_task(
         session,
         provider=task.provider,
         repo_full_name=task.repo_full_name,
+        default_command_skill=settings.agent_command_skill,
     )
     if command_config.agent_commands_enabled is False:
         return await _fail_command_agent_task(
@@ -433,21 +414,22 @@ async def _process_command_agent_task(
         session.add(task)
         await session.commit()
         try:
+            preset = AgentDomainPreset(
+                agent_id=settings.agent_command_agent,
+                task_type="message-command",
+                repository_skills=[command_config.default_agent_command_skill],
+            )
+            task.resolved_preset_json = {
+                "schema_version": "1",
+                "composition": {
+                    "agent": {"id": preset.agent_id},
+                    "repository": {"skills": preset.repository_skills},
+                    "task_type": {"id": preset.task_type},
+                },
+            }
             runtime_session = await pi_agent_client.start_instruction_session(
                 instruction,
-                skill=(
-                    command_config.default_agent_command_skill
-                    or settings.agent_command_skill
-                ),
-                profile=(
-                    command_config.default_agent_command_profile
-                    or settings.agent_command_profile
-                ),
-                provider=settings.pi_agent_provider,
-                model=settings.pi_agent_model,
-                thinking_level=settings.pi_agent_thinking_level,
-                model_base_url=settings.pi_agent_model_base_url,
-                agent_id=settings.agent_command_agent,
+                preset=preset,
             )
         except PiAgentClientError as exc:
             if (
@@ -457,7 +439,7 @@ async def _process_command_agent_task(
                 task.status = "queued"
                 task.stage = "retrying_agent_start"
                 task.error_message = str(exc)
-                task.locked_until = utc_now() + timedelta(
+                task.available_at = utc_now() + timedelta(
                     seconds=settings.retry_initial_delay_seconds
                 )
                 session.add(task)
@@ -485,6 +467,9 @@ async def _process_command_agent_task(
                 provider_registry=provider_registry,
             )
 
+    if runtime_session.resolved_preset is not None:
+        task.resolved_preset_json = runtime_session.resolved_preset
+    await archive_agent_session(session, task, runtime_session)
     task.agent_status = runtime_session.status.value
     task.agent_provider = runtime_session.provider
     task.agent_model = runtime_session.model
@@ -622,57 +607,60 @@ async def _complete_command_agent_task(
     *,
     provider_registry: ProviderRegistry,
 ) -> AgentTask:
-    task.status = "running"
-    task.stage = "publishing_result"
-    session.add(task)
-    await session.commit()
-    await session.refresh(task)
-    try:
-        await _publish_agent_task_comment(
-            session, task, provider_registry=provider_registry, state="completed"
-        )
-    except ProviderError as exc:
-        task.last_publish_error = str(exc)
-        task.error_message = str(exc)
-        session.add(task)
-        await session.commit()
-        await session.refresh(task)
-        return task
-    task.status = "completed"
-    task.stage = "completed"
-    task.completed_at = utc_now()
+    del provider_registry
+    task.status = "awaiting_delivery"
+    task.stage = "result_delivery_pending"
+    task.execution_status = "completed"
     task.error_message = None
     task.failure_code = None
-    session.add(task)
-    await session.commit()
-    await session.refresh(task)
+    await _enqueue_agent_task_comment(
+        session,
+        task,
+        state="completed",
+        mandatory=True,
+        final_status="completed",
+        final_stage="completed",
+        supersede_pending=True,
+    )
     return task
 
 
-async def _publish_agent_task_comment(
+async def _enqueue_agent_task_comment(
     session: AsyncSession,
     task: AgentTask,
     *,
-    provider_registry: ProviderRegistry,
     state: str,
-) -> str:
-    adapter = provider_registry.get(task.provider)
-    if adapter is None or not hasattr(adapter, "publish_agent_task_comment"):
-        raise ProviderError(
-            f"Provider {task.provider} cannot publish agent task comments.",
-            provider=task.provider,
-            operation="publish_agent_task_comment",
-        )
-    try:
-        return await adapter.publish_agent_task_comment(session, task, state=state)
-    except ProviderError:
-        raise
-    except Exception as exc:
-        raise ProviderError(
-            str(exc),
-            provider=task.provider,
-            operation="publish_agent_task_comment",
-        ) from exc
+    mandatory: bool,
+    success_status: str | None = None,
+    success_stage: str | None = None,
+    final_status: str | None = None,
+    final_stage: str | None = None,
+    supersede_pending: bool = False,
+) -> None:
+    payload: dict[str, Any] = {"state": state}
+    if success_status is not None:
+        payload["success_status"] = success_status
+    if success_stage is not None:
+        payload["success_stage"] = success_stage
+    if final_status is not None:
+        payload["final_status"] = final_status
+    if final_stage is not None:
+        payload["final_stage"] = final_stage
+    await enqueue_delivery(
+        session,
+        task,
+        provider=task.provider,
+        operation="agent_task_comment",
+        destination_key=f"{task.provider}:{task.repo_full_name}:pr:{task.pull_request_number}:task:{task.id}",
+        idempotency_key=f"agent-task:{task.id}:comment:{state}:attempt:{task.attempt}",
+        payload=payload,
+        mandatory=mandatory,
+        priority=task.priority,
+        supersede_pending=supersede_pending,
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
 
 
 async def _fail_command_agent_task(
@@ -683,30 +671,21 @@ async def _fail_command_agent_task(
     error: str,
     provider_registry: ProviderRegistry,
 ) -> AgentTask:
-    task.status = "running"
-    task.stage = "publishing_failure"
+    del provider_registry
+    task.status = "awaiting_delivery"
+    task.stage = "failure_delivery_pending"
+    task.execution_status = "failed"
     task.failure_code = failure_code
     task.error_message = error
-    task.completed_at = utc_now()
-    session.add(task)
-    await session.commit()
-    await session.refresh(task)
-    try:
-        await _publish_agent_task_comment(
-            session, task, provider_registry=provider_registry, state="failed"
-        )
-    except ProviderError as exc:
-        task.last_publish_error = str(exc)
-        session.add(task)
-        await session.commit()
-        await session.refresh(task)
-        return task
-    task.status = "failed"
-    task.stage = "failed"
-    task.last_publish_error = None
-    session.add(task)
-    await session.commit()
-    await session.refresh(task)
+    await _enqueue_agent_task_comment(
+        session,
+        task,
+        state="failed",
+        mandatory=True,
+        final_status="failed",
+        final_stage="failed",
+        supersede_pending=True,
+    )
     return task
 
 
@@ -719,32 +698,25 @@ async def _cancel_command_agent_task(
 ) -> AgentTask:
     if task.agent_session_id:
         try:
-            await pi_agent_client.cancel_session(task.agent_session_id)
+            runtime_session = await pi_agent_client.cancel_session(
+                task.agent_session_id
+            )
+            await archive_agent_session(session, task, runtime_session)
         except PiAgentClientError:
             pass
-    task.status = "running"
-    task.stage = "cancellation_pending"
-    session.add(task)
-    await session.commit()
-    try:
-        await _publish_agent_task_comment(
-            session,
-            task,
-            provider_registry=provider_registry,
-            state="cancelled",
-        )
-    except ProviderError as exc:
-        task.last_publish_error = str(exc)
-        session.add(task)
-        await session.commit()
-        await session.refresh(task)
-        return task
-    task.status = "cancelled"
-    task.stage = "cancelled"
-    task.completed_at = utc_now()
-    session.add(task)
-    await session.commit()
-    await session.refresh(task)
+    del provider_registry
+    task.status = "awaiting_delivery"
+    task.stage = "cancellation_delivery_pending"
+    task.execution_status = "cancelled"
+    await _enqueue_agent_task_comment(
+        session,
+        task,
+        state="cancelled",
+        mandatory=True,
+        final_status="cancelled",
+        final_stage="cancelled",
+        supersede_pending=True,
+    )
     return task
 
 
@@ -757,10 +729,11 @@ async def _release_agent_task_lock(
     task = await session.get(AgentTask, task_id)
     if task is None:
         return None
-    task.lock_owner = None
-    if task.stage == "retrying_agent_start" and task.locked_until is not None:
-        pass
-    elif task.status in {"queued", "running"} and task.stage in {
+    delay: float | None = None
+    if task.stage != "retrying_agent_start" and task.status in {
+        "queued",
+        "running",
+    } and task.stage in {
         "waiting_for_turn",
         "waiting_for_agent",
         "publishing_result",
@@ -768,13 +741,17 @@ async def _release_agent_task_lock(
         "cancellation_pending",
         "placeholder_pending",
     }:
-        task.locked_until = utc_now() + timedelta(seconds=retry_after_seconds)
-    else:
-        task.locked_until = None
-    session.add(task)
-    await session.commit()
-    await session.refresh(task)
-    return task
+        delay = retry_after_seconds
+    released = await release_task_claim(
+        session,
+        task_id,
+        retry_after_seconds=delay,
+    )
+    if released is None:
+        return None
+    if not isinstance(released, AgentTask):
+        raise TypeError(f"Released non-agent task {released.id}.")
+    return released
 
 
 async def _fail_agent_task(
@@ -887,6 +864,7 @@ async def process_next_review_run(
         session,
         worker_id=worker_id,
         lock_seconds=settings.worker_lock_seconds,
+        policy=policy_from_settings(settings),
     )
     if review_run is None:
         return None
@@ -895,7 +873,6 @@ async def process_next_review_run(
         gitlab_client=gitlab_client,
     )
 
-    release_lock = True
     try:
         if _should_publish_reviewing(review_run):
             await publish_review_run_status_comment(
@@ -987,7 +964,6 @@ async def process_next_review_run(
                     review_run,
                     settings=settings,
                 ):
-                    release_lock = False
                     return review_run
                 await publish_review_run_status_comment(
                     session,
@@ -1009,7 +985,6 @@ async def process_next_review_run(
                 review_run,
                 settings=settings,
             ):
-                release_lock = False
                 return review_run
             await publish_review_run_status_comment(
                 session,
@@ -1030,14 +1005,12 @@ async def process_next_review_run(
         if raw_result is None:
             if review_run.stage != "waiting_for_human":
                 review_run.stage = review_run.stage or "waiting_for_agent"
-            review_run.lock_owner = None
-            review_run.locked_until = utc_now() + timedelta(
+            review_run.available_at = utc_now() + timedelta(
                 seconds=settings.worker_poll_interval_seconds
             )
             session.add(review_run)
             await session.commit()
             await session.refresh(review_run)
-            release_lock = False
             return review_run
 
         changed_files = await _fetch_changed_files(
@@ -1076,20 +1049,18 @@ async def process_next_review_run(
             provider=review_run.provider,
             repo_full_name=review_run.repo_full_name,
         )
-        adapter = registry.get(review_run.provider)
-        if adapter is not None:
-            await adapter.publish_summary_comment(
+        await publish_review_run_status_comment(
+            session,
+            review_run,
+            provider_registry=registry,
+            status_text="completed",
+        )
+        if config.line_comments_enabled:
+            await _enqueue_review_line_comments(
                 session,
                 review_run,
-                status_text="completed",
-                finding_stats=review_run.finding_count_by_severity,
+                changed_files=changed_files,
             )
-            if config.line_comments_enabled:
-                await adapter.publish_line_comments(
-                    session,
-                    review_run,
-                    changed_files=changed_files,
-                )
         return await session.get(ReviewRun, review_run.id)
     except Exception as exc:
         review_run.status = "failed"
@@ -1109,8 +1080,7 @@ async def process_next_review_run(
         )
         return review_run
     finally:
-        if release_lock:
-            await release_review_run_lock(session, review_run.id)
+        await release_review_run_lock(session, review_run.id)
 
 
 def _should_publish_reviewing(review_run: ReviewRun) -> bool:
@@ -1180,18 +1150,12 @@ async def process_agent_task_timeouts(
             session.add(task)
             await session.commit()
             await session.refresh(task)
-            try:
-                await _publish_agent_task_comment(
-                    session,
-                    task,
-                    provider_registry=registry,
-                    state="soft_timeout",
-                )
-            except ProviderError as exc:
-                task.last_publish_error = str(exc)
-                session.add(task)
-                await session.commit()
-                await session.refresh(task)
+            await _enqueue_agent_task_comment(
+                session,
+                task,
+                state="soft_timeout",
+                mandatory=False,
+            )
             touched.append(task)
     return touched
 
@@ -1283,37 +1247,70 @@ async def publish_review_run_status_comment(
     provider_registry: ProviderRegistry | None = None,
     status_text: str,
 ) -> None:
-    original_failure_code = review_run.failure_code
-    original_error = review_run.error
-    registry = provider_registry or build_worker_provider_registry(
-        github_client=github_client,
-        gitlab_client=gitlab_client,
-    )
-    adapter = registry.get(review_run.provider)
-    if adapter is None:
-        return
-    await adapter.publish_summary_comment(
+    del github_client, gitlab_client, provider_registry
+    terminal = status_text in {"completed", "failed"}
+    if terminal:
+        review_run.execution_status = status_text
+        review_run.status = "awaiting_delivery"
+        review_run.stage = f"{status_text}_delivery_pending"
+    payload: dict[str, Any] = {
+        "status_text": status_text,
+        "finding_stats": review_run.finding_count_by_severity,
+    }
+    if terminal:
+        payload["final_status"] = status_text
+        payload["final_stage"] = status_text
+    await enqueue_delivery(
         session,
         review_run,
-        status_text=status_text,
-        finding_stats=review_run.finding_count_by_severity,
+        provider=review_run.provider,
+        operation="review_summary",
+        destination_key=(
+            f"{review_run.provider}:{review_run.repo_full_name}:"
+            f"pr:{review_run.pull_request_number}:summary"
+        ),
+        idempotency_key=(
+            f"review:{review_run.id}:summary:{status_text}:attempt:"
+            f"{review_run.attempt}"
+        ),
+        payload=payload,
+        mandatory=terminal,
+        priority=review_run.priority,
+        supersede_pending=terminal,
     )
-
+    session.add(review_run)
+    await session.commit()
     await session.refresh(review_run)
-    if original_failure_code and review_run.failure_code != original_failure_code:
-        warnings = list(review_run.validation_warnings_json or [])
-        warnings.append(
-            {
-                "code": "summary_publish_failed",
-                "message": review_run.error,
-            }
-        )
-        review_run.failure_code = original_failure_code
-        review_run.error = original_error
-        review_run.validation_warnings_json = warnings
-        session.add(review_run)
-        await session.commit()
-        await session.refresh(review_run)
+
+
+async def _enqueue_review_line_comments(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    changed_files: list[ChangedFile],
+) -> None:
+    await enqueue_delivery(
+        session,
+        review_run,
+        provider=review_run.provider,
+        operation="review_line_comments",
+        destination_key=(
+            f"{review_run.provider}:{review_run.repo_full_name}:"
+            f"pr:{review_run.pull_request_number}:line-comments"
+        ),
+        idempotency_key=(
+            f"review:{review_run.id}:line-comments:attempt:{review_run.attempt}"
+        ),
+        payload={
+            "changed_files": [item.model_dump(mode="json") for item in changed_files],
+            "final_status": "completed",
+            "final_stage": "completed",
+        },
+        mandatory=True,
+        priority=review_run.priority,
+    )
+    await session.commit()
+    await session.refresh(review_run)
 
 
 async def _cancel_pi_agent_after_hard_timeout(
@@ -1356,15 +1353,12 @@ async def release_review_run_lock(
     session: AsyncSession,
     review_run_id: str,
 ) -> ReviewRun | None:
-    review_run = await session.get(ReviewRun, review_run_id)
-    if review_run is None:
+    task = await release_task_claim(session, review_run_id)
+    if task is None:
         return None
-    review_run.lock_owner = None
-    review_run.locked_until = None
-    session.add(review_run)
-    await session.commit()
-    await session.refresh(review_run)
-    return review_run
+    if not isinstance(task, ReviewRun):
+        raise TypeError(f"Released non-review task {task.id}.")
+    return task
 
 
 async def emit_timeout_event(
@@ -1589,8 +1583,7 @@ async def _schedule_pi_agent_retry(
         review_run.error = None
         review_run.completed_at = None
         review_run.validation_warnings_json = warnings
-        review_run.lock_owner = None
-        review_run.locked_until = utc_now() + timedelta(
+        review_run.available_at = utc_now() + timedelta(
             seconds=settings.worker_poll_interval_seconds
         )
         session.add(review_run)
@@ -1627,8 +1620,7 @@ async def _schedule_pi_agent_retry(
     review_run.error = None
     review_run.completed_at = None
     review_run.validation_warnings_json = warnings
-    review_run.lock_owner = None
-    review_run.locked_until = utc_now() + timedelta(seconds=delay_seconds)
+    review_run.available_at = utc_now() + timedelta(seconds=delay_seconds)
     session.add(review_run)
     await session.commit()
     await session.refresh(review_run)

@@ -7,15 +7,22 @@ from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from review_orchestrator.application.session_archive import archive_agent_session
 from review_orchestrator.domain.models import (
     AgentTask,
+    DeliveryOutbox,
     Finding,
     ProviderEventInbox,
     PullRequestContext,
+    ResourceLease,
+    ResourcePool,
     ReviewCommentRef,
     ReviewConfig,
     ReviewRun,
     ReviewSession,
+    SessionArchive,
+    Task,
+    TaskAttempt,
     Workspace,
     utc_now,
 )
@@ -28,15 +35,19 @@ from review_orchestrator.domain.review_results import (
     parse_review_result,
 )
 from review_orchestrator.domain.schemas import (
-    AgentPendingInput,
     AgentTaskDetail,
     AgentTaskListResponse,
     AgentTaskQueueHealth,
     AgentTaskSummary,
+    DeliveryOutboxListResponse,
+    DeliveryOutboxSummary,
+    DeliverySchedulingUpdate,
     PiAgentSessionDiagnostics,
     ProviderEventInboxDetail,
     ProviderEventInboxListResponse,
     ProviderEventInboxSummary,
+    ResourcePoolListResponse,
+    ResourcePoolRead,
     ReviewRunCreate,
     ReviewRunDetail,
     ReviewRunFindingsSummary,
@@ -50,6 +61,12 @@ from review_orchestrator.domain.schemas import (
     ReviewRunRead,
     ReviewRunSessionSummary,
     ReviewRunWorkspaceSummary,
+    SessionArchiveListResponse,
+    SessionArchiveRead,
+    TaskAttemptSummary,
+    TaskListResponse,
+    TaskSchedulingUpdate,
+    TaskSummary,
     WebhookAccepted,
 )
 from review_orchestrator.infrastructure.config import Settings
@@ -63,6 +80,7 @@ from review_orchestrator.integrations.github import (
     payload_digest,
 )
 from review_orchestrator.integrations.pi_agent import (
+    AgentDomainPreset,
     PiAgentClient,
     PiAgentClientError,
     PiAgentSession,
@@ -104,9 +122,28 @@ async def create_review_run(
     next_attempt = 1 if latest is None else latest.attempt + 1
 
     values = payload.model_dump(exclude={"force"})
+    queue = "manual-review" if trigger_type == "manual" else "webhook-review"
+    priority = 60 if trigger_type == "manual" else 40
     review_run = ReviewRun(
         **values,
+        capability_id="code-review",
         status="queued",
+        execution_status="pending",
+        delivery_status="pending",
+        queue=queue,
+        priority=priority,
+        effective_priority=priority,
+        concurrency_key=(
+            f"{payload.provider}:{payload.repo_full_name}:pr:"
+            f"{payload.pull_request_number}:head:{payload.head_sha}"
+        ),
+        resource_context_json={
+            "repository": f"{payload.provider}/{payload.repo_full_name}",
+            "pr_head": (
+                f"{payload.provider}/{payload.repo_full_name}/"
+                f"{payload.pull_request_number}/{payload.head_sha}"
+            ),
+        },
         trigger_type=trigger_type,
         trigger_event_id=trigger_event_id,
         attempt=next_attempt,
@@ -148,7 +185,6 @@ async def get_pi_agent_session_diagnostics_for_review_run(
     agent_task_ids = await _get_agent_task_ids_for_review_run(session, review_run)
     execution_status: str | None = None
     execution_stage: str | None = None
-    pending_input: AgentPendingInput | None = None
     event_count = 0
     live_status_error = live_status_disabled_reason
 
@@ -163,11 +199,6 @@ async def get_pi_agent_session_diagnostics_for_review_run(
             execution_status = runtime_session.status
             execution_stage = runtime_session.stage
             event_count = len(runtime_session.events)
-            if runtime_session.pending_input is not None:
-                pending_input = AgentPendingInput.model_validate(
-                    runtime_session.pending_input,
-                    from_attributes=True,
-                )
             live_status_error = None
 
     return PiAgentSessionDiagnostics(
@@ -184,7 +215,6 @@ async def get_pi_agent_session_diagnostics_for_review_run(
         agent_thinking_level=review_run.agent_thinking_level,
         execution_status=execution_status,
         execution_stage=execution_stage,
-        pending_input=pending_input,
         event_count=event_count,
         session_available=bool(review_run.agent_session_id),
         live_status_available=execution_status is not None,
@@ -392,12 +422,6 @@ async def start_review_session(
     pi_agent_client: PiAgentClient,
     settings: Settings,
     workspace_path: str | None = None,
-    skill: str | None = None,
-    profile: str | None = None,
-    provider: str | None = None,
-    model: str | None = None,
-    thinking_level: str | None = None,
-    model_base_url: str | None = None,
 ) -> ReviewRun:
     if review_run.status in {"cancelled", "superseded", "completed"}:
         raise ReviewRunTransitionError(
@@ -423,23 +447,24 @@ async def start_review_session(
         provider=review_run.provider,
         repo_full_name=review_run.repo_full_name,
         default_skill=settings.pi_agent_review_skill,
-        default_profile=settings.pi_agent_review_profile,
     )
-    resolved_skill = skill or review_config.default_review_skill
-    resolved_profile = profile or review_config.default_review_profile
-    resolved_provider = provider or settings.pi_agent_provider
-    resolved_model = model or settings.pi_agent_model
-    resolved_thinking = thinking_level or settings.pi_agent_thinking_level
+    preset = AgentDomainPreset(
+        agent_id=settings.pi_agent_review_agent,
+        task_type="code-review",
+        repository_skills=[review_config.default_review_skill],
+    )
+    review_run.resolved_preset_json = {
+        "schema_version": "1",
+        "composition": {
+            "agent": {"id": preset.agent_id},
+            "repository": {"skills": preset.repository_skills},
+            "task_type": {"id": preset.task_type},
+        },
+    }
     try:
         runtime_session = await pi_agent_client.start_session(
             review_input,
-            skill=resolved_skill,
-            profile=resolved_profile,
-            provider=resolved_provider,
-            model=resolved_model,
-            thinking_level=resolved_thinking,
-            model_base_url=model_base_url or settings.pi_agent_model_base_url,
-            agent_id=settings.pi_agent_review_agent,
+            preset=preset,
         )
     except PiAgentClientError as exc:
         review_run.status = "failed"
@@ -458,7 +483,11 @@ async def start_review_session(
     review_run.started_at = utc_now()
     review_run.completed_at = None
     review_run.workspace_path = resolved_workspace_path
+    if runtime_session.resolved_preset is not None:
+        review_run.resolved_preset_json = runtime_session.resolved_preset
     _copy_pi_agent_state(review_run, runtime_session)
+    if runtime_session.resolved_preset is not None:
+        review_run.resolved_preset_json = runtime_session.resolved_preset
     if runtime_session.result is not None:
         review_run.result_raw_json = runtime_session.result
     review_run.failure_code = None
@@ -469,9 +498,10 @@ async def start_review_session(
         session.add(review_session)
     review_session.agent_session_id = runtime_session.id
     review_session.status = runtime_session.status
-    review_session.skill_name = resolved_skill
-    review_session.profile_name = resolved_profile
+    review_session.skill_name = review_config.default_review_skill
+    review_session.profile_name = _runtime_profile(runtime_session)
     review_session.input_snapshot_json = review_input.model_dump()
+    await archive_agent_session(session, review_run, runtime_session)
     await session.commit()
     await session.refresh(review_run)
     return review_run
@@ -519,19 +549,19 @@ async def sync_review_session(
         session.add(review_session)
 
     if runtime_session.status == PiAgentSessionStatus.failed:
-        return await _mark_failed(
+        review_run = await _mark_failed(
             session,
             review_run,
             runtime_session.error or "pi-agent review failed.",
             failure_code="pi_agent_error",
         )
+        await archive_agent_session(session, review_run, runtime_session)
+        await session.commit()
+        return review_run
     if runtime_session.status == PiAgentSessionStatus.cancelled:
         review_run.status = "cancelled"
         review_run.stage = "cancelled"
         review_run.completed_at = utc_now()
-    elif runtime_session.status == PiAgentSessionStatus.waiting_for_input:
-        review_run.status = "running"
-        review_run.stage = "waiting_for_human"
     elif runtime_session.status == PiAgentSessionStatus.completed:
         review_run.status = "running"
         review_run.stage = "agent_completed"
@@ -539,6 +569,7 @@ async def sync_review_session(
         review_run.status = "running"
         review_run.stage = runtime_session.stage
 
+    await archive_agent_session(session, review_run, runtime_session)
     await session.commit()
     await session.refresh(review_run)
     return review_run
@@ -564,6 +595,7 @@ async def cancel_review_session(
         else:
             _copy_pi_agent_state(review_run, runtime_session)
             review_run.error = reason
+            await archive_agent_session(session, review_run, runtime_session)
     else:
         review_run.error = reason
 
@@ -589,6 +621,20 @@ def _copy_pi_agent_state(
     review_run.agent_provider = runtime_session.provider
     review_run.agent_model = runtime_session.model
     review_run.agent_thinking_level = runtime_session.thinking_level
+
+
+def _runtime_profile(runtime_session: PiAgentSession) -> str | None:
+    preset = runtime_session.resolved_preset
+    if not isinstance(preset, dict):
+        return runtime_session.profile
+    composition = preset.get("composition")
+    if not isinstance(composition, dict):
+        return runtime_session.profile
+    task_type = composition.get("task_type")
+    if not isinstance(task_type, dict):
+        return runtime_session.profile
+    profile = task_type.get("profile")
+    return profile if isinstance(profile, str) else runtime_session.profile
 
 
 async def collect_review_result(
@@ -1001,6 +1047,7 @@ async def create_agent_task_from_event(
         context = result.scalar_one_or_none()
 
     agent_task = AgentTask(
+        capability_id="pr-assistant",
         provider_event_id=event.id,
         pull_request_context_id=context.id if context else None,
         provider=event.provider,
@@ -1008,6 +1055,28 @@ async def create_agent_task_from_event(
         pull_request_number=event.pull_request_number,
         task_type="message_command",
         status="queued",
+        execution_status="pending",
+        delivery_status="pending",
+        queue="interactive",
+        priority=80,
+        effective_priority=80,
+        concurrency_key=(
+            f"{event.provider}:{event.repo_full_name}:pr:"
+            f"{event.pull_request_number}"
+        ),
+        resource_context_json={
+            "user": command.author_login,
+            "repository": f"{event.provider}/{event.repo_full_name}",
+            "pr": (
+                f"{event.provider}/{event.repo_full_name}/"
+                f"{event.pull_request_number}"
+            ),
+            "comment": (
+                f"{event.provider}/{command.source_comment_id}"
+                if command.source_comment_id
+                else f"{event.provider}/event/{event.id}"
+            ),
+        },
         stage="placeholder_pending",
         source_kind=command.source_kind,
         source_comment_id=command.source_comment_id,
@@ -1025,6 +1094,434 @@ async def create_agent_task_from_event(
     session.add(agent_task)
     await session.flush()
     return agent_task
+
+
+async def list_tasks(
+    session: AsyncSession,
+    *,
+    kind: str | None = None,
+    capability_id: str | None = None,
+    status: str | None = None,
+    queue: str | None = None,
+    resource_class: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> TaskListResponse:
+    filters = []
+    if kind:
+        filters.append(Task.kind == kind)
+    if capability_id:
+        filters.append(Task.capability_id == capability_id)
+    if status:
+        filters.append(Task.status == status)
+    if queue:
+        filters.append(Task.queue == queue)
+    if resource_class:
+        filters.append(Task.resource_class == resource_class)
+
+    total = int(
+        (
+            await session.execute(
+                select(func.count()).select_from(Task).where(*filters)
+            )
+        ).scalar_one()
+    )
+    tasks = list(
+        (
+            await session.execute(
+                select(Task)
+                .where(*filters)
+                .order_by(
+                    Task.effective_priority.desc(),
+                    Task.available_at,
+                    Task.created_at,
+                )
+                .limit(limit)
+                .offset(offset)
+            )
+        ).scalars()
+    )
+    return TaskListResponse(
+        items=[_task_summary(task) for task in tasks],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+async def get_task_summary(
+    session: AsyncSession,
+    task_id: str,
+) -> TaskSummary | None:
+    task = await session.get(Task, task_id)
+    return None if task is None else _task_summary(task)
+
+
+async def list_task_session_archives(
+    session: AsyncSession,
+    task_id: str,
+) -> SessionArchiveListResponse | None:
+    if await session.get(Task, task_id) is None:
+        return None
+    archives = list(
+        (
+            await session.execute(
+                select(SessionArchive)
+                .where(SessionArchive.task_id == task_id)
+                .order_by(SessionArchive.created_at, SessionArchive.id)
+            )
+        ).scalars()
+    )
+    attempts = await _attempts_for_archives(session, archives)
+    return SessionArchiveListResponse(
+        items=[_session_archive_read(item, attempts) for item in archives]
+    )
+
+
+async def get_session_archive(
+    session: AsyncSession,
+    archive_id: str,
+) -> SessionArchiveRead | None:
+    archive = await session.get(SessionArchive, archive_id)
+    if archive is None:
+        return None
+    attempts = await _attempts_for_archives(session, [archive])
+    return _session_archive_read(archive, attempts)
+
+
+async def _attempts_for_archives(
+    session: AsyncSession,
+    archives: list[SessionArchive],
+) -> dict[str, TaskAttempt]:
+    attempt_ids = {
+        archive.task_attempt_id
+        for archive in archives
+        if archive.task_attempt_id is not None
+    }
+    if not attempt_ids:
+        return {}
+    attempts = list(
+        (
+            await session.execute(
+                select(TaskAttempt).where(TaskAttempt.id.in_(attempt_ids))
+            )
+        ).scalars()
+    )
+    return {attempt.id: attempt for attempt in attempts}
+
+
+def _session_archive_read(
+    archive: SessionArchive,
+    attempts: dict[str, TaskAttempt],
+) -> SessionArchiveRead:
+    attempt = (
+        attempts.get(archive.task_attempt_id)
+        if archive.task_attempt_id is not None
+        else None
+    )
+    attempt_summary = None
+    if attempt is not None:
+        attempt_summary = TaskAttemptSummary(
+            id=attempt.id,
+            task_id=attempt.task_id,
+            attempt_no=attempt.attempt_no,
+            status=attempt.status,
+            stage=attempt.stage,
+            agent_run_id=attempt.agent_run_id,
+            workspace_id=attempt.workspace_id,
+            workspace_path=attempt.workspace_path,
+            resolved_preset=attempt.resolved_preset_json,
+            usage=attempt.usage_json,
+            failure_category=attempt.failure_category,
+            error_message=_safe_error_message(attempt.error_message),
+            started_at=attempt.started_at,
+            completed_at=attempt.completed_at,
+        )
+    return SessionArchiveRead(
+        id=archive.id,
+        task_id=archive.task_id,
+        task_attempt=attempt_summary,
+        agent_run_id=archive.agent_run_id,
+        session=archive.session_json,
+        task_metadata=archive.task_metadata_json,
+        workspace_diff=archive.workspace_diff,
+        workspace_diff_truncated=archive.workspace_diff_truncated,
+        redaction_version=archive.redaction_version,
+        created_at=archive.created_at,
+        updated_at=archive.updated_at,
+    )
+
+
+async def update_task_scheduling(
+    session: AsyncSession,
+    task_id: str,
+    payload: TaskSchedulingUpdate,
+) -> TaskSummary | None:
+    task = await session.get(Task, task_id)
+    if task is None:
+        return None
+    if task.status in TERMINAL_STATUSES:
+        raise ReviewRunTransitionError(
+            f"Task is already {task.status}; scheduling cannot be changed."
+        )
+    if (
+        task.lock_owner is not None
+        and task.locked_until is not None
+        and not _is_past(task.locked_until)
+    ):
+        raise ReviewRunTransitionError(
+            "Task scheduling cannot be changed while a worker lease is active."
+        )
+    values = payload.model_dump(exclude_none=True)
+    if "queue" in values:
+        task.queue = values["queue"]
+    if "priority" in values:
+        task.priority = values["priority"]
+        task.effective_priority = values["priority"]
+    if "available_at" in values:
+        task.available_at = values["available_at"]
+    if "resource_class" in values:
+        task.resource_class = values["resource_class"]
+    if "resource_context" in values:
+        task.resource_context_json = values["resource_context"]
+    task.updated_at = utc_now()
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return _task_summary(task)
+
+
+async def list_resource_pools(session: AsyncSession) -> ResourcePoolListResponse:
+    pools = list(
+        (
+            await session.execute(
+                select(ResourcePool).order_by(
+                    ResourcePool.dimension, ResourcePool.resource_key
+                )
+            )
+        ).scalars()
+    )
+    active = {
+        key: int(units)
+        for key, units in (
+            await session.execute(
+                select(
+                    ResourceLease.resource_key,
+                    func.coalesce(func.sum(ResourceLease.units), 0),
+                )
+                .where(ResourceLease.expires_at > utc_now())
+                .group_by(ResourceLease.resource_key)
+            )
+        ).all()
+    }
+    return ResourcePoolListResponse(
+        items=[
+            ResourcePoolRead(
+                resource_key=pool.resource_key,
+                dimension=pool.dimension,
+                capacity=pool.capacity,
+                active_units=active.get(pool.resource_key, 0),
+                created_at=pool.created_at,
+                updated_at=pool.updated_at,
+            )
+            for pool in pools
+        ]
+    )
+
+
+async def set_resource_pool_capacity(
+    session: AsyncSession,
+    resource_key: str,
+    *,
+    capacity: int,
+    dimension: str | None = None,
+) -> ResourcePoolRead:
+    pool = await session.get(ResourcePool, resource_key)
+    if pool is None:
+        inferred_dimension = resource_key.partition(":")[0]
+        pool = ResourcePool(
+            resource_key=resource_key,
+            dimension=dimension or inferred_dimension or "custom",
+            capacity=capacity,
+        )
+    elif dimension is not None and dimension != pool.dimension:
+        raise ReviewRunTransitionError(
+            "An existing Resource Pool dimension cannot be changed."
+        )
+    pool.capacity = capacity
+    pool.updated_at = utc_now()
+    session.add(pool)
+    await session.commit()
+    active_units = int(
+        (
+            await session.execute(
+                select(func.coalesce(func.sum(ResourceLease.units), 0)).where(
+                    ResourceLease.resource_key == resource_key,
+                    ResourceLease.expires_at > utc_now(),
+                )
+            )
+        ).scalar_one()
+    )
+    await session.refresh(pool)
+    return ResourcePoolRead(
+        resource_key=pool.resource_key,
+        dimension=pool.dimension,
+        capacity=pool.capacity,
+        active_units=active_units,
+        created_at=pool.created_at,
+        updated_at=pool.updated_at,
+    )
+
+
+async def list_delivery_outbox(
+    session: AsyncSession,
+    *,
+    task_id: str | None = None,
+    provider: str | None = None,
+    status: str | None = None,
+    queue: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> DeliveryOutboxListResponse:
+    filters = []
+    if task_id:
+        filters.append(DeliveryOutbox.task_id == task_id)
+    if provider:
+        filters.append(DeliveryOutbox.provider == provider)
+    if status:
+        filters.append(DeliveryOutbox.status == status)
+    if queue:
+        filters.append(DeliveryOutbox.queue == queue)
+    total = int(
+        (
+            await session.execute(
+                select(func.count()).select_from(DeliveryOutbox).where(*filters)
+            )
+        ).scalar_one()
+    )
+    deliveries = list(
+        (
+            await session.execute(
+                select(DeliveryOutbox)
+                .where(*filters)
+                .order_by(
+                    DeliveryOutbox.priority.desc(),
+                    DeliveryOutbox.available_at,
+                    DeliveryOutbox.created_at,
+                )
+                .limit(limit)
+                .offset(offset)
+            )
+        ).scalars()
+    )
+    return DeliveryOutboxListResponse(
+        items=[_delivery_summary(item) for item in deliveries],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+async def get_delivery_outbox(
+    session: AsyncSession,
+    delivery_id: str,
+) -> DeliveryOutboxSummary | None:
+    delivery = await session.get(DeliveryOutbox, delivery_id)
+    return None if delivery is None else _delivery_summary(delivery)
+
+
+async def update_delivery_scheduling(
+    session: AsyncSession,
+    delivery_id: str,
+    payload: DeliverySchedulingUpdate,
+) -> DeliveryOutboxSummary | None:
+    delivery = await session.get(DeliveryOutbox, delivery_id)
+    if delivery is None:
+        return None
+    if delivery.status not in {"queued", "failed"}:
+        raise ReviewRunTransitionError(
+            f"Delivery is {delivery.status}; scheduling cannot be changed."
+        )
+    values = payload.model_dump(exclude_none=True)
+    for field_name, value in values.items():
+        setattr(delivery, field_name, value)
+    if delivery.status == "failed":
+        delivery.status = "queued"
+        delivery.last_error = None
+    delivery.lock_owner = None
+    delivery.locked_until = None
+    delivery.updated_at = utc_now()
+    session.add(delivery)
+    await session.commit()
+    await session.refresh(delivery)
+    return _delivery_summary(delivery)
+
+
+def _delivery_summary(delivery: DeliveryOutbox) -> DeliveryOutboxSummary:
+    return DeliveryOutboxSummary(
+        id=delivery.id,
+        task_id=delivery.task_id,
+        provider=delivery.provider,
+        operation=delivery.operation,
+        destination_key=delivery.destination_key,
+        idempotency_key=delivery.idempotency_key,
+        mandatory=delivery.mandatory,
+        status=delivery.status,
+        queue=delivery.queue,
+        priority=delivery.priority,
+        available_at=delivery.available_at,
+        attempt=delivery.attempt,
+        max_attempts=delivery.max_attempts,
+        provider_message_id=delivery.provider_message_id,
+        last_error=delivery.last_error,
+        delivered_at=delivery.delivered_at,
+        created_at=delivery.created_at,
+        updated_at=delivery.updated_at,
+    )
+
+
+def _task_summary(task: Task) -> TaskSummary:
+    metadata: dict[str, Any] = {}
+    if isinstance(task, ReviewRun):
+        metadata = {
+            "provider": task.provider,
+            "repo_full_name": task.repo_full_name,
+            "pull_request_number": task.pull_request_number,
+            "head_sha": task.head_sha,
+            "trigger_type": task.trigger_type,
+        }
+    elif isinstance(task, AgentTask):
+        metadata = {
+            "provider": task.provider,
+            "repo_full_name": task.repo_full_name,
+            "pull_request_number": task.pull_request_number,
+            "task_type": task.task_type,
+            "source_comment_id": task.source_comment_id,
+        }
+    return TaskSummary(
+        id=task.id,
+        kind=task.kind,
+        capability_id=task.capability_id,
+        status=task.status,
+        stage=task.stage,
+        execution_status=task.execution_status,
+        delivery_status=task.delivery_status,
+        queue=task.queue,
+        priority=task.priority,
+        effective_priority=task.effective_priority,
+        available_at=task.available_at,
+        deadline_at=task.deadline_at,
+        dedupe_key=task.dedupe_key,
+        concurrency_key=task.concurrency_key,
+        resource_class=task.resource_class,
+        resource_context=task.resource_context_json,
+        max_attempts=task.max_attempts,
+        lock_owner=task.lock_owner,
+        locked_until=task.locked_until,
+        domain_metadata=metadata,
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+    )
 
 
 async def list_agent_tasks(
@@ -1958,7 +2455,7 @@ async def get_or_create_review_config(
     provider: str,
     repo_full_name: str,
     default_skill: str = "code-review",
-    default_profile: str = "default",
+    default_command_skill: str = "pr-assistant",
 ) -> ReviewConfig:
     result = await session.execute(
         select(ReviewConfig).where(
@@ -1974,7 +2471,7 @@ async def get_or_create_review_config(
         provider=provider,
         repo_full_name=repo_full_name,
         default_review_skill=default_skill,
-        default_review_profile=default_profile,
+        default_agent_command_skill=default_command_skill,
     )
     session.add(config)
     await session.commit()

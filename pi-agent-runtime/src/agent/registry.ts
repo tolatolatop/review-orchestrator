@@ -1,52 +1,40 @@
+import { createHash } from "node:crypto";
+
 import { Value } from "typebox/value";
 
 import type {
   AgentDefinition,
+  DomainPresetSelection,
   AgentExecutionLimits,
   AgentInvocation,
   JsonObject,
   ResolvedAgentConfiguration,
+  ResolvedDomainPreset,
   RuntimeDefaults,
   SkillSelection,
   ThinkingLevel,
 } from "./types.js";
 
 const AGENT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
-const SKILL_NAME_PATTERN = AGENT_ID_PATTERN;
 const VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 
 export class AgentConfigurationError extends Error {}
 
 export class AgentRegistry {
-  readonly #definitions = new Map<string, Map<string, AgentDefinition>>();
+  readonly #definitions = new Map<string, AgentDefinition>();
 
   register(definition: AgentDefinition): void {
     validateDefinition(definition);
-    const versions = this.#definitions.get(definition.id) ?? new Map();
-    if (versions.has(definition.version)) {
-      throw new AgentConfigurationError(
-        `Agent is already registered: ${definition.id}@${definition.version}`,
-      );
+    if (this.#definitions.has(definition.id)) {
+      throw new AgentConfigurationError(`Agent is already registered: ${definition.id}`);
     }
-    versions.set(definition.version, definition);
-    this.#definitions.set(definition.id, versions);
+    this.#definitions.set(definition.id, definition);
   }
 
-  resolve(id: string, version?: string): AgentDefinition {
-    const versions = this.#definitions.get(id);
-    if (versions === undefined || versions.size === 0) {
-      throw new AgentConfigurationError(`Unknown agent: ${id}`);
-    }
-    if (version !== undefined) {
-      const selected = versions.get(version);
-      if (selected === undefined) {
-        throw new AgentConfigurationError(`Unknown agent version: ${id}@${version}`);
-      }
-      return selected;
-    }
-    return [...versions.values()].sort((left, right) =>
-      right.version.localeCompare(left.version, undefined, { numeric: true })
-    )[0]!;
+  resolve(id: string): AgentDefinition {
+    const definition = this.#definitions.get(id);
+    if (definition === undefined) throw new AgentConfigurationError(`Unknown agent: ${id}`);
+    return definition;
   }
 
   resolveLegacy(kind: "review" | "instruction"): AgentDefinition {
@@ -54,14 +42,87 @@ export class AgentRegistry {
     if (matches.length === 0) {
       throw new AgentConfigurationError(`No agent is registered for legacy kind: ${kind}`);
     }
-    return matches.sort((left, right) =>
-      right.version.localeCompare(left.version, undefined, { numeric: true })
-    )[0]!;
+    return matches[0]!;
   }
 
   list(): AgentDefinition[] {
-    return [...this.#definitions.values()].flatMap((versions) => [...versions.values()]);
+    return [...this.#definitions.values()];
   }
+}
+
+export function resolveDomainPreset(
+  selection: DomainPresetSelection,
+  definition: AgentDefinition,
+  defaults: RuntimeDefaults,
+): { configuration: ResolvedAgentConfiguration; preset: ResolvedDomainPreset } {
+  if (selection.agentId !== definition.id) {
+    throw new AgentConfigurationError(
+      `Preset agent ${selection.agentId} does not match ${definition.id}.`,
+    );
+  }
+  const profile = definition.taskTypeProfiles[selection.taskType];
+  if (profile === undefined) {
+    throw new AgentConfigurationError(
+      `Agent ${definition.id} does not support task type ${selection.taskType}.`,
+    );
+  }
+  const configuration = resolveAgentConfiguration(
+    {
+      definition,
+      input: {},
+      profile,
+      ...(selection.repositorySkills.length === 0
+        ? {}
+        : { skills: selection.repositorySkills }),
+    },
+    defaults,
+  );
+  const skillReferences = [
+    configuration.skills.primary,
+    ...configuration.skills.supporting,
+  ];
+  return {
+    configuration,
+    preset: {
+      schema_version: "1",
+      composition: {
+        agent: {
+          id: definition.id,
+          version: definition.version,
+          digest: agentDefinitionDigest(definition),
+        },
+        repository: { skills: [...selection.repositorySkills] },
+        task_type: { id: selection.taskType, profile },
+      },
+      model: {
+        provider: configuration.provider,
+        id: configuration.model,
+        thinking_level: configuration.thinkingLevel,
+      },
+      skills: skillReferences,
+      skill_digests: {},
+      tools: [...configuration.tools, definition.result.toolName],
+      limits: { ...configuration.limits },
+      environment: { mode: "task-overlay", template: "runtime-default" },
+    },
+  };
+}
+
+function agentDefinitionDigest(definition: AgentDefinition): string {
+  return createHash("sha256").update(JSON.stringify({
+    id: definition.id,
+    version: definition.version,
+    inputSchema: definition.inputSchema,
+    result: definition.result,
+    defaultSkills: definition.defaultSkills,
+    allowRepositorySkills: definition.allowRepositorySkills,
+    tools: definition.tools,
+    profiles: definition.profiles,
+    taskTypeProfiles: definition.taskTypeProfiles,
+    modelPolicy: definition.modelPolicy,
+    limits: definition.limits,
+    systemPrompt: definition.systemPrompt,
+  })).digest("hex");
 }
 
 export function validateAgentInput(definition: AgentDefinition, value: unknown): JsonObject {
@@ -100,8 +161,10 @@ export function resolveAgentConfiguration(
     supporting: [...definition.defaultSkills.supporting],
   };
   if (invocation.skills !== undefined) {
-    if (!definition.allowSkillOverride) {
-      throw new AgentConfigurationError(`Agent ${definition.id} does not allow skill overrides.`);
+    if (!definition.allowRepositorySkills) {
+      throw new AgentConfigurationError(
+        `Agent ${definition.id} does not accept Repository Skills.`,
+      );
     }
     if (invocation.skills.length === 0) {
       throw new AgentConfigurationError("At least one skill is required when overriding skills.");
@@ -115,24 +178,13 @@ export function resolveAgentConfiguration(
   if (profile.supportingSkills !== undefined) skills.supporting = [...profile.supportingSkills];
   validateSkillSelection(skills);
 
-  const requestModel = invocation.model;
-  if (requestModel?.provider !== undefined && !definition.modelPolicy.allowProviderOverride) {
-    throw new AgentConfigurationError(`Agent ${definition.id} does not allow provider overrides.`);
-  }
-  if (requestModel?.id !== undefined && !definition.modelPolicy.allowModelOverride) {
-    throw new AgentConfigurationError(`Agent ${definition.id} does not allow model overrides.`);
-  }
-  if (requestModel?.base_url !== undefined && !definition.modelPolicy.allowBaseUrlOverride) {
-    throw new AgentConfigurationError(`Agent ${definition.id} does not allow model base URL overrides.`);
-  }
-
-  // Deployment defaults form the base, legal session overrides are applied next,
-  // and a named profile has the final say within the agent's fixed allow-list.
-  const provider = profile.provider ?? requestModel?.provider ?? defaults.provider;
-  const model = profile.model ?? requestModel?.id ?? defaults.model;
+  // Deployment forms the Agent base; the Task Type's named preset has final
+  // ownership of the fields it explicitly declares.
+  const provider = profile.provider ?? defaults.provider;
+  const model = profile.model ?? defaults.model;
   const thinkingLevel = profile.thinkingLevel
-    ?? normalizeThinking(requestModel?.thinking_level ?? defaults.thinkingLevel);
-  const baseUrl = requestModel?.base_url ?? defaults.modelBaseUrl;
+    ?? normalizeThinking(defaults.thinkingLevel);
+  const baseUrl = defaults.modelBaseUrl;
   validateModelSelection(definition, provider, model, thinkingLevel);
 
   const limits = mergeLimits(definition.limits, profile.limits);
@@ -156,7 +208,6 @@ export function resolveAgentConfiguration(
     thinkingLevel,
     ...(baseUrl === undefined ? {} : { baseUrl }),
     limits,
-    interactionPolicy: { ...definition.interactionPolicy },
   };
 }
 
@@ -173,6 +224,13 @@ function validateDefinition(definition: AgentDefinition): void {
       `Agent ${definition.id} is missing default profile ${definition.defaultProfile}.`,
     );
   }
+  for (const [taskType, profile] of Object.entries(definition.taskTypeProfiles)) {
+    if (!AGENT_ID_PATTERN.test(taskType) || definition.profiles[profile] === undefined) {
+      throw new AgentConfigurationError(
+        `Agent ${definition.id} has invalid task preset ${taskType}:${profile}.`,
+      );
+    }
+  }
   if (definition.tools.length === 0) {
     throw new AgentConfigurationError(`Agent ${definition.id} must declare at least one tool.`);
   }
@@ -184,14 +242,29 @@ function validateDefinition(definition: AgentDefinition): void {
 
 function validateSkillSelection(skills: SkillSelection): void {
   const all = [skills.primary, ...skills.supporting];
-  if (all.length > 16) throw new AgentConfigurationError("An agent may load at most 16 skills.");
-  for (const skill of all) {
-    if (!SKILL_NAME_PATTERN.test(skill)) {
-      throw new AgentConfigurationError(`Invalid skill name: ${skill}`);
-    }
-  }
+  for (const skill of all) validateSkillReference(skill);
   if (new Set(all).size !== all.length) {
     throw new AgentConfigurationError("Primary and supporting skills must be unique.");
+  }
+}
+
+function validateSkillReference(reference: string): void {
+  if (reference.length === 0 || reference.length > 512 || /[\r\n\0]/.test(reference)) {
+    throw new AgentConfigurationError(`Invalid Skill reference: ${reference}`);
+  }
+  if (reference.startsWith("npm:")) {
+    if (reference.slice(4).trim() === "" || /\s/.test(reference.slice(4))) {
+      throw new AgentConfigurationError(`Invalid npm Skill reference: ${reference}`);
+    }
+    return;
+  }
+  const name = reference.startsWith("builtin:")
+    ? reference.slice("builtin:".length)
+    : reference.startsWith("prebuilt:")
+      ? reference.slice("prebuilt:".length)
+      : reference;
+  if (!AGENT_ID_PATTERN.test(name)) {
+    throw new AgentConfigurationError(`Invalid Skill reference: ${reference}`);
   }
 }
 

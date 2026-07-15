@@ -1,5 +1,9 @@
 # Review Orchestrator 目录架构
 
+> 当前文档描述已实现结构。下一阶段的任务调度、上下文审计、Capability Pack 和
+> 薄 Agent Runtime 重规划见
+> [`agent-task-architecture-redesign_zh.md`](agent-task-architecture-redesign_zh.md)。
+
 后端源码按职责分为五个层级。业务实现只能从这些层级目录导入其他实现；仓库根部的
 同名模块仅用于兼容旧导入路径，不承载业务逻辑。
 

@@ -1,5 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -8,18 +17,16 @@ import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 
 import {
   AgentConfigurationError,
-  resolveAgentConfiguration,
+  resolveDomainPreset,
   validateAgentInput,
 } from "./agent/registry.js";
 import { AgentRunner } from "./agent/runner.js";
+import { restoreWorkspaceOwnership } from "./agent/environment.js";
 import type {
   AgentDefinition,
-  AgentInvocation,
   AgentToolContext,
   JsonObject,
   LegacySessionKind,
-  ModelSelection,
-  ResolvedAgentConfiguration,
   RuntimeEvent,
   RuntimeTool,
   SessionKind,
@@ -27,7 +34,6 @@ import type {
   ThinkingLevel,
 } from "./agent/types.js";
 import {
-  changeSummaryAgent,
   codeReviewAgent,
   createBuiltinAgentRegistry,
   prAssistantAgent,
@@ -38,32 +44,18 @@ const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const MAX_REQUEST_BYTES = 1_000_000;
 const MAX_EVENTS = 200;
 const AGENT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
-const SKILL_NAME_PATTERN = AGENT_ID_PATTERN;
 const COMMIT_PATTERN = /^[0-9a-f]{7,64}$/i;
 const THINKING_LEVELS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
 
 interface StartSessionRequest {
   kind: SessionKind;
   agent_id: string;
-  agent_version?: string;
+  task_type: string;
+  repository_skills: string[];
   idempotency_key?: string;
   title?: string;
   workspace_path: string;
   input: JsonObject;
-  model?: ModelSelection;
-  skills?: string[];
-  profile?: string;
-}
-
-interface HumanMessageRequest {
-  message: string;
-  delivery?: "answer" | "steer" | "follow_up";
-}
-
-interface PublicPendingInput {
-  id: string;
-  question: string;
-  choices?: string[];
 }
 
 interface PublicSession {
@@ -85,11 +77,12 @@ interface PublicSession {
   tools: string[];
   execution_limits: SessionRecord["execution_limits"];
   execution_counters: SessionRecord["execution_counters"];
-  interaction_policy: SessionRecord["interaction_policy"];
+  resolved_preset?: SessionRecord["resolved_preset"];
+  execution_environment?: SessionRecord["execution_environment"];
   result?: JsonObject;
+  session_archive?: JsonObject;
   error?: string;
   session_file?: string;
-  pending_input?: PublicPendingInput;
   created_at: string;
   updated_at: string;
   events: RuntimeEvent[];
@@ -108,17 +101,27 @@ const config = {
   host: process.env.PI_AGENT_HOST ?? "0.0.0.0",
   port: parsePositiveInt(process.env.PI_AGENT_PORT, 3210),
   stateRoot: resolve(process.env.PI_AGENT_STATE_ROOT ?? "/var/lib/pi-agent"),
+  environmentRoot: resolve(
+    process.env.PI_AGENT_TASK_ENVIRONMENT_ROOT ?? "/var/lib/pi-agent-task",
+  ),
   workspaceRoot: resolve(process.env.PI_AGENT_WORKSPACE_ROOT ?? "/workspaces"),
   skillsRoot: resolve(process.env.PI_AGENT_SKILLS_ROOT ?? "/opt/pi-agent/skills"),
   agentDir: resolve(process.env.PI_CODING_AGENT_DIR ?? "/var/lib/pi-agent/config"),
   modelsFile: resolve(process.env.PI_AGENT_MODELS_FILE ?? "/etc/pi-agent/models.json"),
+  environmentTemplateRoot: process.env.PI_AGENT_ENVIRONMENT_TEMPLATE_ROOT === undefined
+    ? undefined
+    : resolve(process.env.PI_AGENT_ENVIRONMENT_TEMPLATE_ROOT),
+  taskUidMin: parsePositiveInt(process.env.PI_AGENT_TASK_UID_MIN, 20_000),
+  taskUidMax: parsePositiveInt(process.env.PI_AGENT_TASK_UID_MAX, 60_000),
+  taskGid: parsePositiveInt(process.env.PI_AGENT_TASK_GID, 65532),
+  workspaceOwnerUid: parsePositiveInt(process.env.PI_AGENT_WORKSPACE_OWNER_UID, 1000),
+  workspaceOwnerGid: parsePositiveInt(process.env.PI_AGENT_WORKSPACE_OWNER_GID, 1000),
   serviceToken: process.env.PI_AGENT_RUNTIME_TOKEN,
   defaultProvider: process.env.PI_AGENT_PROVIDER ?? "openai",
   defaultModel: process.env.PI_AGENT_MODEL ?? "gpt-5.4",
   defaultThinking: normalizeThinking(process.env.PI_AGENT_THINKING_LEVEL ?? "high"),
   defaultSkill: process.env.PI_AGENT_REVIEW_SKILL ?? "code-review",
   defaultInstructionSkill: process.env.PI_AGENT_COMMAND_SKILL ?? "pr-assistant",
-  defaultProfile: process.env.PI_AGENT_REVIEW_PROFILE ?? "default",
   modelBaseUrl: process.env.PI_AGENT_MODEL_BASE_URL,
 };
 
@@ -129,9 +132,18 @@ const idempotentSessions = new Map<string, string>();
 const persistenceQueues = new Map<string, Promise<void>>();
 const runner = new AgentRunner({
   stateRoot: config.stateRoot,
+  environmentRoot: config.environmentRoot,
   skillsRoot: config.skillsRoot,
   agentDir: config.agentDir,
   modelsFile: config.modelsFile,
+  ...(config.environmentTemplateRoot === undefined
+    ? {}
+    : { environmentTemplateRoot: config.environmentTemplateRoot }),
+  taskUidMin: config.taskUidMin,
+  taskUidMax: config.taskUidMax,
+  taskGid: config.taskGid,
+  workspaceOwnerUid: config.workspaceOwnerUid,
+  workspaceOwnerGid: config.workspaceOwnerGid,
   toolRegistry,
   addEvent,
   persist: persistRecord,
@@ -184,23 +196,21 @@ function publicSession(record: SessionRecord): PublicSession {
     tools: record.tools,
     execution_limits: record.execution_limits,
     execution_counters: record.execution_counters,
-    interaction_policy: record.interaction_policy,
     created_at: record.created_at,
     updated_at: record.updated_at,
     events: record.events,
   };
   if (record.idempotency_key !== undefined) response.idempotency_key = record.idempotency_key;
+  if (record.execution_environment !== undefined) {
+    response.execution_environment = record.execution_environment;
+  }
+  if (record.resolved_preset !== undefined) {
+    response.resolved_preset = record.resolved_preset;
+  }
   if (record.result !== undefined) response.result = record.result;
+  if (record.session_archive !== undefined) response.session_archive = record.session_archive;
   if (record.error !== undefined) response.error = record.error;
   if (record.session_file !== undefined) response.session_file = record.session_file;
-  if (record.pending !== undefined) {
-    const pending: PublicPendingInput = {
-      id: record.pending.id,
-      question: record.pending.question,
-    };
-    if (record.pending.choices !== undefined) pending.choices = record.pending.choices;
-    response.pending_input = pending;
-  }
   return response;
 }
 
@@ -268,19 +278,30 @@ async function loadPersistedSessions(): Promise<void> {
         tools: value.tools ?? [],
         execution_limits: value.execution_limits ?? legacyDefinition.limits,
         execution_counters: value.execution_counters ?? { turns: 0, toolCalls: 0 },
-        interaction_policy: value.interaction_policy ?? legacyDefinition.interactionPolicy,
         created_at: value.created_at ?? now(),
         updated_at: value.updated_at ?? now(),
         events: value.events ?? [],
       };
       if (value.idempotency_key !== undefined) record.idempotency_key = value.idempotency_key;
+      if (value.execution_environment !== undefined) {
+        record.execution_environment = value.execution_environment;
+      }
+      if (value.resolved_preset !== undefined) {
+        record.resolved_preset = value.resolved_preset;
+      }
       if (value.result !== undefined) record.result = value.result;
+      if (value.session_archive !== undefined) record.session_archive = value.session_archive;
       if (value.error !== undefined) record.error = value.error;
       if (value.session_file !== undefined) record.session_file = value.session_file;
       if (!TERMINAL_STATUSES.has(String(value.status))) {
         record.stage = "runtime_restarted";
         record.error = "The pi-agent runtime restarted while this session was active.";
         record.updated_at = now();
+        await restoreWorkspaceOwnership(
+          record.workspace_path,
+          config.workspaceOwnerUid,
+          config.workspaceOwnerGid,
+        ).catch(() => undefined);
         await persistRecord(record);
       }
       sessions.set(record.id, record);
@@ -375,18 +396,30 @@ function validateLegacyInstruction(value: unknown): JsonObject {
 export function validateStartRequest(value: unknown): StartSessionRequest {
   assertObject(value, "request");
   const workspacePath = requireString(value.workspace_path, "workspace_path");
+  for (const field of ["agent_version", "model", "profile", "skills"]) {
+    if (value[field] !== undefined) {
+      throw new HttpError(
+        422,
+        `${field} is not a Runtime request override; use a domain preset.`,
+      );
+    }
+  }
   let definition: AgentDefinition;
   let input: JsonObject;
   let kind: SessionKind;
+  let taskType: string;
+  let repositorySkills: string[];
 
   try {
     if (value.agent_id !== undefined) {
       const agentId = requireString(value.agent_id, "agent_id");
       if (!AGENT_ID_PATTERN.test(agentId)) throw new HttpError(422, `Invalid agent id: ${agentId}`);
-      const version = value.agent_version === undefined
-        ? undefined
-        : requireString(value.agent_version, "agent_version");
-      definition = agentRegistry.resolve(agentId, version);
+      definition = agentRegistry.resolve(agentId);
+      taskType = requireString(value.task_type, "task_type");
+      if (!AGENT_ID_PATTERN.test(taskType)) {
+        throw new HttpError(422, `Invalid task type: ${taskType}`);
+      }
+      repositorySkills = validateRepositorySkills(value.repository_skills ?? []);
       input = validateAgentInput(definition, value.input);
       if (
         typeof input.workspace_path === "string"
@@ -402,6 +435,10 @@ export function validateStartRequest(value: unknown): StartSessionRequest {
       }
       kind = kindValue;
       definition = agentRegistry.resolveLegacy(kindValue);
+      taskType = kind === "review" ? "code-review" : "message-command";
+      repositorySkills = [
+        kind === "review" ? config.defaultSkill : config.defaultInstructionSkill,
+      ];
       if (kind === "review") {
         input = validateRepositoryContext(value.review, "review");
         input.workspace_path = workspacePath;
@@ -429,38 +466,11 @@ export function validateStartRequest(value: unknown): StartSessionRequest {
     throw error;
   }
 
-  let model: ModelSelection | undefined;
-  if (value.model !== undefined) {
-    assertObject(value.model, "model");
-    model = {};
-    if (value.model.provider !== undefined) {
-      model.provider = requireString(value.model.provider, "model.provider");
-    }
-    if (value.model.id !== undefined) model.id = requireString(value.model.id, "model.id");
-    if (value.model.thinking_level !== undefined) {
-      const thinking = requireString(value.model.thinking_level, "model.thinking_level");
-      normalizeThinking(thinking);
-      model.thinking_level = thinking;
-    }
-    if (value.model.base_url !== undefined) {
-      model.base_url = requireString(value.model.base_url, "model.base_url");
-    }
-  }
-
-  let skills: string[] | undefined;
-  if (value.skills !== undefined) {
-    if (!Array.isArray(value.skills)) throw new HttpError(422, "skills must be an array.");
-    skills = value.skills.map((item, index) => {
-      const skill = requireString(item, `skills[${index}]`);
-      if (!SKILL_NAME_PATTERN.test(skill)) throw new HttpError(422, `Invalid skill name: ${skill}`);
-      return skill;
-    });
-  }
-
   const request: StartSessionRequest = {
     kind,
     agent_id: definition.id,
-    agent_version: definition.version,
+    task_type: taskType,
+    repository_skills: repositorySkills,
     workspace_path: workspacePath,
     input,
   };
@@ -470,12 +480,20 @@ export function validateStartRequest(value: unknown): StartSessionRequest {
     request.idempotency_key = key;
   }
   if (typeof value.title === "string" && value.title.trim() !== "") request.title = value.title.trim();
-  if (typeof value.profile === "string" && value.profile.trim() !== "") {
-    request.profile = value.profile.trim();
-  }
-  if (model !== undefined) request.model = model;
-  if (skills !== undefined) request.skills = skills;
   return request;
+}
+
+function validateRepositorySkills(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    throw new HttpError(422, "repository_skills must be an array.");
+  }
+  return value.map((item, index) => {
+    const reference = requireString(item, `repository_skills[${index}]`);
+    if (reference.length > 512 || /[\r\n\0]/.test(reference)) {
+      throw new HttpError(422, `Invalid Skill reference: ${reference}`);
+    }
+    return reference;
+  });
 }
 
 async function validateWorkspace(workspacePath: string): Promise<string> {
@@ -504,31 +522,26 @@ export async function startSession(request: StartSessionRequest): Promise<Sessio
     }
   }
   const workspace = await validateWorkspace(request.workspace_path);
-  const definition = agentRegistry.resolve(request.agent_id, request.agent_version);
-  const defaultSkills = request.kind === "review"
-    ? [config.defaultSkill]
-    : request.kind === "instruction"
-      ? [config.defaultInstructionSkill]
-      : undefined;
-  const invocation: AgentInvocation = {
-    definition,
-    input: request.input,
-    ...(request.profile === undefined
-      ? request.kind === "review" ? { profile: config.defaultProfile } : {}
-      : { profile: request.profile }),
-    ...(request.skills === undefined
-      ? defaultSkills === undefined ? {} : { skills: defaultSkills }
-      : { skills: request.skills }),
-    ...(request.model === undefined ? {} : { model: request.model }),
-  };
-  let resolved: ResolvedAgentConfiguration;
+  const definition = agentRegistry.resolve(request.agent_id);
+  let resolved;
+  let resolvedPreset;
   try {
-    resolved = resolveAgentConfiguration(invocation, {
-      provider: config.defaultProvider,
-      model: config.defaultModel,
-      thinkingLevel: config.defaultThinking,
-      ...(config.modelBaseUrl === undefined ? {} : { modelBaseUrl: config.modelBaseUrl }),
-    });
+    const resolution = resolveDomainPreset(
+      {
+        agentId: request.agent_id,
+        taskType: request.task_type,
+        repositorySkills: request.repository_skills,
+      },
+      definition,
+      {
+        provider: config.defaultProvider,
+        model: config.defaultModel,
+        thinkingLevel: config.defaultThinking,
+        ...(config.modelBaseUrl === undefined ? {} : { modelBaseUrl: config.modelBaseUrl }),
+      },
+    );
+    resolved = resolution.configuration;
+    resolvedPreset = resolution.preset;
   } catch (error) {
     if (error instanceof AgentConfigurationError) throw new HttpError(422, error.message);
     throw error;
@@ -555,7 +568,7 @@ export async function startSession(request: StartSessionRequest): Promise<Sessio
     tools: [],
     execution_limits: resolved.limits,
     execution_counters: { turns: 0, toolCalls: 0 },
-    interaction_policy: resolved.interactionPolicy,
+    resolved_preset: resolvedPreset,
     created_at: timestamp,
     updated_at: timestamp,
     events: [{ at: timestamp, type: "session_created", stage: "starting" }],
@@ -570,41 +583,10 @@ export async function startSession(request: StartSessionRequest): Promise<Sessio
   return record;
 }
 
-async function sendHumanMessage(record: SessionRecord, request: HumanMessageRequest): Promise<void> {
-  if (TERMINAL_STATUSES.has(record.status)) {
-    throw new HttpError(409, `Session is already ${record.status}.`);
-  }
-  const message = requireString(request.message, "message");
-  const delivery = request.delivery ?? (record.pending ? "answer" : "steer");
-  if (record.pending !== undefined) {
-    if (delivery !== "answer") throw new HttpError(409, "This session is waiting for an answer.");
-    const pending = record.pending;
-    delete record.pending;
-    record.status = "running";
-    record.stage = "running";
-    pending.resolve(message);
-    await persistRecord(record);
-    return;
-  }
-  if (delivery === "answer") throw new HttpError(409, "The session has no pending human-input request.");
-  if (delivery === "steer" && !record.interaction_policy.allowSteer) {
-    throw new HttpError(409, `Agent ${record.agent_id} does not allow steering.`);
-  }
-  if (delivery === "follow_up" && !record.interaction_policy.allowFollowUp) {
-    throw new HttpError(409, `Agent ${record.agent_id} does not allow follow-up messages.`);
-  }
-  if (record.session === undefined) throw new HttpError(409, "The pi-agent session is still starting.");
-  if (delivery === "follow_up") await record.session.followUp(message);
-  else await record.session.steer(message);
-  addEvent(record, { type: `human_${delivery}`, stage: record.stage });
-}
-
 async function cancelSession(record: SessionRecord): Promise<void> {
   if (TERMINAL_STATUSES.has(record.status)) return;
   record.status = "cancelled";
   record.stage = "cancelled";
-  record.pending?.reject(new Error("Session cancelled."));
-  delete record.pending;
   await record.session?.abort();
   addEvent(record, { type: "session_cancelled", stage: record.stage });
   await persistRecord(record);
@@ -649,25 +631,6 @@ function sessionIdFromPath(pathname: string, suffix = ""): string | undefined {
   return match?.[1] ? decodeURIComponent(match[1]) : undefined;
 }
 
-function publicAgent(definition: AgentDefinition) {
-  return {
-    id: definition.id,
-    version: definition.version,
-    description: definition.description,
-    legacy_kind: definition.legacyKind,
-    default_profile: definition.defaultProfile,
-    profiles: definition.profiles,
-    default_skills: definition.defaultSkills,
-    tools: definition.tools,
-    model_policy: definition.modelPolicy,
-    interaction_policy: definition.interactionPolicy,
-    limits: definition.limits,
-    result_tool: definition.result.toolName,
-    input_schema: definition.inputSchema,
-    output_schema: definition.result.schema,
-  };
-}
-
 async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
   try {
     const url = new URL(request.url ?? "/", "http://runtime.local");
@@ -681,34 +644,8 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
       return;
     }
     authorize(request);
-    if (request.method === "GET" && url.pathname === "/v1/agents") {
-      sendJson(response, 200, {
-        items: agentRegistry.list().map(publicAgent),
-      });
-      return;
-    }
     if (request.method === "POST" && url.pathname === "/v1/sessions") {
       const record = await startSession(validateStartRequest(await readJson(request)));
-      sendJson(response, 202, publicSession(record));
-      return;
-    }
-    const messageSessionId = sessionIdFromPath(url.pathname, "/messages");
-    if (request.method === "POST" && messageSessionId !== undefined) {
-      const record = sessions.get(messageSessionId);
-      if (!record) throw new HttpError(404, "Session not found.");
-      const body = await readJson(request);
-      assertObject(body, "request");
-      const delivery = body.delivery;
-      if (delivery !== undefined && !["answer", "steer", "follow_up"].includes(String(delivery))) {
-        throw new HttpError(422, "delivery must be answer, steer, or follow_up.");
-      }
-      const humanRequest: HumanMessageRequest = {
-        message: requireString(body.message, "message"),
-      };
-      if (delivery !== undefined) {
-        humanRequest.delivery = delivery as Exclude<HumanMessageRequest["delivery"], undefined>;
-      }
-      await sendHumanMessage(record, humanRequest);
       sendJson(response, 202, publicSession(record));
       return;
     }
@@ -740,8 +677,13 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
 
 export async function startServer(): Promise<void> {
   await Promise.all([
-    mkdir(config.stateRoot, { recursive: true }),
-    mkdir(config.agentDir, { recursive: true }),
+    mkdir(config.stateRoot, { recursive: true, mode: 0o700 }),
+    mkdir(config.agentDir, { recursive: true, mode: 0o700 }),
+    mkdir(config.environmentRoot, { recursive: true, mode: 0o755 }),
+  ]);
+  await Promise.all([
+    chmod(config.stateRoot, 0o700),
+    chmod(config.agentDir, 0o700),
   ]);
   await loadPersistedSessions();
   const server = createServer((request, response) => {
@@ -789,7 +731,6 @@ function compatibilityRecord(
     tools: value.tools ?? [],
     execution_limits: value.execution_limits ?? definition.limits,
     execution_counters: value.execution_counters ?? { turns: 0, toolCalls: 0 },
-    interaction_policy: value.interaction_policy ?? definition.interactionPolicy,
   });
   return value as unknown as SessionRecord;
 }
@@ -827,7 +768,7 @@ export function createInstructionTools(record: Record<string, unknown>): Runtime
   return createCompatibilityTools(record, prAssistantAgent);
 }
 
-export { agentRegistry, changeSummaryAgent, codeReviewAgent, prAssistantAgent, toolRegistry };
+export { agentRegistry, codeReviewAgent, prAssistantAgent, toolRegistry };
 
 const entrypoint = process.argv[1];
 if (entrypoint !== undefined && import.meta.url === pathToFileURL(entrypoint).href) {

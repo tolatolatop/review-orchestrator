@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  readFile as readHostFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -20,6 +26,7 @@ import {
 const stateRoot = await mkdtemp(join(tmpdir(), "pi-agent-state-"));
 const workspaceRoot = await mkdtemp(join(tmpdir(), "pi-agent-workspaces-"));
 process.env.PI_AGENT_STATE_ROOT = stateRoot;
+process.env.PI_AGENT_TASK_ENVIRONMENT_ROOT = join(stateRoot, "task-environments");
 process.env.PI_AGENT_WORKSPACE_ROOT = workspaceRoot;
 process.env.PI_AGENT_SKILLS_ROOT = resolve("skills");
 process.env.PI_CODING_AGENT_DIR = join(stateRoot, "config");
@@ -132,31 +139,56 @@ test("review tools confine reads to the workspace", async () => {
   }
 });
 
-test("request_human_input pauses and resumes the same session", async () => {
-  const workspace = await mkdtemp(join(tmpdir(), "pi-agent-human-"));
+test("workspace tools can write files and execute build commands", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "pi-agent-write-shell-"));
+  const outside = await mkdtemp(join(tmpdir(), "pi-agent-write-outside-"));
   try {
     const state = record(workspace);
-    const requestHuman = tool(createReviewTools(state), "request_human_input");
-    const execution = requestHuman.execute(
-      "human-1",
-      { question: "Is this public?", choices: ["yes", "no"] },
+    const tools = createReviewTools(state);
+    const write = await tool(tools, "write_file").execute(
+      "write-1",
+      { path: "generated/result.txt", content: "ready\n" },
       undefined,
       undefined,
       undefined,
     );
-    await new Promise((resolve) => setImmediate(resolve));
+    assert.match(write.content[0].text, /Wrote 6 bytes/);
+    assert.equal(await readHostFile(join(workspace, "generated/result.txt"), "utf8"), "ready\n");
 
-    assert.equal(state.status, "waiting_for_input");
-    assert.equal(state.stage, "waiting_for_human");
-    assert.equal(state.pending.question, "Is this public?");
-    state.pending.resolve("yes");
-
-    const result = await execution;
-    assert.equal(state.status, "running");
-    assert.equal(state.stage, "running");
-    assert.equal(result.content[0].text, "Operator answer: yes");
+    const shell = await tool(tools, "shell").execute(
+      "shell-1",
+      { command: "wc -c < generated/result.txt" },
+      undefined,
+      undefined,
+      undefined,
+    );
+    assert.equal(shell.details.exit_code, 0);
+    assert.equal(shell.content[0].text.trim(), "6");
+    await assert.rejects(
+      tool(tools, "write_file").execute(
+        "write-escape",
+        { path: "../outside", content: "no" },
+        undefined,
+        undefined,
+        undefined,
+      ),
+      /repository-relative paths/,
+    );
+    await writeFile(join(outside, "secret.txt"), "do not overwrite\n");
+    await symlink(join(outside, "secret.txt"), join(workspace, "escape.txt"));
+    await assert.rejects(
+      tool(tools, "write_file").execute(
+        "write-symlink",
+        { path: "escape.txt", content: "no" },
+        undefined,
+        undefined,
+        undefined,
+      ),
+      /outside the agent workspace/,
+    );
   } finally {
     await rm(workspace, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
   }
 });
 
@@ -195,7 +227,7 @@ test("submit_review records structured output and terminates", async () => {
   }
 });
 
-test("instruction tools expose only read operations and submit_task_result", async () => {
+test("instruction tools expose full workspace capability and submit_task_result", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "pi-agent-instruction-tools-"));
   try {
     await writeFile(join(workspace, "app.py"), "def retry():\n    return True\n", "utf8");
@@ -204,7 +236,15 @@ test("instruction tools expose only read operations and submit_task_result", asy
 
     assert.deepEqual(
       tools.map((item) => item.name),
-      ["list_files", "read_file", "search_code", "git_diff", "submit_task_result"],
+      [
+        "list_files",
+        "read_file",
+        "search_code",
+        "git_diff",
+        "write_file",
+        "shell",
+        "submit_task_result",
+      ],
     );
     assert.equal(tools.some((item) => item.name === "submit_review"), false);
     assert.equal(tools.some((item) => item.name === "request_human_input"), false);
@@ -249,7 +289,6 @@ test("instruction session start is idempotent for one agent task attempt", async
       author_login: "alice",
       history: [],
     },
-    skills: ["pr-assistant"],
   });
 
   const first = await startSession(request);
@@ -259,39 +298,39 @@ test("instruction session start is idempotent for one agent task attempt", async
   assert.equal(duplicate.idempotency_key, "agent-task:idempotent-task:attempt:1");
 });
 
-test("generic session start resolves a non-legacy agent and real profile", async () => {
-  const workspace = await mkdtemp(join(workspaceRoot, "summary-"));
+test("generic session start resolves and records a domain preset", async () => {
+  const workspace = await mkdtemp(join(workspaceRoot, "review-preset-"));
   const request = validateStartRequest({
-    agent_id: "change-summary",
-    agent_version: "1.0.0",
+    agent_id: "code-review",
+    task_type: "code-review",
+    repository_skills: ["builtin:code-review"],
     workspace_path: workspace,
-    profile: "deep",
-    model: { provider: "missing-provider", id: "missing-model" },
     input: {
-      repository_context: {
-        provider: "github",
-        repo_full_name: "example/repo",
-        pr_number: 1,
-        base_sha: "aaaaaaaa",
-        head_sha: "bbbbbbbb",
-      },
-      audience: "release-manager",
+      provider: "github",
+      repo_full_name: "example/repo",
+      pr_number: 1,
+      base_sha: "aaaaaaaa",
+      head_sha: "bbbbbbbb",
     },
   });
 
   const session = await startSession(request);
 
-  assert.equal(session.kind, "agent");
-  assert.equal(session.agent_id, "change-summary");
+  assert.equal(session.kind, "review");
+  assert.equal(session.agent_id, "code-review");
   assert.equal(session.agent_version, "1.0.0");
-  assert.equal(session.profile, "deep");
+  assert.equal(session.profile, "default");
   assert.equal(session.thinking_level, "high");
-  assert.deepEqual(session.skills, ["change-summary"]);
+  assert.deepEqual(session.skills, ["builtin:code-review"]);
+  assert.equal(session.resolved_preset.composition.task_type.id, "code-review");
+  assert.deepEqual(session.resolved_preset.composition.repository.skills, [
+    "builtin:code-review",
+  ]);
   for (let attempt = 0; attempt < 100 && session.status !== "failed"; attempt += 1) {
     await new Promise((resolveTick) => setImmediate(resolveTick));
   }
   assert.equal(session.status, "failed");
-  assert.match(session.error, /Unknown pi model/);
+  assert.match(session.error, /No API key found|Unknown pi model/);
 });
 
 test("pi SDK completes a review through submit_review", async () => {

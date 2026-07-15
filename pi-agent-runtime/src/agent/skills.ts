@@ -7,20 +7,33 @@ import type { LoadedSkill, SkillSelection } from "./types.js";
 export async function loadAgentSkills(
   skillsRoot: string,
   selection: SkillSelection,
+  resolvedPaths: Map<string, string> = new Map(),
 ): Promise<LoadedSkill[]> {
   const ordered = [selection.primary, ...selection.supporting];
-  return await Promise.all(ordered.map(async (name, index) => {
-    const path = join(skillsRoot, name, "SKILL.md");
+  return await Promise.all(ordered.map(async (reference, index) => {
+    const fallbackName = reference.startsWith("builtin:")
+      ? reference.slice("builtin:".length)
+      : reference;
+    const path = resolvedPaths.get(reference) ?? join(skillsRoot, fallbackName, "SKILL.md");
     await stat(path).catch(() => {
       throw new Error(`Configured agent skill does not exist: ${path}`);
     });
     const raw = await readFile(path, "utf8");
     const declaredName = parseFrontmatterName(raw);
-    if (declaredName !== name) {
-      throw new Error(`Skill ${path} declares name ${declaredName ?? "(missing)"}; expected ${name}.`);
+    if (declaredName === undefined) {
+      throw new Error(`Skill ${path} is missing its frontmatter name.`);
+    }
+    if (
+      !reference.startsWith("npm:")
+      && !reference.startsWith("prebuilt:")
+      && declaredName !== fallbackName
+    ) {
+      throw new Error(
+        `Skill ${path} declares name ${declaredName}; expected ${fallbackName}.`,
+      );
     }
     return {
-      name,
+      name: declaredName,
       path,
       digest: createHash("sha256").update(raw).digest("hex"),
       content: stripFrontmatter(raw).trim(),

@@ -12,9 +12,6 @@ export const repositoryContextSchema = Type.Object({
 
 export const permissiveModelPolicy: AgentModelPolicy = {
   allowedThinkingLevels: ["minimal", "low", "medium", "high", "xhigh"],
-  allowProviderOverride: true,
-  allowModelOverride: true,
-  allowBaseUrlOverride: true,
 };
 
 export const repositoryTools = [
@@ -22,6 +19,8 @@ export const repositoryTools = [
   "repository.read-file",
   "repository.search-code",
   "repository.git-diff",
+  "workspace.write-file",
+  "workspace.shell",
 ];
 
 export function asRepositoryContext(value: unknown): RepositoryContext {
