@@ -268,6 +268,54 @@ class ResourcePool(Base):
     )
 
 
+class AgentPreset(Base):
+    """Database-backed, operator-managed pi-agent preset selection.
+
+    A preset owns only the runtime selectors and bounded execution overrides.
+    Agent code, schemas, prompts, versions, and Tool implementations remain
+    installed Runtime resources.
+    """
+
+    __tablename__ = "agent_preset"
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_agent_preset_name"),
+        UniqueConstraint(
+            "task_kind",
+            "scope_key",
+            name="uq_agent_preset_task_scope",
+        ),
+        CheckConstraint("revision > 0", name="ck_agent_preset_revision"),
+        Index("ix_agent_preset_resolution", "task_kind", "scope_key", "enabled"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    task_kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    scope: Mapped[str] = mapped_column(String(32), nullable=False)
+    scope_key: Mapped[str] = mapped_column(String(768), nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    repo_full_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    agent_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    task_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    repository_skills_json: Mapped[list] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    model_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    tools_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    limits_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    revision: Mapped[int] = mapped_column(nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
 class ResourceLease(Base):
     __tablename__ = "resource_lease"
     __table_args__ = (

@@ -129,10 +129,29 @@ export interface DomainPresetSelection {
   agentId: string;
   taskType: string;
   repositorySkills: string[];
+  resource?: DomainPresetResourceReference;
+  overrides?: DomainPresetOverrides;
+}
+
+export interface DomainPresetResourceReference {
+  id: string;
+  name: string;
+  revision: number;
+}
+
+export interface DomainPresetOverrides {
+  model?: {
+    provider?: string;
+    id?: string;
+    thinking_level?: ThinkingLevel;
+  };
+  tools?: string[];
+  limits?: Partial<AgentExecutionLimits>;
 }
 
 export interface ResolvedDomainPreset {
   schema_version: "1";
+  resource?: DomainPresetResourceReference;
   composition: {
     agent: { id: string; version: string; digest: string };
     repository: { skills: string[] };

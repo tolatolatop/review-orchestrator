@@ -210,6 +210,25 @@ def test_review_ledger_dashboard_is_mounted(tmp_path: Path) -> None:
     assert "idempotency_key" in response.text
 
 
+def test_agent_preset_configuration_console_is_mounted(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        redirect = client.get("/presets", follow_redirects=False)
+        response = client.get("/presets/")
+
+    assert redirect.status_code == 307
+    assert redirect.headers["location"] == "/presets/"
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Agent Preset 路由台" in response.text
+    assert "const API='/api/v1/agent-presets'" in response.text
+    assert "method:id?'PATCH':'POST'" in response.text
+    assert "method:'DELETE'" in response.text
+    assert "headers['X-Review-Token']=PROXY_TOKEN" in response.text
+    assert 'id="repository-skills"' not in response.text
+    assert 'id="skills"' in response.text
+    assert 'id="max-tool-calls"' in response.text
+
+
 def test_observability_list_aliases_are_available(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
         for resource in ("provider-events", "review-runs", "agent-tasks"):

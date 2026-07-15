@@ -183,6 +183,76 @@ test("domain preset composition applies field-specific ownership", () => {
   );
 });
 
+test("database preset resources apply validated bounded overrides", () => {
+  const request = validateStartRequest({
+    agent_id: "code-review",
+    task_type: "code-review",
+    repository_skills: ["code-review", "security-analysis"],
+    preset_resource: {
+      id: "preset-1",
+      name: "security-review",
+      revision: 3,
+    },
+    preset_overrides: {
+      model: { thinking_level: "medium" },
+      tools: ["repository.git-diff", "repository.read-file"],
+      limits: { maxTurns: 12, maxToolCalls: 40 },
+    },
+    workspace_path: "/workspaces/repo",
+    input: repository,
+  });
+  const { configuration: resolved, preset } = resolveDomainPreset(
+    {
+      agentId: request.agent_id,
+      taskType: request.task_type,
+      repositorySkills: request.repository_skills,
+      resource: request.preset_resource,
+      overrides: request.preset_overrides,
+    },
+    codeReviewAgent,
+    { provider: "openai", model: "gpt-5.4", thinkingLevel: "high" },
+  );
+
+  assert.equal(resolved.thinkingLevel, "medium");
+  assert.deepEqual(resolved.tools, [
+    "repository.git-diff",
+    "repository.read-file",
+  ]);
+  assert.equal(resolved.limits.maxTurns, 12);
+  assert.equal(resolved.limits.maxToolCalls, 40);
+  assert.equal(resolved.limits.maxResultBytes, 250_000);
+  assert.deepEqual(preset.resource, {
+    id: "preset-1",
+    name: "security-review",
+    revision: 3,
+  });
+  assert.deepEqual(preset.skills, ["code-review", "security-analysis"]);
+  assert.throws(
+    () => resolveDomainPreset(
+      {
+        agentId: "code-review",
+        taskType: "code-review",
+        repositorySkills: ["code-review"],
+        overrides: { tools: ["untrusted.shell"] },
+      },
+      codeReviewAgent,
+      { provider: "openai", model: "gpt-5.4", thinkingLevel: "high" },
+    ),
+    /outside the agent code-review allow-list/,
+  );
+  assert.throws(
+    () => validateStartRequest({
+      agent_id: "code-review",
+      task_type: "code-review",
+      repository_skills: ["code-review"],
+      preset_overrides: { limits: { maxTurns: 0 } },
+      workspace_path: "/workspaces/repo",
+      input: repository,
+    }),
+    /must be an integer between/,
+  );
+});
+
 test("installed named presets can change tools and execution limits", () => {
   const resolved = configuration(changeSummaryAgent, {
     profile: "deep",

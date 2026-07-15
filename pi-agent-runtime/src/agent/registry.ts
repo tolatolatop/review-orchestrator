@@ -5,6 +5,7 @@ import { Value } from "typebox/value";
 import type {
   AgentDefinition,
   DomainPresetSelection,
+  DomainPresetOverrides,
   AgentExecutionLimits,
   AgentInvocation,
   JsonObject,
@@ -66,7 +67,7 @@ export function resolveDomainPreset(
       `Agent ${definition.id} does not support task type ${selection.taskType}.`,
     );
   }
-  const configuration = resolveAgentConfiguration(
+  let configuration = resolveAgentConfiguration(
     {
       definition,
       input: {},
@@ -77,6 +78,10 @@ export function resolveDomainPreset(
     },
     defaults,
   );
+  configuration = applyDomainPresetOverrides(
+    configuration,
+    selection.overrides,
+  );
   const skillReferences = [
     configuration.skills.primary,
     ...configuration.skills.supporting,
@@ -85,6 +90,9 @@ export function resolveDomainPreset(
     configuration,
     preset: {
       schema_version: "1",
+      ...(selection.resource === undefined
+        ? {}
+        : { resource: { ...selection.resource } }),
       composition: {
         agent: {
           id: definition.id,
@@ -105,6 +113,40 @@ export function resolveDomainPreset(
       limits: { ...configuration.limits },
       environment: { mode: "task-overlay", template: "runtime-default" },
     },
+  };
+}
+
+function applyDomainPresetOverrides(
+  configuration: ResolvedAgentConfiguration,
+  overrides: DomainPresetOverrides | undefined,
+): ResolvedAgentConfiguration {
+  if (overrides === undefined) return configuration;
+  const definition = configuration.definition;
+  const provider = overrides.model?.provider ?? configuration.provider;
+  const model = overrides.model?.id ?? configuration.model;
+  const thinkingLevel = overrides.model?.thinking_level
+    ?? configuration.thinkingLevel;
+  validateModelSelection(definition, provider, model, thinkingLevel);
+
+  const tools = overrides.tools === undefined
+    ? [...configuration.tools]
+    : [...overrides.tools];
+  if (tools.some((tool) => !definition.tools.includes(tool))) {
+    throw new AgentConfigurationError(
+      `Preset cannot add tools outside the agent ${definition.id} allow-list.`,
+    );
+  }
+  if (new Set(tools).size !== tools.length) {
+    throw new AgentConfigurationError("Preset contains duplicate tools.");
+  }
+
+  return {
+    ...configuration,
+    provider,
+    model,
+    thinkingLevel,
+    tools,
+    limits: mergeLimits(configuration.limits, overrides.limits),
   };
 }
 

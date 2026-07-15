@@ -7,9 +7,9 @@ authentication and TLS.**
 
 ## Current Availability
 
-The service mounts its bundled operator dashboard at `/dashboard/` and a
-focused review-run ledger at `/reviews/`. Both consume the canonical
-observability APIs below from the same origin:
+The service mounts its bundled operator dashboard at `/dashboard/`, a focused
+review-run ledger at `/reviews/`, and the database-backed Agent Preset console
+at `/presets/`. They consume the canonical same-origin APIs below:
 
 | Purpose | Endpoint |
 | --- | --- |
@@ -18,6 +18,7 @@ observability APIs below from the same origin:
 | Review runs | `GET /api/v1/observability/review-runs[/{review_run_id}]` |
 | pi-agent by run | `GET /api/v1/observability/review-runs/{review_run_id}/agent-session` |
 | pi-agent by session | `GET /api/v1/observability/agent-sessions/{agent_session_id}` |
+| Agent Preset configuration | `/api/v1/agent-presets[/{preset_id}]` |
 
 The legacy paths without `/observability` remain compatible. Remote requests
 use the token-protected Nginx boundary by default; trusted requests from the
@@ -67,6 +68,7 @@ Local operators bypass Nginx entirely and therefore do not need the token:
 
 ```bash
 open http://127.0.0.1:${REVIEW_LOCAL_PORT:-18000}/reviews/
+open http://127.0.0.1:${REVIEW_LOCAL_PORT:-18000}/presets/
 curl -fsS http://127.0.0.1:${REVIEW_LOCAL_PORT:-18000}/api/v1/observability/review-runs
 ```
 

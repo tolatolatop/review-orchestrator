@@ -12,6 +12,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from review_orchestrator.application.delivery import enqueue_delivery
+from review_orchestrator.application.presets import (
+    configured_preset_snapshot,
+    resolve_agent_preset,
+)
 from review_orchestrator.application.scheduler import (
     SchedulerPolicy,
     claim_next_task,
@@ -35,11 +39,13 @@ from review_orchestrator.domain.models import (
     utc_now,
 )
 from review_orchestrator.domain.review_results import ChangedFile
-from review_orchestrator.domain.schemas import WorkspacePrepareRequest
+from review_orchestrator.domain.schemas import (
+    AgentPresetTaskKind,
+    WorkspacePrepareRequest,
+)
 from review_orchestrator.infrastructure.config import Settings
 from review_orchestrator.infrastructure.workspaces import prepare_workspace
 from review_orchestrator.integrations.pi_agent import (
-    AgentDomainPreset,
     AgentInstructionHistoryItem,
     AgentInstructionInput,
     AgentInstructionRepositoryContext,
@@ -406,19 +412,18 @@ async def _process_command_agent_task(
         session.add(task)
         await session.commit()
         try:
-            preset = AgentDomainPreset(
-                agent_id=settings.agent_command_agent,
-                task_type="message-command",
-                repository_skills=[command_config.default_agent_command_skill],
+            preset = await resolve_agent_preset(
+                session,
+                task_kind=AgentPresetTaskKind.agent_task,
+                provider=task.provider,
+                repo_full_name=task.repo_full_name,
+                fallback_agent_id=settings.agent_command_agent,
+                fallback_task_type="message-command",
+                fallback_repository_skills=[
+                    command_config.default_agent_command_skill
+                ],
             )
-            task.resolved_preset_json = {
-                "schema_version": "1",
-                "composition": {
-                    "agent": {"id": preset.agent_id},
-                    "repository": {"skills": preset.repository_skills},
-                    "task_type": {"id": preset.task_type},
-                },
-            }
+            task.resolved_preset_json = configured_preset_snapshot(preset)
             runtime_session = await pi_agent_client.start_instruction_session(
                 instruction,
                 preset=preset,

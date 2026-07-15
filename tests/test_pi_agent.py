@@ -6,8 +6,12 @@ import pytest
 from review_orchestrator.config import Settings
 from review_orchestrator.pi_agent import (
     AgentDomainPreset,
+    AgentDomainPresetLimits,
+    AgentDomainPresetModel,
+    AgentDomainPresetOverrides,
     AgentInstructionInput,
     AgentInstructionRepositoryContext,
+    AgentPresetResourceReference,
     PiAgentClient,
     PiAgentClientError,
     PiAgentSessionStatus,
@@ -59,6 +63,54 @@ def test_start_payload_keeps_workspace_and_only_domain_preset_selectors() -> Non
     assert "profile" not in payload
     assert "model" not in payload
     assert "agent_version" not in payload
+
+
+def test_start_payload_serializes_database_resource_overrides() -> None:
+    client = PiAgentClient(base_url="http://pi-agent:3210")
+    preset = AgentDomainPreset(
+        agent_id="code-review",
+        task_type="code-review",
+        repository_skills=["code-review", "security-analysis"],
+        resource=AgentPresetResourceReference(
+            id="preset-1",
+            name="security-review",
+            revision=3,
+        ),
+        overrides=AgentDomainPresetOverrides(
+            model=AgentDomainPresetModel(
+                provider="company-openai",
+                id="review-model",
+                thinking_level="medium",
+            ),
+            tools=["repository.git-diff", "repository.read-file"],
+            limits=AgentDomainPresetLimits(
+                max_turns=12,
+                max_tool_calls=40,
+                max_result_bytes=120000,
+            ),
+        ),
+    )
+
+    payload = client._start_payload(review_input(), preset=preset)
+
+    assert payload["preset_resource"] == {
+        "id": "preset-1",
+        "name": "security-review",
+        "revision": 3,
+    }
+    assert payload["preset_overrides"] == {
+        "model": {
+            "provider": "company-openai",
+            "id": "review-model",
+            "thinking_level": "medium",
+        },
+        "tools": ["repository.git-diff", "repository.read-file"],
+        "limits": {
+            "maxTurns": 12,
+            "maxToolCalls": 40,
+            "maxResultBytes": 120000,
+        },
+    }
 
 
 def test_instruction_payload_keeps_command_context_history_and_idempotency() -> None:

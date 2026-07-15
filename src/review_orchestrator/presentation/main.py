@@ -17,6 +17,7 @@ from review_orchestrator.infrastructure.db import (
 from review_orchestrator.integrations.provider_plugins import create_provider_registry
 from review_orchestrator.presentation.api import router
 from review_orchestrator.presentation.dashboard import DASHBOARD_HTML
+from review_orchestrator.presentation.presets_dashboard import PRESETS_DASHBOARD_HTML
 from review_orchestrator.presentation.provider_core import (
     router as provider_core_router,
 )
@@ -36,7 +37,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.session_factory = create_session_factory(engine)
             provider_registry = create_provider_registry(settings)
             app.state.provider_registry = provider_registry
-            await init_models(engine)
+            await init_models(engine, settings)
             yield
         finally:
             try:
@@ -80,6 +81,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/reviews/", response_class=HTMLResponse, include_in_schema=False)
     async def reviews_dashboard() -> HTMLResponse:
         return HTMLResponse(REVIEWS_DASHBOARD_HTML)
+
+    @app.get("/presets", include_in_schema=False)
+    async def presets_dashboard_redirect() -> RedirectResponse:
+        return RedirectResponse("/presets/", status_code=307)
+
+    @app.get("/presets/", response_class=HTMLResponse, include_in_schema=False)
+    async def presets_dashboard() -> HTMLResponse:
+        return HTMLResponse(PRESETS_DASHBOARD_HTML)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

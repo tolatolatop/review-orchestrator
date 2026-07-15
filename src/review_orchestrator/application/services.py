@@ -10,6 +10,10 @@ from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from review_orchestrator.application.presets import (
+    configured_preset_snapshot,
+    resolve_agent_preset,
+)
 from review_orchestrator.application.session_archive import archive_agent_session
 from review_orchestrator.domain.models import (
     AgentTask,
@@ -38,6 +42,7 @@ from review_orchestrator.domain.review_results import (
     parse_review_result,
 )
 from review_orchestrator.domain.schemas import (
+    AgentPresetTaskKind,
     AgentTaskDetail,
     AgentTaskListResponse,
     AgentTaskQueueHealth,
@@ -81,7 +86,6 @@ from review_orchestrator.infrastructure.observability import (
     redact_value,
 )
 from review_orchestrator.integrations.pi_agent import (
-    AgentDomainPreset,
     PiAgentClient,
     PiAgentClientError,
     PiAgentSession,
@@ -511,19 +515,16 @@ async def start_review_session(
         repo_full_name=review_run.repo_full_name,
         default_skill=settings.pi_agent_review_skill,
     )
-    preset = AgentDomainPreset(
-        agent_id=settings.pi_agent_review_agent,
-        task_type="code-review",
-        repository_skills=[review_config.default_review_skill],
+    preset = await resolve_agent_preset(
+        session,
+        task_kind=AgentPresetTaskKind.review,
+        provider=review_run.provider,
+        repo_full_name=review_run.repo_full_name,
+        fallback_agent_id=settings.pi_agent_review_agent,
+        fallback_task_type="code-review",
+        fallback_repository_skills=[review_config.default_review_skill],
     )
-    review_run.resolved_preset_json = {
-        "schema_version": "1",
-        "composition": {
-            "agent": {"id": preset.agent_id},
-            "repository": {"skills": preset.repository_skills},
-            "task_type": {"id": preset.task_type},
-        },
-    }
+    review_run.resolved_preset_json = configured_preset_snapshot(preset)
     try:
         runtime_session = await pi_agent_client.start_session(
             review_input,
@@ -561,7 +562,9 @@ async def start_review_session(
         session.add(review_session)
     review_session.agent_session_id = runtime_session.id
     review_session.status = runtime_session.status
-    review_session.skill_name = review_config.default_review_skill
+    review_session.skill_name = (
+        preset.repository_skills[0] if preset.repository_skills else None
+    )
     review_session.profile_name = _runtime_profile(runtime_session)
     review_session.input_snapshot_json = review_input.model_dump()
     await archive_agent_session(session, review_run, runtime_session)

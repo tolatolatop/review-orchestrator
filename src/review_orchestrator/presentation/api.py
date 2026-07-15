@@ -2,9 +2,18 @@
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from review_orchestrator.application.presets import (
+    AgentPresetConflictError,
+    AgentPresetValidationError,
+    create_agent_preset,
+    delete_agent_preset,
+    get_agent_preset,
+    list_agent_presets,
+    update_agent_preset,
+)
 from review_orchestrator.application.services import (
     ReviewRequestRejected,
     ReviewRunTransitionError,
@@ -42,6 +51,10 @@ from review_orchestrator.application.services import (
 from review_orchestrator.domain.models import AgentTask
 from review_orchestrator.domain.review_results import ReviewResultError
 from review_orchestrator.domain.schemas import (
+    AgentPresetCreate,
+    AgentPresetListResponse,
+    AgentPresetRead,
+    AgentPresetUpdate,
     AgentTaskDetail,
     AgentTaskListResponse,
     CleanupSummary,
@@ -419,6 +432,100 @@ async def update_resource_pool_endpoint(
     except ReviewRunTransitionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     return pool
+
+
+@router.post(
+    "/agent-presets",
+    response_model=AgentPresetRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_agent_preset_endpoint(
+    payload: AgentPresetCreate,
+    session: AsyncSession = session_dependency,
+) -> AgentPresetRead:
+    try:
+        return await create_agent_preset(session, payload)
+    except AgentPresetConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+
+@router.get("/agent-presets", response_model=AgentPresetListResponse)
+async def list_agent_presets_endpoint(
+    task_kind: str | None = Query(
+        default=None,
+        pattern="^(review|agent_task)$",
+    ),
+    scope: str | None = Query(
+        default=None,
+        pattern="^(global|repository)$",
+    ),
+    provider: str | None = Query(default=None, min_length=1, max_length=64),
+    repo_full_name: str | None = Query(default=None, min_length=1, max_length=512),
+    enabled: bool | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = session_dependency,
+) -> AgentPresetListResponse:
+    return await list_agent_presets(
+        session,
+        task_kind=task_kind,
+        scope=scope,
+        provider=provider,
+        repo_full_name=repo_full_name,
+        enabled=enabled,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/agent-presets/{preset_id}", response_model=AgentPresetRead)
+async def get_agent_preset_endpoint(
+    preset_id: str,
+    session: AsyncSession = session_dependency,
+) -> AgentPresetRead:
+    preset = await get_agent_preset(session, preset_id)
+    if preset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return preset
+
+
+@router.patch("/agent-presets/{preset_id}", response_model=AgentPresetRead)
+async def update_agent_preset_endpoint(
+    preset_id: str,
+    payload: AgentPresetUpdate,
+    session: AsyncSession = session_dependency,
+) -> AgentPresetRead:
+    try:
+        preset = await update_agent_preset(session, preset_id, payload)
+    except AgentPresetConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except AgentPresetValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=exc.errors,
+        ) from exc
+    if preset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return preset
+
+
+@router.delete(
+    "/agent-presets/{preset_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_agent_preset_endpoint(
+    preset_id: str,
+    session: AsyncSession = session_dependency,
+) -> Response:
+    if not await delete_agent_preset(session, preset_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/deliveries", response_model=DeliveryOutboxListResponse)

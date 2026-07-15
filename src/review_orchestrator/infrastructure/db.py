@@ -2,8 +2,9 @@
 
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
+from hashlib import sha256
 
-from sqlalchemy import MetaData, Table, inspect, select, text
+from sqlalchemy import MetaData, Table, func, inspect, select, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -46,14 +47,141 @@ def create_session_factory(
     return async_sessionmaker(engine, expire_on_commit=False)
 
 
-async def init_models(engine: AsyncEngine) -> None:
+async def init_models(
+    engine: AsyncEngine,
+    settings: Settings | None = None,
+) -> None:
     # Import registers SQLAlchemy models with metadata.
     import review_orchestrator.domain.models  # noqa: F401
 
+    settings = settings or get_settings()
     async with engine.begin() as conn:
+        preset_table_missing = await conn.run_sync(
+            lambda connection: "agent_preset"
+            not in inspect(connection).get_table_names()
+        )
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_migrate_unified_tasks)
         await conn.run_sync(_migrate_agent_runtime_columns)
+        if preset_table_missing:
+            await conn.run_sync(
+                lambda connection: _seed_agent_presets(connection, settings)
+            )
+
+
+def _seed_agent_presets(connection: Connection, settings: Settings) -> None:
+    """Seed default resources once when the Agent Preset table is introduced."""
+
+    from review_orchestrator.domain.models import AgentPreset, ReviewConfig
+
+    if connection.execute(select(func.count(AgentPreset.id))).scalar_one() > 0:
+        return
+    now = datetime.now(UTC)
+    rows: list[dict[str, object]] = [
+        {
+            "name": "default-review",
+            "description": "Global default preset for pull request reviews.",
+            "task_kind": "review",
+            "scope": "global",
+            "scope_key": "global",
+            "provider": None,
+            "repo_full_name": None,
+            "agent_id": settings.pi_agent_review_agent,
+            "task_type": "code-review",
+            "repository_skills_json": [settings.pi_agent_review_skill],
+            "model_json": None,
+            "tools_json": None,
+            "limits_json": None,
+            "enabled": True,
+            "revision": 1,
+            "created_at": now,
+            "updated_at": now,
+        },
+        {
+            "name": "default-agent-task",
+            "description": "Global default preset for pull request AgentTasks.",
+            "task_kind": "agent_task",
+            "scope": "global",
+            "scope_key": "global",
+            "provider": None,
+            "repo_full_name": None,
+            "agent_id": settings.agent_command_agent,
+            "task_type": "message-command",
+            "repository_skills_json": [settings.agent_command_skill],
+            "model_json": None,
+            "tools_json": None,
+            "limits_json": None,
+            "enabled": True,
+            "revision": 1,
+            "created_at": now,
+            "updated_at": now,
+        },
+    ]
+    inspector = inspect(connection)
+    review_config_columns = {
+        column["name"] for column in inspector.get_columns("review_config")
+    }
+    required_review_config_columns = {
+        "provider",
+        "repo_full_name",
+        "default_review_skill",
+        "default_agent_command_skill",
+    }
+    if required_review_config_columns <= review_config_columns:
+        configs = connection.execute(
+            select(
+                ReviewConfig.provider,
+                ReviewConfig.repo_full_name,
+                ReviewConfig.default_review_skill,
+                ReviewConfig.default_agent_command_skill,
+            )
+        ).mappings()
+        for config in configs:
+            digest = sha256(
+                f"{config['provider']}:{config['repo_full_name']}".encode()
+            ).hexdigest()[:16]
+            common = {
+                "scope": "repository",
+                "scope_key": (
+                    f"repository:{config['provider']}:{config['repo_full_name']}"
+                ),
+                "provider": config["provider"],
+                "repo_full_name": config["repo_full_name"],
+                "model_json": None,
+                "tools_json": None,
+                "limits_json": None,
+                "enabled": True,
+                "revision": 1,
+                "created_at": now,
+                "updated_at": now,
+            }
+            rows.extend(
+                [
+                    {
+                        **common,
+                        "name": f"migrated-review-{digest}",
+                        "description": "Migrated repository review selection.",
+                        "task_kind": "review",
+                        "agent_id": settings.pi_agent_review_agent,
+                        "task_type": "code-review",
+                        "repository_skills_json": [
+                            config["default_review_skill"]
+                        ],
+                    },
+                    {
+                        **common,
+                        "name": f"migrated-agent-task-{digest}",
+                        "description": "Migrated repository AgentTask selection.",
+                        "task_kind": "agent_task",
+                        "agent_id": settings.agent_command_agent,
+                        "task_type": "message-command",
+                        "repository_skills_json": [
+                            config["default_agent_command_skill"]
+                        ],
+                    },
+                ]
+            )
+    connection.execute(AgentPreset.__table__.insert(), rows)
 
 
 _LEGACY_TASK_CONTROL_COLUMNS = (

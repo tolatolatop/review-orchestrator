@@ -438,6 +438,178 @@ class ResourcePoolUpdate(BaseModel):
     dimension: str | None = Field(default=None, min_length=1, max_length=64)
 
 
+class AgentPresetTaskKind(StrEnum):
+    review = "review"
+    agent_task = "agent_task"
+
+
+class AgentPresetScope(StrEnum):
+    global_scope = "global"
+    repository = "repository"
+
+
+class AgentPresetModelOverride(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str | None = Field(default=None, min_length=1, max_length=64)
+    id: str | None = Field(default=None, min_length=1, max_length=128)
+    thinking_level: str | None = Field(
+        default=None,
+        pattern="^(minimal|low|medium|high|xhigh)$",
+    )
+
+    @model_validator(mode="after")
+    def require_override(self) -> AgentPresetModelOverride:
+        if self.provider is None and self.id is None and self.thinking_level is None:
+            raise ValueError("At least one model override is required.")
+        return self
+
+
+class AgentPresetLimitsOverride(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_turns: int | None = Field(default=None, gt=0, le=1000)
+    max_tool_calls: int | None = Field(default=None, gt=0, le=10000)
+    max_result_bytes: int | None = Field(default=None, gt=0, le=10_000_000)
+
+    @model_validator(mode="after")
+    def require_override(self) -> AgentPresetLimitsOverride:
+        if (
+            self.max_turns is None
+            and self.max_tool_calls is None
+            and self.max_result_bytes is None
+        ):
+            raise ValueError("At least one execution limit override is required.")
+        return self
+
+
+class AgentPresetDefinition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$",
+    )
+    description: str | None = Field(default=None, max_length=2000)
+    task_kind: AgentPresetTaskKind
+    scope: AgentPresetScope = AgentPresetScope.global_scope
+    provider: str | None = Field(default=None, min_length=1, max_length=64)
+    repo_full_name: str | None = Field(default=None, min_length=1, max_length=512)
+    agent_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$",
+    )
+    task_type: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$",
+    )
+    repository_skills: list[str] = Field(default_factory=list, max_length=16)
+    model: AgentPresetModelOverride | None = None
+    tools: list[str] | None = Field(default=None, max_length=64)
+    limits: AgentPresetLimitsOverride | None = None
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_definition(self) -> AgentPresetDefinition:
+        if self.scope == AgentPresetScope.global_scope:
+            if self.provider is not None or self.repo_full_name is not None:
+                raise ValueError(
+                    "Global presets cannot declare provider or repo_full_name."
+                )
+        elif self.provider is None or self.repo_full_name is None:
+            raise ValueError(
+                "Repository presets require provider and repo_full_name."
+            )
+        for label, values in (
+            ("repository_skills", self.repository_skills),
+            ("tools", self.tools or []),
+        ):
+            if len(set(values)) != len(values):
+                raise ValueError(f"{label} must not contain duplicates.")
+            if any(
+                not value
+                or len(value) > 512
+                or any(c in value for c in "\r\n\0")
+                for value in values
+            ):
+                raise ValueError(f"{label} contains an invalid reference.")
+        return self
+
+
+class AgentPresetCreate(AgentPresetDefinition):
+    pass
+
+
+class AgentPresetUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$",
+    )
+    description: str | None = Field(default=None, max_length=2000)
+    task_kind: AgentPresetTaskKind | None = None
+    scope: AgentPresetScope | None = None
+    provider: str | None = Field(default=None, min_length=1, max_length=64)
+    repo_full_name: str | None = Field(default=None, min_length=1, max_length=512)
+    agent_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$",
+    )
+    task_type: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$",
+    )
+    repository_skills: list[str] | None = Field(default=None, max_length=16)
+    model: AgentPresetModelOverride | None = None
+    tools: list[str] | None = Field(default=None, max_length=64)
+    limits: AgentPresetLimitsOverride | None = None
+    enabled: bool | None = None
+
+    @model_validator(mode="after")
+    def require_update(self) -> AgentPresetUpdate:
+        if not self.model_fields_set:
+            raise ValueError("At least one preset field is required.")
+        required = {
+            "name",
+            "task_kind",
+            "scope",
+            "agent_id",
+            "task_type",
+            "repository_skills",
+            "enabled",
+        }
+        if any(
+            field in self.model_fields_set and getattr(self, field) is None
+            for field in required
+        ):
+            raise ValueError("Required preset fields cannot be null.")
+        return self
+
+
+class AgentPresetRead(AgentPresetDefinition):
+    id: str
+    revision: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class AgentPresetListResponse(BaseModel):
+    items: list[AgentPresetRead]
+    total: int
+    limit: int
+    offset: int
+
+
 class DeliveryOutboxSummary(BaseModel):
     id: str
     task_id: str

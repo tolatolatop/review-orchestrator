@@ -24,6 +24,7 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{ou
 h1{margin:0;font:750 30px/1.14 ui-rounded,"Arial Rounded MT Bold","PingFang SC",sans-serif;letter-spacing:-.035em}
 .intro{margin:7px 0 0;color:var(--muted)}
 .refresh-box{display:flex;align-items:center;gap:11px;min-height:45px}
+.page-link{color:var(--muted);font-weight:650;text-decoration:none;white-space:nowrap}.page-link:hover{color:var(--blue);text-decoration:underline;text-underline-offset:3px}
 .refresh-meta{text-align:right;color:var(--muted);font-size:12px}
 .refresh-meta strong{display:block;color:var(--ink);font:600 12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
 .icon-button{display:inline-flex;align-items:center;gap:7px;min-height:38px;padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink);cursor:pointer;box-shadow:0 2px 8px rgba(23,32,51,.03)}
@@ -153,6 +154,7 @@ a.mr-title:hover{color:var(--blue);text-decoration:underline;text-underline-offs
       </div>
     </div>
     <div class="refresh-box">
+      <a class="page-link" data-token-link href="/presets/">Preset 配置</a>
       <div class="refresh-meta"><span id="refresh-status">30 秒后自动刷新</span><strong id="updated-at">尚未加载</strong></div>
       <button class="icon-button" id="refresh" type="button">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/></svg>
@@ -203,6 +205,7 @@ const PROVIDERS_API='/api/v1/providers';
 const PAGE_SIZE=25;
 const REFRESH_SECONDS=30;
 const PROXY_TOKEN=new URLSearchParams(window.location.search).get('token')||'';
+if(PROXY_TOKEN)document.querySelectorAll('[data-token-link]').forEach(link=>{const url=new URL(link.href,location.origin);url.searchParams.set('token',PROXY_TOKEN);link.href=url.href});
 const statusNames={queued:'排队中',running:'运行中',completed:'已完成',failed:'失败',cancelled:'已取消',superseded:'已替代'};
 const stageNames={start:'准备执行',starting:'启动 pi-agent',retrying_agent_start:'重试执行器',waiting_for_agent:'等待执行器',waiting_for_human:'等待人工输入',agent_completed:'收集审查结果',collecting_result:'收集审查结果',publishing_summary:'发布审查摘要',cleanup:'清理工作区',completed:'执行完成'};
 const state={status:'',provider:'',repo_full_name:'',pull_request_number:'',page:1,total:0,loading:false,controller:null,remaining:REFRESH_SECONDS,rerun:null,createdRunId:null,highlightRunId:null};

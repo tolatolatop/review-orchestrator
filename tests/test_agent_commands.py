@@ -351,6 +351,10 @@ async def test_command_task_publishes_placeholder_before_agent_and_updates_it(
     assert len(github_client.issue_comments) == 1
     assert "🤖 Answer for @alice" in github_client.issue_comments[0].body
     assert "`src/retry.py:10-18`" in github_client.issue_comments[0].body
+    _, runtime_options = pi_agent_client.started_inputs[0]
+    selected_preset = runtime_options["preset"]
+    assert selected_preset.resource.name == "default-agent-task"
+    assert selected_preset.resource.revision == 1
 
 
 async def test_empty_command_returns_guidance_without_starting_agent(
