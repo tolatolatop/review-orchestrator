@@ -7,7 +7,7 @@ adapters. This guide describes how to add Azure DevOps, Bitbucket, GitCode, or
 another code-hosting platform without weakening the existing providers.
 
 The target shape is a small provider adapter boundary around external platform
-behavior. Review run lifecycle, OpenHands session orchestration, workspace
+behavior. Review run lifecycle, pi-agent session orchestration, workspace
 preparation, result parsing, finding reconciliation, and retry policy should stay
 provider-agnostic.
 
@@ -22,8 +22,9 @@ GitHub support currently covers:
 - Review-run creation for PR `opened`, `synchronize`, `reopened`, and
   `ready_for_review`.
 - PR context updates for supported pull request state and metadata changes.
-- Mention-trigger agent tasks when PR comments or reviews mention the configured
-  review bot login.
+- Mention-trigger message-command AgentTasks when PR comments or reviews mention
+  the configured review bot login. These answer the message and do not create a
+  ReviewRun.
 - Provider event idempotency through `(provider, delivery_id)`.
 - Provider-scoped storage for PR contexts, review runs, comment refs, workspaces,
   and review config.
@@ -67,7 +68,7 @@ The orchestrator core owns shared behavior:
 - `PullRequestContext`, `ReviewRun`, `Finding`, `ReviewCommentRef`,
   `ReviewConfig`, and `Workspace` persistence.
 - Review run retry, cancellation, superseding, timeout, and lifecycle state.
-- OpenHands session start/sync/cancel.
+- pi-agent session start/sync/cancel and human steering.
 - Review result schema validation and fingerprint generation.
 - Summary-only fallback for findings that cannot be line-commented.
 
@@ -154,7 +155,7 @@ the payload is invalid or unauthenticated.
 | `pr_converted_to_draft` | `pull_request.converted_to_draft` | Draft flag changed to true | Draft support varies | If unsupported, leave unmapped. |
 | `pr_metadata_changed` | edited, labeled, assigned, unlabeled, unassigned | title/label/assignee/target branch update | title/reviewer/status metadata updates | Do not create review runs by default. |
 | `pr_comment_context` | issue comment, review, review comment on PR | MR note/discussion | PR thread/comment | Context only unless bot is mentioned. |
-| `agent_mention` | PR comment/review mentions bot | MR note mentions bot | PR thread/comment mentions bot | Requires provider-specific bot identity matching. |
+| `agent_command` | PR comment/review mentions bot with a command | MR note mentions bot | PR thread/comment mentions bot | Requires provider-specific bot identity and actor-policy matching. |
 
 Review runs should be created for `pr_opened`, `pr_updated`, `pr_reopened`, and
 `pr_ready_for_review` by default. Metadata-only and comment-context events should

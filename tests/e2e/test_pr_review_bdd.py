@@ -23,7 +23,7 @@ from review_orchestrator.review_results import ChangedFile, parse_review_result
 from review_orchestrator.worker import acquire_next_review_run
 
 from .helpers import (
-    FakeOpenHandsClient,
+    FakePiAgentClient,
     create_temp_pull_request_repo,
     given_github_pr_webhook,
     load_json_fixture,
@@ -37,12 +37,12 @@ def test_p0_pr_opened_runs_review_and_reconciles_published_state(
 ) -> None:
     repo = create_temp_pull_request_repo(tmp_path)
     payload = given_github_pr_webhook("github_pr_opened.json", repo)
-    raw_result = load_json_fixture("openhands_review_result.json")
+    raw_result = load_json_fixture("pi_agent_review_result.json")
     changed_files = load_json_fixture("changed_files.json")
-    fake_openhands = FakeOpenHandsClient()
+    fake_pi_agent = FakePiAgentClient()
 
     with make_e2e_client(tmp_path) as client:
-        client.app.state.openhands_client = fake_openhands
+        client.app.state.pi_agent_client = fake_pi_agent
 
         accepted = when_github_delivers(
             client,
@@ -132,11 +132,11 @@ def test_p0_pr_opened_runs_review_and_reconciles_published_state(
     ] == "src/config.py"
 
     assert (
-        fake_openhands.started_inputs[0].workspace_path
+        fake_pi_agent.started_inputs[0].workspace_path
         == workspace["workspace_path"]
     )
-    assert fake_openhands.started_inputs[0].base_sha == repo.base_sha
-    assert fake_openhands.started_inputs[0].head_sha == repo.head_sha
+    assert fake_pi_agent.started_inputs[0].base_sha == repo.base_sha
+    assert fake_pi_agent.started_inputs[0].head_sha == repo.head_sha
 
     assert published["context_latest_review_run_id"] == accepted["review_run_id"]
     assert published["delivery_count"] == 1

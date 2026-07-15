@@ -1,7 +1,7 @@
 # Review Orchestrator
 
 MVP backend for PR review orchestration. The service owns webhook ingestion,
-review-run lifecycle state, and integration points for OpenHands-backed review
+review-run lifecycle state, isolated workspaces, and pi-agent-backed review
 sessions.
 
 ## Stack
@@ -12,6 +12,8 @@ sessions.
 - SQLAlchemy async
 - SQLite for local development
 - PostgreSQL via asyncpg for production
+- `@earendil-works/pi-coding-agent` 0.80.7 runtime
+- Node.js 22 for the isolated agent service
 - ruff
 - pytest
 
@@ -20,16 +22,25 @@ sessions.
 ```bash
 uv sync
 cp .env.example .env
-uv run uvicorn review_orchestrator.main:app --reload
+uv run uvicorn review_orchestrator.presentation.main:app --reload
 uv run ruff check .
 uv run pytest
+uv run pytest --cov=review_orchestrator --cov-branch
+npm --prefix pi-agent-runtime ci
+npm --prefix pi-agent-runtime test
+npm --prefix pi-agent-runtime audit --audit-level=high
 ```
 
 The BDD/E2E scenario matrix and local-only fixture strategy are documented in
 [`docs/bdd-e2e.md`](docs/bdd-e2e.md). The default E2E tests use SQLite, a
-temporary git repository, fixture GitHub payloads, and a fake OpenHands client;
-optional real PostgreSQL/OpenHands/GitHub integration tests are intentionally not
+temporary git repository, fixture GitHub payloads, and a fake pi-agent client;
+optional real PostgreSQL/LLM/GitHub integration tests are intentionally not
 part of the default command.
+
+The responsibility-oriented source layout and legacy import compatibility
+policy are documented in [`docs/architecture_zh.md`](docs/architecture_zh.md).
+The pre-refactor coverage findings and final verification evidence are in
+[`docs/test-coverage-audit_zh.md`](docs/test-coverage-audit_zh.md).
 
 Deployment guidance for local, test, and production environments is documented
 in [`docs/deployment.md`](docs/deployment.md).
@@ -70,10 +81,16 @@ locally:
 - `GET /api/v1/review-runs/{review_run_id}`
 - `POST /api/v1/review-runs/{review_run_id}/session/start`
 - `POST /api/v1/review-runs/{review_run_id}/session/sync`
+- `POST /api/v1/review-runs/{review_run_id}/session/messages`
 - `POST /api/v1/review-runs/{review_run_id}/session/cancel`
 - `POST /api/v1/review-runs/{review_run_id}/result`
 - `POST /api/v1/review-runs/{review_run_id}/retry`
 - `POST /api/v1/review-runs/{review_run_id}/cancel`
+- `GET /api/v1/agent-tasks/{agent_task_id}/agent-session`
+- `POST /api/v1/agent-tasks/{agent_task_id}/cancel`
+- `POST /api/v1/agent-tasks/{agent_task_id}/retry`
+- `GET /api/v1/observability/review-runs/{review_run_id}/agent-session`
+- `GET /api/v1/observability/agent-sessions/{agent_session_id}`
 
 The operator observability API contract and shared redaction rules are defined
 in [`docs/observability-api.md`](docs/observability-api.md).
@@ -175,35 +192,67 @@ stored in the database with conservative defaults:
 - `auto_retry_invalid_agent_result = false`
 - `auto_retry_infra_failure = true`
 - `default_review_skill = code-review`
-- `default_review_profile = default`
 
 Workspace storage defaults:
 
 - `WORKSPACE_ROOT=./.workspaces`
 - `GIT_CACHE_ROOT=./.git-cache`
 
-OpenHands App Server integration:
+pi-agent runtime integration:
 
-- `OPENHANDS_BASE_URL=http://localhost:3000`
-- self-host OpenHands UI: `http://127.0.0.1:${OPENHANDS_FRONTEND_PORT:-3000}`
-- `OPENHANDS_API_TOKEN=optional-service-token`
-- `OPENHANDS_TIMEOUT_SECONDS=30`
+- `PI_AGENT_BASE_URL=http://localhost:3210`
+- `PI_AGENT_RUNTIME_TOKEN=strong-service-token`
+- `PI_AGENT_PROVIDER=openai`
+- `PI_AGENT_MODEL=gpt-5.4`
+- `PI_AGENT_THINKING_LEVEL=high`
+- `PI_AGENT_REVIEW_AGENT=code-review`
+- `AGENT_COMMAND_AGENT=pr-assistant`
+- `PI_AGENT_TIMEOUT_SECONDS=30`
 
-### OpenHands Integration
+### pi-agent Integration
 
-The Review Orchestrator owns `review_run` state. OpenHands is treated as the
-execution backend for a single review session:
+The Review Orchestrator owns Task state. A separate thin Runtime embeds the
+pi-agent SDK behind installed Agent definitions:
 
 1. `session/start` converts an existing `review_run` plus a workspace path into a
-   small `ReviewSkillInput` commit-range reference and creates an OpenHands app
-   conversation.
-2. `session/sync` polls OpenHands start-task/conversation state and maps hard
-   failures back to the review run.
-3. `session/cancel` marks the run cancelled and best-effort deletes the
-   OpenHands conversation.
-4. `result` accepts the final OpenHands JSON output, validates it with
-   `review_orchestrator.review_results`, stores the summary, and marks the run
-   completed.
+   small `ReviewSkillInput` commit-range reference and creates a persisted
+   pi-agent session.
+2. The control plane sends only `agent_id + repository_skills + task_type`.
+   Runtime resolves the installed Agent base, Repository Skills and named Task
+   Type preset into a frozen `resolved_preset`; requests cannot override model,
+   Base URL, profile, Tool implementations, or Agent version.
+3. Each run receives a writable Task Workspace and a disposable dependency
+   overlay cloned from builtin/prebuilt content. Skills may be installed with
+   npm, while Tools remain independently and explicitly configured.
+4. `session/cancel` marks the run cancelled and aborts the pi-agent session.
+5. The worker collects the structured `submit_review` result, validates it with
+   `review_orchestrator.review_results`, permanently archives the redacted pi
+   Session plus Task metadata, and writes Provider delivery to the Outbox.
+
+The production Runtime includes `code-review` and `pr-assistant`; additional
+definitions are installed code, not dynamically version-routed request data.
+Custom model definitions can be placed in
+`${PI_AGENT_CONFIG_PATH}/models.json`; see
+`pi-agent-runtime/config/models.example.json`.
+
+### `@bot` message commands
+
+On a GitHub PR, a trusted `OWNER`, `MEMBER`, or `COLLABORATOR` can mention the
+configured `REVIEW_BOT_LOGIN` in an issue comment, submitted review, or review
+comment. The text after the mention becomes a message command rather than an
+automatic review.
+
+The command path persists an `AgentTask`, creates one task-specific placeholder
+comment, prepares the same head-SHA-isolated workspace used by reviews, and
+starts pi-agent in `instruction` mode with the `pr-assistant` skill. A validated
+`submit_task_result` answer replaces that exact placeholder. Failures,
+cancellation, soft timeout, and hard timeout also update the same comment.
+
+Commands for one PR execute in Task priority/resource order. A new command receives a bounded history of
+the six most recent successful command/answer exchanges. It never creates a
+`ReviewRun` or `Finding`. The Agent can read, write, build, and test inside its
+Task Workspace, but does not receive Provider/Git/Runtime/model credentials and
+cannot publish comments directly.
 
 ### Workspace MVP Contract
 
@@ -269,7 +318,7 @@ github:{repo_hash}:pr:{pr_number}:head:{head_sha}
 
 ## Review Skill Contract
 
-The OpenHands review skill receives only a small commit-range reference:
+The pi-agent review skill receives only a small commit-range reference:
 
 ```json
 {
@@ -310,8 +359,8 @@ orchestrator instead of trusting model-provided IDs.
 
 ### Review Result Parser
 
-`parse_review_result` is an internal contract used by the orchestrator after an
-OpenHands session finishes. It accepts either a JSON string or decoded object and
+`parse_review_result` is an internal contract used by the orchestrator after a
+pi-agent session finishes. It accepts either a JSON string or decoded object and
 returns:
 
 ```json

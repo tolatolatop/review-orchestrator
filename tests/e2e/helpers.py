@@ -13,47 +13,38 @@ from fastapi.testclient import TestClient
 
 from review_orchestrator.config import Settings
 from review_orchestrator.main import create_app
-from review_orchestrator.openhands import (
-    OpenHandsConversation,
-    OpenHandsStartTask,
-    OpenHandsStartTaskStatus,
-)
+from review_orchestrator.pi_agent import PiAgentSession
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "fixtures"
 WEBHOOK_SECRET = "e2e-secret"
 
 
-class FakeOpenHandsClient:
+class FakePiAgentClient:
     def __init__(self) -> None:
         self.started_inputs: list[Any] = []
-        self.deleted_conversation_ids: list[str] = []
-        self.start_task = OpenHandsStartTask(
-            id="task-e2e-1",
-            status=OpenHandsStartTaskStatus.ready,
-            app_conversation_id="conversation-e2e-1",
-            sandbox_id="sandbox-e2e-1",
-            agent_server_url="http://openhands.test/agent",
-        )
-        self.conversation = OpenHandsConversation(
-            id="conversation-e2e-1",
-            sandbox_status="RUNNING",
-            execution_status="FINISHED",
+        self.cancelled_session_ids: list[str] = []
+        self.session = PiAgentSession(
+            id="session-e2e-1",
+            status="running",
+            stage="analyzing",
+            provider="openai",
+            model="gpt-5.4",
+            thinking_level="high",
         )
 
-    async def start_conversation(self, review_input: Any) -> OpenHandsStartTask:
+    async def start_session(self, review_input: Any, **kwargs: Any) -> PiAgentSession:
         self.started_inputs.append(review_input)
-        return self.start_task
+        return self.session
 
-    async def get_start_task(self, task_id: str) -> OpenHandsStartTask:
-        assert task_id == self.start_task.id
-        return self.start_task
+    async def get_session(self, session_id: str) -> PiAgentSession:
+        assert session_id == self.session.id
+        return self.session
 
-    async def get_conversation(self, conversation_id: str) -> OpenHandsConversation:
-        assert conversation_id == self.conversation.id
-        return self.conversation
-
-    async def delete_conversation(self, conversation_id: str) -> None:
-        self.deleted_conversation_ids.append(conversation_id)
+    async def cancel_session(self, session_id: str) -> PiAgentSession:
+        self.cancelled_session_ids.append(session_id)
+        return self.session.model_copy(
+            update={"status": "cancelled", "stage": "cancelled"}
+        )
 
 
 @dataclass(frozen=True)

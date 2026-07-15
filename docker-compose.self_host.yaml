@@ -14,81 +14,69 @@ services:
       retries: 5
     restart: unless-stopped
 
-  openhands-db-init:
-    image: postgres:16-alpine
+  pi-agent-runtime:
+    build:
+      context: ./pi-agent-runtime
+    image: review-orchestrator-pi-agent:0.80.7
     environment:
-      PGHOST: postgres
-      PGPORT: 5432
-      PGDATABASE: ${POSTGRES_DB:-review_orchestrator}
-      PGUSER: ${POSTGRES_USER:-review}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-review}
-      OPENHANDS_DB_NAME: ${OPENHANDS_DB_NAME:-openhands}
-      OPENHANDS_DB_USER: ${OPENHANDS_DB_USER:-openhands}
-      OPENHANDS_DB_PASSWORD: ${OPENHANDS_DB_PASSWORD:-openhands}
-    volumes:
-      - ./deploy/postgres/provision-openhands-db.sh:/usr/local/bin/provision-openhands-db:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
-    entrypoint: ["/bin/sh", "/usr/local/bin/provision-openhands-db"]
-    restart: "no"
-
-  openhands-db-migrate:
-    image: ${OPENHANDS_IMAGE:-docker.openhands.dev/openhands/openhands:1.8}
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: ${OPENHANDS_DB_NAME:-openhands}
-      DB_USER: ${OPENHANDS_DB_USER:-openhands}
-      DB_PASS: ${OPENHANDS_DB_PASSWORD:-openhands}
-    volumes:
-      - openhands_state:/.openhands
-      - ./deploy/openhands/migrate_sqlite_to_postgres.py:/opt/openhands/migrate_sqlite_to_postgres.py:ro
-    depends_on:
-      openhands-db-init:
-        condition: service_completed_successfully
-    entrypoint:
-      [
-        "/app/.venv/bin/python",
-        "/opt/openhands/migrate_sqlite_to_postgres.py",
-      ]
-    restart: "no"
-
-  openhands:
-    image: ${OPENHANDS_IMAGE:-docker.openhands.dev/openhands/openhands:1.8}
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      SANDBOX_RUNTIME_CONTAINER_IMAGE: ${SANDBOX_RUNTIME_CONTAINER_IMAGE:-docker.all-hands.dev/all-hands-ai/runtime:latest}
-      SANDBOX_HOST_PORT: ${SANDBOX_HOST_PORT:-3000}
-      OH_SANDBOX_KIND: DockerSandboxServiceInjector
-      OH_SANDBOX_HOST_PORT: ${SANDBOX_HOST_PORT:-3000}
-      OH_SANDBOX_EXTRA_HOSTS: ${OH_SANDBOX_EXTRA_HOSTS:-{"host.docker.internal":"192.168.176.10"}}
-      LOG_ALL_EVENTS: ${OPENHANDS_LOG_ALL_EVENTS:-false}
-      OH_WEB_URL: ${OH_WEB_URL:-http://host.docker.internal:3000}
-      DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: ${OPENHANDS_DB_NAME:-openhands}
-      DB_USER: ${OPENHANDS_DB_USER:-openhands}
-      DB_PASS: ${OPENHANDS_DB_PASSWORD:-openhands}
+      PI_AGENT_HOST: 0.0.0.0
+      PI_AGENT_PORT: 3210
+      PI_AGENT_STATE_ROOT: /var/lib/pi-agent
+      PI_AGENT_TASK_ENVIRONMENT_ROOT: /var/lib/pi-agent-task
+      PI_AGENT_WORKSPACE_ROOT: /var/lib/review-orchestrator/workspaces
+      PI_AGENT_ENVIRONMENT_TEMPLATE_ROOT: /opt/pi-agent/environment-template
+      PI_AGENT_TASK_UID_MIN: 20000
+      PI_AGENT_TASK_UID_MAX: 60000
+      PI_AGENT_TASK_GID: 65532
+      PI_AGENT_WORKSPACE_OWNER_UID: 1000
+      PI_AGENT_WORKSPACE_OWNER_GID: 1000
+      PI_AGENT_SKILLS_ROOT: /opt/pi-agent/skills
+      PI_AGENT_MODELS_FILE: /etc/pi-agent/models.json
+      PI_AGENT_RUNTIME_TOKEN: ${PI_AGENT_RUNTIME_TOKEN:-}
+      PI_AGENT_PROVIDER: ${PI_AGENT_PROVIDER:-openai}
+      PI_AGENT_MODEL: ${PI_AGENT_MODEL:-gpt-5.4}
+      PI_AGENT_THINKING_LEVEL: ${PI_AGENT_THINKING_LEVEL:-high}
+      PI_AGENT_MODEL_BASE_URL: ${PI_AGENT_MODEL_BASE_URL:-}
+      PI_AGENT_LLM_API_KEY: ${PI_AGENT_LLM_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_GENERATIVE_AI_API_KEY: ${GOOGLE_GENERATIVE_AI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
     ports:
-      - "127.0.0.1:${OPENHANDS_FRONTEND_PORT:-${OPENHANDS_PORT:-3000}}:3000"
-    networks:
-      default:
-        ipv4_address: 192.168.176.10
+      - "127.0.0.1:${PI_AGENT_RUNTIME_PORT:-3210}:3210"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - openhands_state:/.openhands
-      - review_orchestrator_data:/var/lib/review-orchestrator
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    depends_on:
-      openhands-db-migrate:
-        condition: service_completed_successfully
+      - pi_agent_state:/var/lib/pi-agent
+      - review_workspace:/var/lib/review-orchestrator/workspaces
+      - ${PI_AGENT_SKILLS_PATH:-./pi-agent-runtime/skills}:/opt/pi-agent/skills:ro
+      - ${PI_AGENT_CONFIG_PATH:-./pi-agent-runtime/config}:/etc/pi-agent:ro
+      - ${PI_AGENT_ENVIRONMENT_TEMPLATE_PATH:-./pi-agent-runtime/environment-template}:/opt/pi-agent/environment-template:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+      - /var/lib/pi-agent-task:size=1g,mode=0755
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3210/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
 
   review-orchestrator:
@@ -105,19 +93,32 @@ services:
       PORT: 8000
       WORKSPACE_ROOT: /var/lib/review-orchestrator/workspaces
       GIT_CACHE_ROOT: /var/lib/review-orchestrator/git-cache
-      OPENHANDS_BASE_URL: http://openhands:3000
+      PI_AGENT_BASE_URL: http://pi-agent-runtime:3210
+      PI_AGENT_RUNTIME_TOKEN: ${PI_AGENT_RUNTIME_TOKEN:-}
+      PI_AGENT_REVIEW_AGENT: ${PI_AGENT_REVIEW_AGENT:-code-review}
+      PI_AGENT_REVIEW_SKILL: ${PI_AGENT_REVIEW_SKILL:-code-review}
+      AGENT_COMMAND_AGENT: ${AGENT_COMMAND_AGENT:-pr-assistant}
+      AGENT_COMMAND_ENABLED: ${AGENT_COMMAND_ENABLED:-true}
+      AGENT_COMMAND_SKILL: ${AGENT_COMMAND_SKILL:-pr-assistant}
+      AGENT_TASK_SOFT_TIMEOUT_SECONDS: ${AGENT_TASK_SOFT_TIMEOUT_SECONDS:-120}
+      AGENT_TASK_TIMEOUT_SECONDS: ${AGENT_TASK_TIMEOUT_SECONDS:-600}
+      AGENT_TASK_MAX_HISTORY_TURNS: ${AGENT_TASK_MAX_HISTORY_TURNS:-6}
+      AGENT_TASK_MAX_HISTORY_CHARS: ${AGENT_TASK_MAX_HISTORY_CHARS:-24000}
+      AGENT_TASK_ALLOWED_ASSOCIATIONS: ${AGENT_TASK_ALLOWED_ASSOCIATIONS:-OWNER,MEMBER,COLLABORATOR}
+      AGENT_TASK_MAX_COMMAND_CHARS: ${AGENT_TASK_MAX_COMMAND_CHARS:-8000}
     expose:
       - "8000"
     ports:
       - "127.0.0.1:${REVIEW_LOCAL_PORT:-18000}:8000"
     volumes:
       - review_orchestrator_data:/var/lib/review-orchestrator
+      - review_workspace:/var/lib/review-orchestrator/workspaces
       - ./secrets:/run/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
-      openhands:
-        condition: service_started
+      pi-agent-runtime:
+        condition: service_healthy
     healthcheck:
       test:
         [
@@ -145,17 +146,30 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-review}:${POSTGRES_PASSWORD:-review}@postgres:5432/${POSTGRES_DB:-review_orchestrator}
       WORKSPACE_ROOT: /var/lib/review-orchestrator/workspaces
       GIT_CACHE_ROOT: /var/lib/review-orchestrator/git-cache
-      OPENHANDS_BASE_URL: http://openhands:3000
+      PI_AGENT_BASE_URL: http://pi-agent-runtime:3210
+      PI_AGENT_RUNTIME_TOKEN: ${PI_AGENT_RUNTIME_TOKEN:-}
+      PI_AGENT_REVIEW_AGENT: ${PI_AGENT_REVIEW_AGENT:-code-review}
+      PI_AGENT_REVIEW_SKILL: ${PI_AGENT_REVIEW_SKILL:-code-review}
+      AGENT_COMMAND_AGENT: ${AGENT_COMMAND_AGENT:-pr-assistant}
+      AGENT_COMMAND_ENABLED: ${AGENT_COMMAND_ENABLED:-true}
+      AGENT_COMMAND_SKILL: ${AGENT_COMMAND_SKILL:-pr-assistant}
+      AGENT_TASK_SOFT_TIMEOUT_SECONDS: ${AGENT_TASK_SOFT_TIMEOUT_SECONDS:-120}
+      AGENT_TASK_TIMEOUT_SECONDS: ${AGENT_TASK_TIMEOUT_SECONDS:-600}
+      AGENT_TASK_MAX_HISTORY_TURNS: ${AGENT_TASK_MAX_HISTORY_TURNS:-6}
+      AGENT_TASK_MAX_HISTORY_CHARS: ${AGENT_TASK_MAX_HISTORY_CHARS:-24000}
+      AGENT_TASK_ALLOWED_ASSOCIATIONS: ${AGENT_TASK_ALLOWED_ASSOCIATIONS:-OWNER,MEMBER,COLLABORATOR}
+      AGENT_TASK_MAX_COMMAND_CHARS: ${AGENT_TASK_MAX_COMMAND_CHARS:-8000}
       WORKER_POLL_INTERVAL_SECONDS: ${WORKER_POLL_INTERVAL_SECONDS:-5}
       WORKER_LOCK_SECONDS: ${WORKER_LOCK_SECONDS:-300}
     volumes:
       - review_orchestrator_data:/var/lib/review-orchestrator
+      - review_workspace:/var/lib/review-orchestrator/workspaces
       - ./secrets:/run/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
-      openhands:
-        condition: service_started
+      pi-agent-runtime:
+        condition: service_healthy
     restart: unless-stopped
 
   nginx:
@@ -190,11 +204,6 @@ services:
 
 volumes:
   postgres_data:
-  openhands_state:
+  pi_agent_state:
   review_orchestrator_data:
-
-networks:
-  default:
-    ipam:
-      config:
-        - subnet: 192.168.176.0/24
+  review_workspace:

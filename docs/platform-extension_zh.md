@@ -6,7 +6,7 @@ provider adapter 路由平台行为。本文说明如何在不破坏现有 provi
 扩展到 Azure DevOps、Bitbucket、GitCode 或其他代码托管平台。
 
 目标形态是在外部平台行为周围建立一个小而清晰的 provider adapter 边界。Review
-run 生命周期、OpenHands session 编排、workspace 准备、结果解析、finding 对账和
+run 生命周期、pi-agent session 编排、workspace 准备、结果解析、finding 对账和
 重试策略应继续保持 provider-agnostic。
 
 ## 当前 GitHub MVP
@@ -21,8 +21,8 @@ GitHub 支持当前覆盖：
 - 对 PR `opened`、`synchronize`、`reopened` 和 `ready_for_review` 创建
   review run。
 - 对受支持的 pull request 状态和元数据变更更新 PR context。
-- 当 PR comment 或 review 中提到配置的 review bot login 时，创建
-  mention-trigger agent task。
+- 当 PR comment 或 review 中提到配置的 review bot login 时，创建直接回答该消息的
+  message-command AgentTask；它不会创建 ReviewRun。
 - 通过 `(provider, delivery_id)` 实现 provider event 幂等。
 - 对 PR context、review run、comment ref、workspace 和 review config 使用
   provider 维度隔离存储。
@@ -64,7 +64,7 @@ Orchestrator core 负责共享行为：
 - `PullRequestContext`、`ReviewRun`、`Finding`、`ReviewCommentRef`、
   `ReviewConfig` 和 `Workspace` 持久化。
 - Review run retry、cancel、supersede、timeout 和生命周期状态。
-- OpenHands session start/sync/cancel。
+- pi-agent session start/sync/cancel 与人工输入。
 - Review result schema 校验和 fingerprint 生成。
 - 对无法发布为 line comment 的 finding 执行 summary-only 降级。
 
@@ -149,7 +149,7 @@ client 或 SDK 失败时，adapter 将其转换成带有 `provider` 和 `operati
 | `pr_converted_to_draft` | `pull_request.converted_to_draft` | Draft flag 变为 true | Draft 支持因平台而异 | 不支持时保持 unmapped。 |
 | `pr_metadata_changed` | edited、labeled、assigned、unlabeled、unassigned | title、label、assignee、target branch 更新 | title、reviewer、status metadata 更新 | 默认不创建 review run。 |
 | `pr_comment_context` | PR 上的 issue comment、review、review comment | MR note/discussion | PR thread/comment | 仅作为上下文，除非提到 bot。 |
-| `agent_mention` | PR comment/review 提到 bot | MR note 提到 bot | PR thread/comment 提到 bot | 需要 provider-specific bot identity 匹配。 |
+| `agent_command` | PR comment/review 提到 bot 并附带指令 | MR note 提到 bot | PR thread/comment 提到 bot | 需要 provider-specific bot identity 与 actor policy 匹配。 |
 
 默认只应对 `pr_opened`、`pr_updated`、`pr_reopened` 和
 `pr_ready_for_review` 创建 review run。Metadata-only 和 comment-context 事件可以

@@ -1,24 +1,85 @@
 from pathlib import Path
 
 
-def test_openhands_state_uses_the_configured_file_store_path() -> None:
-    compose = (
-        Path(__file__).parents[1] / "docker-compose.self_host.yaml"
-    ).read_text()
+def root_files() -> tuple[str, str]:
+    root = Path(__file__).parents[1]
+    return (
+        (root / "docker-compose.self_host.yaml").read_text(),
+        (root / ".env.example").read_text(),
+    )
 
-    assert "- openhands_state:/.openhands\n" in compose
-    assert "- openhands_state:/.openhands-state\n" not in compose
-    assert ("SANDBOX_HOST_PORT: ${SANDBOX_HOST_PORT:-3000}") in compose
-    assert "OH_SANDBOX_KIND: DockerSandboxServiceInjector" in compose
-    assert '"host.docker.internal":"192.168.176.10"' in compose
-    assert "ipv4_address: 192.168.176.10" in compose
-    assert "subnet: 192.168.176.0/24" in compose
+
+def test_pi_agent_runtime_is_isolated_with_a_writable_task_workspace() -> None:
+    compose, _ = root_files()
+    runtime = compose.split("  pi-agent-runtime:", 1)[1].split(
+        "  review-orchestrator:", 1
+    )[0]
+
+    assert "review-orchestrator-pi-agent:0.80.7" in runtime
+    assert "review_workspace:/var/lib/review-orchestrator/workspaces" in runtime
+    assert "review_orchestrator_data:/var/lib/review-orchestrator" not in runtime
+    assert "pi_agent_state:/var/lib/pi-agent" in runtime
+    assert "read_only: true" in runtime
+    assert "cap_drop:\n      - ALL" in runtime
+    assert "cap_add:" in runtime
+    assert "- SETUID" in runtime
+    assert "PI_AGENT_TASK_UID_MIN: 20000" in runtime
+    assert "PI_AGENT_TASK_UID_MAX: 60000" in runtime
+    assert "PI_AGENT_TASK_ENVIRONMENT_ROOT: /var/lib/pi-agent-task" in runtime
+    assert "no-new-privileges:true" in runtime
+    assert "/var/run/docker.sock" not in runtime
+    assert "/run/secrets" not in runtime
+    assert "GITHUB_" not in runtime
+    assert "POSTGRES_" not in runtime
+
+
+def test_pi_agent_runtime_supports_configurable_models_and_skills() -> None:
+    compose, example_env = root_files()
+
+    assert "PI_AGENT_PROVIDER: ${PI_AGENT_PROVIDER:-openai}" in compose
+    assert "PI_AGENT_MODEL: ${PI_AGENT_MODEL:-gpt-5.4}" in compose
+    assert "PI_AGENT_THINKING_LEVEL: ${PI_AGENT_THINKING_LEVEL:-high}" in compose
+    assert (
+        "${PI_AGENT_SKILLS_PATH:-./pi-agent-runtime/skills}:"
+        "/opt/pi-agent/skills:ro"
+    ) in compose
+    assert (
+        "${PI_AGENT_CONFIG_PATH:-./pi-agent-runtime/config}:"
+        "/etc/pi-agent:ro"
+    ) in compose
+    assert "PI_AGENT_PROVIDER=openai" in example_env
+    assert "PI_AGENT_SKILLS_PATH=./pi-agent-runtime/skills" in example_env
+    assert "AGENT_COMMAND_SKILL=pr-assistant" in example_env
+    assert "PI_AGENT_ENVIRONMENT_TEMPLATE_ROOT:" in compose
+    assert "PI_AGENT_ENVIRONMENT_TEMPLATE_PATH=" in example_env
+
+
+def test_worker_receives_message_command_timeout_and_history_configuration() -> None:
+    compose, example_env = root_files()
+    worker = compose.split("  review-orchestrator-worker:", 1)[1].split(
+        "  nginx:", 1
+    )[0]
+
+    assert "AGENT_TASK_SOFT_TIMEOUT_SECONDS:" in worker
+    assert "AGENT_TASK_TIMEOUT_SECONDS:" in worker
+    assert "AGENT_TASK_MAX_HISTORY_TURNS:" in worker
+    assert "AGENT_TASK_MAX_HISTORY_CHARS:" in worker
+    assert "AGENT_TASK_ALLOWED_ASSOCIATIONS:" in worker
+    assert "AGENT_TASK_SOFT_TIMEOUT_SECONDS=120" in example_env
+    assert "AGENT_TASK_TIMEOUT_SECONDS=600" in example_env
+    assert "AGENT_TASK_MAX_HISTORY_TURNS=6" in example_env
+    assert "AGENT_TASK_MAX_HISTORY_CHARS=24000" in example_env
+
+
+def test_pi_agent_runtime_defaults_to_loopback_port_3210() -> None:
+    compose, example_env = root_files()
+
+    assert '"127.0.0.1:${PI_AGENT_RUNTIME_PORT:-3210}:3210"' in compose
+    assert "PI_AGENT_RUNTIME_PORT=3210" in example_env
 
 
 def test_orchestrator_has_a_loopback_only_tokenless_local_port() -> None:
-    root = Path(__file__).parents[1]
-    compose = (root / "docker-compose.self_host.yaml").read_text()
-    example_env = (root / ".env.example").read_text()
+    compose, example_env = root_files()
 
     assert '"127.0.0.1:${REVIEW_LOCAL_PORT:-18000}:8000"' in compose
     assert '"${REVIEW_LOCAL_PORT:-18000}:8000"' not in compose
@@ -26,9 +87,7 @@ def test_orchestrator_has_a_loopback_only_tokenless_local_port() -> None:
 
 
 def test_nginx_token_gate_defaults_on_and_allows_an_empty_disabled_token() -> None:
-    root = Path(__file__).parents[1]
-    compose = (root / "docker-compose.self_host.yaml").read_text()
-    example_env = (root / ".env.example").read_text()
+    compose, example_env = root_files()
 
     assert (
         'REVIEW_PROXY_TOKEN_ENABLED: "${REVIEW_PROXY_TOKEN_ENABLED:-true}"'
@@ -39,48 +98,20 @@ def test_nginx_token_gate_defaults_on_and_allows_an_empty_disabled_token() -> No
     assert "REVIEW_PROXY_TOKEN_ENABLED=true" in example_env
 
 
-def test_openhands_uses_a_separate_provisioned_postgres_database() -> None:
-    root = Path(__file__).parents[1]
-    compose = (root / "docker-compose.self_host.yaml").read_text()
-    example_env = (root / ".env.example").read_text()
+def test_openhands_services_and_privileged_runtime_are_removed() -> None:
+    compose, example_env = root_files()
 
-    assert "openhands-db-init:" in compose
-    assert "openhands-db-migrate:" in compose
-    assert "DB_HOST: postgres" in compose
-    assert "DB_NAME: ${OPENHANDS_DB_NAME:-openhands}" in compose
-    assert "DB_USER: ${OPENHANDS_DB_USER:-openhands}" in compose
-    assert "DB_PASS: ${OPENHANDS_DB_PASSWORD:-openhands}" in compose
-    assert "OPENHANDS_IMAGE=docker.openhands.dev/openhands/openhands:1.8" in example_env
-    assert (
-        "openhands-db-migrate:\n        condition: service_completed_successfully"
-        in compose
-    )
-
-
-def test_openhands_migration_is_fail_closed_and_keeps_a_backup() -> None:
-    migration = (
-        Path(__file__).parents[1]
-        / "deploy"
-        / "openhands"
-        / "migrate_sqlite_to_postgres.py"
-    ).read_text()
-
-    assert 'f".db.pre-postgres-{_sqlite_digest(temporary)}.bak"' in migration
-    assert "CREATE TYPE eventcallbackstatus" in migration
-    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS" in migration
-    assert "Refusing conflicting migration" in migration
-    assert "missing_keys = source_rows.keys() - target_rows.keys()" in migration
-    assert (
-        "with source_engine.connect() as source, target_engine.begin() as target"
-        in migration
-    )
+    assert "openhands:" not in compose.lower()
+    assert "OPENHANDS_" not in example_env
+    assert "DockerSandboxServiceInjector" not in compose
+    assert "/var/run/docker.sock" not in compose
 
 
 def test_github_app_private_key_is_mounted_only_into_orchestrator_services() -> None:
-    compose = (Path(__file__).parents[1] / "docker-compose.self_host.yaml").read_text()
+    compose, _ = root_files()
 
     assert compose.count("- ./secrets:/run/secrets:ro") == 2
-    openhands_section = compose.split("  openhands:", 1)[1].split(
+    runtime = compose.split("  pi-agent-runtime:", 1)[1].split(
         "  review-orchestrator:", 1
     )[0]
-    assert "/run/secrets" not in openhands_section
+    assert "/run/secrets" not in runtime

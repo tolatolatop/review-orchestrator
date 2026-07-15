@@ -8,6 +8,8 @@ from typing import Any
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from review_orchestrator.application.delivery import enqueue_delivery
+from review_orchestrator.application.scheduler import claim_next_task
 from review_orchestrator.config import Settings
 from review_orchestrator.main import create_app
 from review_orchestrator.models import (
@@ -18,47 +20,45 @@ from review_orchestrator.models import (
     ReviewCommentRef,
     ReviewRun,
     ReviewSession,
+    SessionArchive,
+    Task,
+    TaskAttempt,
     Workspace,
 )
-from review_orchestrator.openhands import (
-    OpenHandsConversation,
-    OpenHandsStartTask,
-    OpenHandsStartTaskStatus,
+from review_orchestrator.pi_agent import (
+    PiAgentSession,
 )
 
 
-class FakeOpenHandsClient:
+class FakePiAgentClient:
     def __init__(self) -> None:
         self.started_inputs: list[Any] = []
-        self.deleted_conversation_ids: list[str] = []
-        self.start_task = OpenHandsStartTask(
-            id="task-1",
-            status=OpenHandsStartTaskStatus.ready,
-            app_conversation_id="conversation-1",
-            sandbox_id="sandbox-1",
-            agent_server_url="http://agent-server",
-        )
-        self.conversation = OpenHandsConversation(
-            id="conversation-1",
-            sandbox_status="RUNNING",
-            execution_status="RUNNING",
+        self.started_options: list[dict[str, Any]] = []
+        self.cancelled_session_ids: list[str] = []
+        self.session = PiAgentSession(
+            id="session-1",
+            status="running",
+            stage="analyzing",
+            provider="openai",
+            model="gpt-5.4",
+            thinking_level="high",
         )
 
-    async def start_conversation(self, review_input: Any) -> OpenHandsStartTask:
+    async def start_session(self, review_input: Any, **kwargs: Any) -> PiAgentSession:
         self.started_inputs.append(review_input)
-        return self.start_task
+        self.started_options.append(kwargs)
+        return self.session
 
-    async def get_start_task(self, task_id: str) -> OpenHandsStartTask:
-        assert task_id == self.start_task.id
-        return self.start_task
+    async def get_session(self, session_id: str) -> PiAgentSession:
+        assert session_id == self.session.id
+        return self.session
 
-    async def get_conversation(self, conversation_id: str) -> OpenHandsConversation:
-        assert conversation_id == self.conversation.id
-        return self.conversation
-
-    async def delete_conversation(self, conversation_id: str) -> None:
-        self.deleted_conversation_ids.append(conversation_id)
-
+    async def cancel_session(self, session_id: str) -> PiAgentSession:
+        self.cancelled_session_ids.append(session_id)
+        self.session = self.session.model_copy(
+            update={"status": "cancelled", "stage": "cancelled"}
+        )
+        return self.session
 
 def make_client(tmp_path: Path) -> TestClient:
     settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db")
@@ -142,6 +142,230 @@ def test_observability_list_aliases_are_available(tmp_path: Path) -> None:
             assert response.json()["items"] == []
 
 
+def test_unified_task_scheduling_api_exposes_and_updates_review_task(
+    tmp_path: Path,
+) -> None:
+    with make_client(tmp_path) as client:
+        created = client.post(
+            "/api/v1/review-runs",
+            json={
+                "provider": "github",
+                "repo_full_name": "owner/repo",
+                "pull_request_number": 42,
+                "base_sha": "a" * 40,
+                "head_sha": "b" * 40,
+            },
+        )
+        assert created.status_code == 201
+        task_id = created.json()["id"]
+
+        listed = client.get(
+            "/api/v1/tasks",
+            params={"kind": "review", "queue": "manual-review"},
+        )
+        assert listed.status_code == 200
+        assert listed.json()["total"] == 1
+        task = listed.json()["items"][0]
+        assert task["id"] == task_id
+        assert task["capability_id"] == "code-review"
+        assert task["priority"] == 60
+        assert task["domain_metadata"]["repo_full_name"] == "owner/repo"
+
+        updated = client.patch(
+            f"/api/v1/tasks/{task_id}/scheduling",
+            json={
+                "queue": "interactive",
+                "priority": 90,
+                "resource_class": "agent-heavy",
+                "resource_context": {
+                    "repository": {
+                        "keys": ["github/owner/repo"],
+                        "units": 1,
+                    },
+                    "model": "gpt-5.4",
+                },
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["queue"] == "interactive"
+        assert updated.json()["priority"] == 90
+        assert updated.json()["effective_priority"] == 90
+        assert updated.json()["resource_class"] == "agent-heavy"
+        assert updated.json()["resource_context"]["model"] == "gpt-5.4"
+        assert updated.json()["resource_context"]["repository"] == {
+            "keys": ["github/owner/repo"],
+            "units": 1,
+        }
+
+
+async def _claim_task_for_api_test(client: TestClient) -> str:
+    async with client.app.state.session_factory() as session:
+        task = await claim_next_task(
+            session,
+            worker_id="api-test-worker",
+            task_kinds={"review"},
+        )
+        assert task is not None
+        return task.id
+
+
+def test_resource_pool_api_updates_counted_lock_capacity(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        created = client.post(
+            "/api/v1/review-runs",
+            json={
+                "provider": "github",
+                "repo_full_name": "owner/repo",
+                "pull_request_number": 42,
+                "head_sha": "b" * 40,
+            },
+        )
+        assert created.status_code == 201
+        client.portal.call(_claim_task_for_api_test, client)
+
+        pools = client.get("/api/v1/resource-pools")
+        assert pools.status_code == 200
+        concurrency_pool = next(
+            item
+            for item in pools.json()["items"]
+            if item["dimension"] == "concurrency"
+        )
+        assert concurrency_pool["capacity"] == 1
+        assert concurrency_pool["active_units"] == 1
+
+        updated = client.put(
+            f"/api/v1/resource-pools/{concurrency_pool['resource_key']}",
+            json={"capacity": 3},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["capacity"] == 3
+        assert updated.json()["active_units"] == 1
+
+        created_pool = client.put(
+            "/api/v1/resource-pools/custom:gpu-a",
+            json={"capacity": 2, "dimension": "custom"},
+        )
+        assert created_pool.status_code == 200
+        assert created_pool.json()["resource_key"] == "custom:gpu-a"
+        assert created_pool.json()["dimension"] == "custom"
+        assert created_pool.json()["capacity"] == 2
+        dimension_conflict = client.put(
+            "/api/v1/resource-pools/custom:gpu-a",
+            json={"capacity": 3, "dimension": "model"},
+        )
+        assert dimension_conflict.status_code == 409
+
+
+async def _enqueue_delivery_for_api_test(client: TestClient, task_id: str) -> str:
+    async with client.app.state.session_factory() as session:
+        task = await session.get(Task, task_id)
+        assert task is not None
+        delivery = await enqueue_delivery(
+            session,
+            task,
+            provider="github",
+            operation="review_summary",
+            destination_key=f"task:{task.id}:summary",
+            idempotency_key=f"task:{task.id}:summary:completed",
+            payload={"status_text": "completed"},
+        )
+        await session.commit()
+        return delivery.id
+
+
+def test_delivery_scheduling_api_lists_and_reschedules_outbox(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        created = client.post(
+            "/api/v1/review-runs",
+            json={
+                "provider": "github",
+                "repo_full_name": "owner/repo",
+                "pull_request_number": 42,
+                "head_sha": "b" * 40,
+            },
+        )
+        assert created.status_code == 201
+        task_id = created.json()["id"]
+        delivery_id = client.portal.call(
+            _enqueue_delivery_for_api_test,
+            client,
+            task_id,
+        )
+
+        listed = client.get(
+            "/api/v1/deliveries",
+            params={"task_id": task_id, "status": "queued"},
+        )
+        assert listed.status_code == 200
+        assert listed.json()["total"] == 1
+        assert listed.json()["items"][0]["id"] == delivery_id
+
+        updated = client.patch(
+            f"/api/v1/deliveries/{delivery_id}/scheduling",
+            json={"queue": "provider-urgent", "priority": 95, "max_attempts": 8},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["queue"] == "provider-urgent"
+        assert updated.json()["priority"] == 95
+        assert updated.json()["max_attempts"] == 8
+
+
+async def _archive_session_for_api_test(client: TestClient, task_id: str) -> str:
+    async with client.app.state.session_factory() as session:
+        attempt = TaskAttempt(
+            task_id=task_id,
+            attempt_no=1,
+            status="completed",
+            agent_run_id="agent-run-api",
+        )
+        session.add(attempt)
+        await session.flush()
+        archive = SessionArchive(
+            task_id=task_id,
+            task_attempt_id=attempt.id,
+            agent_run_id="agent-run-api",
+            session_json={"entries": [{"role": "assistant", "content": "done"}]},
+            task_metadata_json={"task": {"id": task_id}},
+        )
+        session.add(archive)
+        await session.commit()
+        return archive.id
+
+
+def test_session_archive_api_lists_permanent_task_sessions(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        created = client.post(
+            "/api/v1/review-runs",
+            json={
+                "provider": "github",
+                "repo_full_name": "owner/repo",
+                "pull_request_number": 42,
+                "head_sha": "b" * 40,
+            },
+        )
+        assert created.status_code == 201
+        task_id = created.json()["id"]
+        archive_id = client.portal.call(
+            _archive_session_for_api_test,
+            client,
+            task_id,
+        )
+
+        listed = client.get(f"/api/v1/tasks/{task_id}/sessions")
+        fetched = client.get(f"/api/v1/session-archives/{archive_id}")
+        alias = client.get(
+            f"/api/v1/observability/session-archives/{archive_id}"
+        )
+
+        assert listed.status_code == 200
+        assert [item["id"] for item in listed.json()["items"]] == [archive_id]
+        assert fetched.status_code == 200
+        assert fetched.json()["task_attempt"]["attempt_no"] == 1
+        assert fetched.json()["session"]["entries"][0]["content"] == "done"
+        assert alias.json() == fetched.json()
+        assert client.get("/api/v1/tasks/missing/sessions").status_code == 404
+
+
 def test_observability_detail_aliases_match_legacy_routes(tmp_path: Path) -> None:
     payload = pull_request_payload(action="opened")
     body = json_body(payload)
@@ -179,6 +403,12 @@ async def create_agent_task_record(
     input_json: dict | None = None,
     result_json: dict | None = None,
     error_message: str | None = None,
+    stage: str | None = None,
+    agent_session_id: str | None = None,
+    response_comment_id: str | None = None,
+    command_text: str | None = None,
+    source_author_login: str | None = None,
+    failure_code: str | None = None,
 ) -> AgentTask:
     created_at = created_at or datetime.now(UTC)
     session_factory = client.app.state.session_factory
@@ -236,6 +466,12 @@ async def create_agent_task_record(
             pull_request_number=pull_request_number,
             task_type=task_type,
             status=status,
+            stage=stage,
+            agent_session_id=agent_session_id,
+            response_comment_id=response_comment_id,
+            command_text=command_text,
+            source_author_login=source_author_login,
+            failure_code=failure_code,
             input_json=input_json,
             result_json=result_json,
             error_message=error_message,
@@ -246,6 +482,24 @@ async def create_agent_task_record(
         await session.commit()
         await session.refresh(task)
         return task
+
+
+class FakeTaskCommentGitHubClient:
+    def __init__(self) -> None:
+        self.updated: list[tuple[str, str]] = []
+
+    async def update_issue_comment(self, repo_full_name, comment_id, body):
+        del repo_full_name
+        self.updated.append((str(comment_id), body))
+        return str(comment_id)
+
+    async def list_issue_comments(self, repo_full_name, pull_request_number):
+        del repo_full_name, pull_request_number
+        return []
+
+    async def create_issue_comment(self, repo_full_name, pull_request_number, body):
+        del repo_full_name, pull_request_number, body
+        return "created-task-comment"
 
 
 def pull_request_payload(
@@ -569,7 +823,7 @@ def test_get_review_run_detail_exposes_operator_context(tmp_path: Path) -> None:
             review_run.status = "failed"
             review_run.stage = "publishing_summary"
             review_run.workspace_path = "/workspaces/example-repo/pr-42/bbbbbbb"
-            review_run.openhands_conversation_id = "conversation-1"
+            review_run.agent_session_id = "session-1"
             review_run.failure_code = "invalid_result"
             review_run.error = "invalid result\nraw provider payload"
             review_run.hard_timeout_emitted_at = datetime.now(UTC)
@@ -596,7 +850,7 @@ def test_get_review_run_detail_exposes_operator_context(tmp_path: Path) -> None:
             session.add(
                 ReviewSession(
                     review_run_id=review_run_id,
-                    openhands_conversation_id="conversation-1",
+                    agent_session_id="session-1",
                     status="failed",
                     skill_name="code-review",
                     profile_name="default",
@@ -850,6 +1104,57 @@ def test_closed_pull_request_cancels_existing_queued_review_run(tmp_path: Path) 
     assert review_run["failure_code"] == "pr_merged"
 
 
+def test_closed_pull_request_requests_active_message_task_cancellation(
+    tmp_path: Path,
+) -> None:
+    opened_payload = pull_request_payload(action="opened", head_sha="b" * 40)
+    opened_body = json_body(opened_payload)
+    command_payload = {
+        "action": "created",
+        "repository": {"full_name": "example/repo"},
+        "issue": {"number": 42, "pull_request": {"url": "https://api.github/pr"}},
+        "comment": {
+            "id": 777,
+            "body": "@review-agent explain this change",
+            "user": {"login": "alice", "type": "User"},
+            "author_association": "MEMBER",
+        },
+    }
+    command_body = json_body(command_payload)
+    closed_payload = pull_request_payload(
+        action="closed", merged=False, head_sha="b" * 40
+    )
+    closed_body = json_body(closed_payload)
+
+    with make_signed_client(tmp_path) as client:
+        client.post(
+            "/api/v1/webhooks/github",
+            content=opened_body,
+            headers=github_headers(opened_body, delivery_id="open-for-command"),
+        )
+        command = client.post(
+            "/api/v1/webhooks/github",
+            content=command_body,
+            headers=github_headers(
+                command_body,
+                delivery_id="message-before-close",
+                event="issue_comment",
+            ),
+        ).json()
+        client.post(
+            "/api/v1/webhooks/github",
+            content=closed_body,
+            headers=github_headers(closed_body, delivery_id="close-with-command"),
+        )
+        task = client.get(
+            f"/api/v1/agent-tasks/{command['agent_task_id']}"
+        ).json()
+
+    assert task["status"] == "running"
+    assert task["stage"] == "cancellation_pending"
+    assert task["failure_code"] == "pr_closed"
+
+
 def test_pr_issue_comment_is_context_only(tmp_path: Path) -> None:
     payload = {
         "action": "created",
@@ -878,7 +1183,13 @@ def test_pr_issue_comment_mention_creates_agent_task(tmp_path: Path) -> None:
         "action": "created",
         "repository": {"full_name": "example/repo"},
         "issue": {"number": 42, "pull_request": {"url": "https://api.github/pr"}},
-        "comment": {"id": 123, "body": "@review-agent should I re-review this?"},
+        "comment": {
+            "id": 123,
+            "html_url": "https://github.com/example/repo/pull/42#issuecomment-123",
+            "body": "@review-agent explain why this retry is safe",
+            "user": {"login": "alice", "type": "User"},
+            "author_association": "MEMBER",
+        },
     }
     body = json_body(payload)
 
@@ -888,12 +1199,134 @@ def test_pr_issue_comment_mention_creates_agent_task(tmp_path: Path) -> None:
             content=body,
             headers=github_headers(body, event="issue_comment"),
         )
+        task = client.get(
+            f"/api/v1/agent-tasks/{response.json()['agent_task_id']}"
+        ).json()
 
     assert response.status_code == 200
-    assert response.json()["internal_event"] == "agent_mention"
+    assert response.json()["internal_event"] == "agent_command"
     assert response.json()["status"] == "queued"
     assert response.json()["review_run_id"] is None
     assert response.json()["agent_task_id"] is not None
+    assert task["task_type"] == "message_command"
+    assert task["status"] == "queued"
+    assert task["stage"] == "placeholder_pending"
+    assert task["command_text"] == "explain why this retry is safe"
+    assert task["source_kind"] == "issue_comment"
+    assert task["source_comment_id"] == "123"
+    assert task["source_author_login"] == "alice"
+
+
+def test_bot_authored_mention_does_not_create_agent_task(tmp_path: Path) -> None:
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "example/repo"},
+        "issue": {"number": 42, "pull_request": {"url": "https://api.github/pr"}},
+        "comment": {
+            "id": 124,
+            "body": "@review-agent recursive message",
+            "user": {"login": "review-agent", "type": "Bot"},
+            "author_association": "MEMBER",
+        },
+    }
+    body = json_body(payload)
+
+    with make_signed_client(tmp_path) as client:
+        response = client.post(
+            "/api/v1/webhooks/github",
+            content=body,
+            headers=github_headers(
+                body,
+                delivery_id="delivery-bot-comment",
+                event="issue_comment",
+            ),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["internal_event"] == "pr_comment_context"
+    assert response.json()["agent_task_id"] is None
+
+
+def test_untrusted_comment_author_does_not_create_agent_task(tmp_path: Path) -> None:
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "example/repo"},
+        "issue": {"number": 42, "pull_request": {"url": "https://api.github/pr"}},
+        "comment": {
+            "id": 125,
+            "body": "@review-agent inspect the authentication flow",
+            "user": {"login": "external-user", "type": "User"},
+            "author_association": "NONE",
+        },
+    }
+    body = json_body(payload)
+
+    with make_signed_client(tmp_path) as client:
+        response = client.post(
+            "/api/v1/webhooks/github",
+            content=body,
+            headers=github_headers(
+                body,
+                delivery_id="delivery-untrusted-comment",
+                event="issue_comment",
+            ),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["internal_event"] == "pr_comment_context"
+    assert response.json()["agent_task_id"] is None
+
+
+def test_review_and_line_comment_mentions_create_message_commands(
+    tmp_path: Path,
+) -> None:
+    cases = [
+        (
+            "pull_request_review",
+            "submitted",
+            "review",
+            126,
+        ),
+        (
+            "pull_request_review_comment",
+            "created",
+            "comment",
+            127,
+        ),
+    ]
+    with make_signed_client(tmp_path) as client:
+        for event, action, source_key, source_id in cases:
+            payload = {
+                "action": action,
+                "repository": {"full_name": "example/repo"},
+                "pull_request": {"number": 42},
+                source_key: {
+                    "id": source_id,
+                    "html_url": f"https://github.com/example/repo/pull/42#{source_id}",
+                    "body": "@review-agent explain this change",
+                    "user": {"login": "alice", "type": "User"},
+                    "author_association": "COLLABORATOR",
+                },
+            }
+            body = json_body(payload)
+            response = client.post(
+                "/api/v1/webhooks/github",
+                content=body,
+                headers=github_headers(
+                    body,
+                    delivery_id=f"delivery-{event}",
+                    event=event,
+                ),
+            )
+
+            assert response.status_code == 200
+            assert response.json()["internal_event"] == "agent_command"
+            task = client.get(
+                f"/api/v1/agent-tasks/{response.json()['agent_task_id']}"
+            ).json()
+            assert task["task_type"] == "message_command"
+            assert task["source_kind"] == event
+            assert task["source_comment_id"] == str(source_id)
 
 
 def test_list_provider_events_filters_and_returns_safe_summary(
@@ -905,7 +1338,12 @@ def test_list_provider_events_filters_and_returns_safe_summary(
         "action": "created",
         "repository": {"full_name": "example/repo"},
         "issue": {"number": 42, "pull_request": {"url": "https://api.github/pr"}},
-        "comment": {"id": 123, "body": "@review-agent should I re-review this?"},
+        "comment": {
+            "id": 123,
+            "body": "@review-agent should I re-review this?",
+            "user": {"login": "alice", "type": "User"},
+            "author_association": "MEMBER",
+        },
     }
     comment_body = json_body(comment_payload)
 
@@ -931,7 +1369,7 @@ def test_list_provider_events_filters_and_returns_safe_summary(
                 "provider": "github",
                 "repo_full_name": "example/repo",
                 "pull_request_number": 42,
-                "internal_event": "agent_mention",
+                "internal_event": "agent_command",
                 "status": "queued",
                 "delivery_id": "delivery-comment",
             },
@@ -1075,7 +1513,110 @@ async def test_get_agent_task_detail_returns_redacted_metadata(tmp_path: Path) -
     assert missing_response.status_code == 404
 
 
-def test_start_review_session_records_openhands_identifiers(tmp_path: Path) -> None:
+async def test_cancel_agent_task_cancels_runtime_and_updates_placeholder(
+    tmp_path: Path,
+) -> None:
+    pi_agent_client = FakePiAgentClient()
+    github_client = FakeTaskCommentGitHubClient()
+    with make_client(tmp_path) as client:
+        client.app.state.pi_agent_client = pi_agent_client
+        client.app.state.github_client = github_client
+        task = await create_agent_task_record(
+            client,
+            status="running",
+            stage="waiting_for_agent",
+            task_type="message_command",
+            agent_session_id="session-1",
+            response_comment_id="task-comment-1",
+            command_text="Explain the retry.",
+            source_author_login="alice",
+        )
+
+        response = client.post(f"/api/v1/agent-tasks/{task.id}/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    assert response.json()["stage"] == "cancelled"
+    assert pi_agent_client.cancelled_session_ids == ["session-1"]
+    assert len(github_client.updated) == 1
+    assert github_client.updated[0][0] == "task-comment-1"
+    assert "cancelled" in github_client.updated[0][1]
+
+
+async def test_retry_failed_agent_task_reuses_placeholder_with_new_attempt(
+    tmp_path: Path,
+) -> None:
+    with make_client(tmp_path) as client:
+        task = await create_agent_task_record(
+            client,
+            status="failed",
+            stage="failed",
+            task_type="message_command",
+            response_comment_id="task-comment-1",
+            command_text="Explain the retry.",
+            source_author_login="alice",
+            failure_code="agent_failed",
+            error_message="model failed",
+        )
+
+        response = client.post(f"/api/v1/agent-tasks/{task.id}/retry")
+
+    assert response.status_code == 202
+    data = response.json()
+    assert data["status"] == "queued"
+    assert data["stage"] == "placeholder_pending"
+    assert data["response_comment_id"] == "task-comment-1"
+    assert data["failure_code"] is None
+    assert data["error_message"] is None
+
+
+async def test_agent_task_session_diagnostics_reads_live_instruction_session(
+    tmp_path: Path,
+) -> None:
+    pi_agent_client = FakePiAgentClient()
+    pi_agent_client.session = PiAgentSession(
+        id="session-1",
+        kind="instruction",
+        status="running",
+        stage="tool:read_file",
+        provider="openai",
+        model="gpt-5.4",
+        thinking_level="high",
+        events=[
+            {
+                "at": "2026-07-15T00:00:00Z",
+                "type": "tool_execution_start",
+                "stage": "tool:read_file",
+                "tool": "read_file",
+            }
+        ],
+    )
+    with make_client(tmp_path) as client:
+        client.app.state.pi_agent_client = pi_agent_client
+        task = await create_agent_task_record(
+            client,
+            status="running",
+            stage="waiting_for_agent",
+            task_type="message_command",
+            agent_session_id="session-1",
+            command_text="Explain the retry.",
+            source_author_login="alice",
+        )
+
+        response = client.get(f"/api/v1/agent-tasks/{task.id}/agent-session")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["review_run_id"] is None
+    assert data["agent_task_ids"] == [task.id]
+    assert data["status"] == "running"
+    assert data["stage"] == "waiting_for_agent"
+    assert data["execution_status"] == "running"
+    assert data["execution_stage"] == "tool:read_file"
+    assert data["event_count"] == 1
+
+
+def test_start_review_session_records_pi_agent_identifiers(tmp_path: Path) -> None:
     payload = {
         "provider": "github",
         "repo_full_name": "example/repo",
@@ -1083,10 +1624,10 @@ def test_start_review_session_records_openhands_identifiers(tmp_path: Path) -> N
         "base_sha": "a" * 40,
         "head_sha": "b" * 40,
     }
-    fake_openhands = FakeOpenHandsClient()
+    fake_pi_agent = FakePiAgentClient()
 
     with make_client(tmp_path) as client:
-        client.app.state.openhands_client = fake_openhands
+        client.app.state.pi_agent_client = fake_pi_agent
         create_response = client.post("/api/v1/review-runs", json=payload)
         review_run = create_response.json()
 
@@ -1099,11 +1640,13 @@ def test_start_review_session_records_openhands_identifiers(tmp_path: Path) -> N
     data = start_response.json()
     assert data["status"] == "running"
     assert data["workspace_path"] == "/workspaces/example-repo/pr-42/bbbbbbb"
-    assert data["openhands_start_task_id"] == "task-1"
-    assert data["openhands_conversation_id"] == "conversation-1"
-    assert data["openhands_sandbox_id"] == "sandbox-1"
-    assert fake_openhands.started_inputs[0].repo_full_name == "example/repo"
-    assert fake_openhands.started_inputs[0].base_sha == "a" * 40
+    assert data["agent_session_id"] == "session-1"
+    assert data["agent_status"] == "running"
+    assert data["agent_provider"] == "openai"
+    assert data["agent_model"] == "gpt-5.4"
+    assert data["agent_thinking_level"] == "high"
+    assert fake_pi_agent.started_inputs[0].repo_full_name == "example/repo"
+    assert fake_pi_agent.started_inputs[0].base_sha == "a" * 40
 
 
 def test_start_review_session_requires_workspace_path(tmp_path: Path) -> None:
@@ -1116,7 +1659,7 @@ def test_start_review_session_requires_workspace_path(tmp_path: Path) -> None:
     }
 
     with make_client(tmp_path) as client:
-        client.app.state.openhands_client = FakeOpenHandsClient()
+        client.app.state.pi_agent_client = FakePiAgentClient()
         create_response = client.post("/api/v1/review-runs", json=payload)
         review_run = create_response.json()
         start_response = client.post(
@@ -1128,7 +1671,10 @@ def test_start_review_session_requires_workspace_path(tmp_path: Path) -> None:
     assert "workspace_path" in start_response.json()["detail"]
 
 
-def test_sync_review_session_marks_openhands_failure(tmp_path: Path) -> None:
+def test_start_review_session_rejects_request_overrides_and_uses_domain_preset(
+    tmp_path: Path,
+) -> None:
+    fake_pi_agent = FakePiAgentClient()
     payload = {
         "provider": "github",
         "repo_full_name": "example/repo",
@@ -1136,15 +1682,53 @@ def test_sync_review_session_marks_openhands_failure(tmp_path: Path) -> None:
         "base_sha": "a" * 40,
         "head_sha": "b" * 40,
     }
-    fake_openhands = FakeOpenHandsClient()
-    fake_openhands.conversation = OpenHandsConversation(
-        id="conversation-1",
-        sandbox_status="RUNNING",
-        execution_status="ERROR",
+
+    with make_client(tmp_path) as client:
+        client.app.state.pi_agent_client = fake_pi_agent
+        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        rejected = client.post(
+            f"/api/v1/review-runs/{review_run['id']}/session/start",
+            json={
+                "workspace_path": "/workspaces/example/repo/pr-42/bbbbbbb",
+                "skill": "security-review",
+                "profile": "strict",
+                "provider": "company-openai",
+                "model": "review-model",
+                "thinking_level": "xhigh",
+                "model_base_url": "https://llm-gateway.example/v1",
+            },
+        )
+        response = client.post(
+            f"/api/v1/review-runs/{review_run['id']}/session/start",
+            json={"workspace_path": "/workspaces/example/repo/pr-42/bbbbbbb"},
+        )
+
+    assert rejected.status_code == 422
+    assert response.status_code == 200
+    assert len(fake_pi_agent.started_options) == 1
+    preset = fake_pi_agent.started_options[0]["preset"]
+    assert preset.model_dump() == {
+        "agent_id": "code-review",
+        "task_type": "code-review",
+        "repository_skills": ["code-review"],
+    }
+
+
+def test_sync_review_session_marks_pi_agent_failure(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+    fake_pi_agent = FakePiAgentClient()
+    fake_pi_agent.session = fake_pi_agent.session.model_copy(
+        update={"status": "failed", "stage": "failed", "error": "model error"}
     )
 
     with make_client(tmp_path) as client:
-        client.app.state.openhands_client = fake_openhands
+        client.app.state.pi_agent_client = fake_pi_agent
         review_run = client.post("/api/v1/review-runs", json=payload).json()
         started = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
@@ -1156,10 +1740,11 @@ def test_sync_review_session_marks_openhands_failure(tmp_path: Path) -> None:
 
     assert sync_response.status_code == 200
     assert sync_response.json()["status"] == "failed"
-    assert "ERROR" in sync_response.json()["error"]
+    assert sync_response.json()["failure_code"] == "pi_agent_error"
+    assert sync_response.json()["error"] == "model error"
 
 
-def test_observability_openhands_session_returns_safe_metadata(
+def test_observability_pi_agent_session_returns_safe_metadata(
     tmp_path: Path,
 ) -> None:
     payload = {
@@ -1169,13 +1754,10 @@ def test_observability_openhands_session_returns_safe_metadata(
         "base_sha": "a" * 40,
         "head_sha": "b" * 40,
     }
-    fake_openhands = FakeOpenHandsClient()
+    fake_pi_agent = FakePiAgentClient()
 
-    with make_client_with_settings(
-        tmp_path,
-        openhands_ui_base_url="https://openhands.example.test",
-    ) as client:
-        client.app.state.openhands_client = fake_openhands
+    with make_client(tmp_path) as client:
+        client.app.state.pi_agent_client = fake_pi_agent
         review_run = client.post("/api/v1/review-runs", json=payload).json()
         started = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
@@ -1184,34 +1766,30 @@ def test_observability_openhands_session_returns_safe_metadata(
 
         by_run = client.get(
             "/api/v1/observability/review-runs/"
-            f"{started['id']}/openhands-session"
+            f"{started['id']}/agent-session"
         )
-        by_conversation = client.get(
-            "/api/v1/observability/openhands-sessions/conversation-1"
+        by_session = client.get(
+            "/api/v1/observability/agent-sessions/session-1"
         )
 
     assert by_run.status_code == 200
     data = by_run.json()
     assert data["review_run_id"] == started["id"]
-    assert data["openhands_start_task_id"] == "task-1"
-    assert data["openhands_conversation_id"] == "conversation-1"
-    assert data["openhands_sandbox_id"] == "sandbox-1"
-    assert data["openhands_agent_server_url"] == "http://agent-server"
-    assert data["execution_status"] == "RUNNING"
-    assert data["sandbox_status"] == "RUNNING"
+    assert data["agent_session_id"] == "session-1"
+    assert data["agent_provider"] == "openai"
+    assert data["agent_model"] == "gpt-5.4"
+    assert data["agent_thinking_level"] == "high"
+    assert data["execution_status"] == "running"
+    assert data["execution_stage"] == "analyzing"
+    assert data["event_count"] == 0
     assert data["session_available"] is True
     assert data["live_status_available"] is True
     assert data["live_status_error"] is None
-    assert data["passthrough"] == {
-        "enabled": True,
-        "conversation_url": "https://openhands.example.test/conversations/conversation-1",
-        "reason": None,
-    }
-    assert by_conversation.status_code == 200
-    assert by_conversation.json()["review_run_id"] == started["id"]
+    assert by_session.status_code == 200
+    assert by_session.json()["review_run_id"] == started["id"]
 
 
-def test_observability_openhands_session_reports_disabled_configuration(
+def test_observability_pi_agent_session_reports_disabled_configuration(
     tmp_path: Path,
 ) -> None:
     payload = {
@@ -1224,33 +1802,29 @@ def test_observability_openhands_session_reports_disabled_configuration(
 
     with make_client_with_settings(
         tmp_path,
-        openhands_base_url=None,
-        openhands_ui_base_url=None,
+        pi_agent_base_url=None,
     ) as client:
         review_run = client.post("/api/v1/review-runs", json=payload).json()
         response = client.get(
             "/api/v1/observability/review-runs/"
-            f"{review_run['id']}/openhands-session"
+            f"{review_run['id']}/agent-session"
         )
 
     assert response.status_code == 200
     data = response.json()
     assert data["session_available"] is False
     assert data["live_status_available"] is False
-    assert data["live_status_error"] == "OpenHands base URL is not configured."
-    assert data["passthrough"] == {
-        "enabled": False,
-        "conversation_url": None,
-        "reason": "OpenHands conversation id is not recorded for this review run.",
-    }
+    assert data["live_status_error"] == (
+        "pi-agent runtime base URL is not configured."
+    )
 
 
-def test_observability_openhands_session_returns_404_for_unknown_conversation(
+def test_observability_pi_agent_session_returns_404_for_unknown_session(
     tmp_path: Path,
 ) -> None:
     with make_client(tmp_path) as client:
         response = client.get(
-            "/api/v1/observability/openhands-sessions/missing-conversation"
+            "/api/v1/observability/agent-sessions/missing-session"
         )
 
     assert response.status_code == 404
@@ -1296,7 +1870,7 @@ def test_collect_review_result_completes_review_run(tmp_path: Path) -> None:
     assert data["parsed"]["findings"][0]["publish_as_line_comment"] is True
 
 
-def test_cancel_review_session_deletes_openhands_conversation(tmp_path: Path) -> None:
+def test_cancel_review_session_cancels_pi_agent_session(tmp_path: Path) -> None:
     payload = {
         "provider": "github",
         "repo_full_name": "example/repo",
@@ -1304,10 +1878,10 @@ def test_cancel_review_session_deletes_openhands_conversation(tmp_path: Path) ->
         "base_sha": "a" * 40,
         "head_sha": "b" * 40,
     }
-    fake_openhands = FakeOpenHandsClient()
+    fake_pi_agent = FakePiAgentClient()
 
     with make_client(tmp_path) as client:
-        client.app.state.openhands_client = fake_openhands
+        client.app.state.pi_agent_client = fake_pi_agent
         review_run = client.post("/api/v1/review-runs", json=payload).json()
         started = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
@@ -1320,4 +1894,126 @@ def test_cancel_review_session_deletes_openhands_conversation(tmp_path: Path) ->
 
     assert cancel_response.status_code == 200
     assert cancel_response.json()["status"] == "cancelled"
-    assert fake_openhands.deleted_conversation_ids == ["conversation-1"]
+    assert fake_pi_agent.cancelled_session_ids == ["session-1"]
+
+
+def test_review_session_does_not_expose_human_message_route(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+    fake_pi_agent = FakePiAgentClient()
+
+    with make_client(tmp_path) as client:
+        client.app.state.pi_agent_client = fake_pi_agent
+        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        started = client.post(
+            f"/api/v1/review-runs/{review_run['id']}/session/start",
+            json={"workspace_path": "/workspaces/example-repo/pr-42/bbbbbbb"},
+        ).json()
+        response = client.post(
+            f"/api/v1/review-runs/{started['id']}/session/messages",
+            json={"message": "Yes, this is intentional.", "delivery": "answer"},
+        )
+
+    assert response.status_code == 404
+
+
+def test_public_api_not_found_contracts(tmp_path: Path) -> None:
+    """All resource endpoints must keep a stable 404 contract during reorganization."""
+    requests = [
+        ("GET", "/api/v1/provider-events/missing", None),
+        ("GET", "/api/v1/agent-tasks/missing", None),
+        ("GET", "/api/v1/agent-tasks/missing/agent-session", None),
+        ("POST", "/api/v1/agent-tasks/missing/cancel", None),
+        ("POST", "/api/v1/agent-tasks/missing/retry", None),
+        ("GET", "/api/v1/review-runs/missing", None),
+        ("GET", "/api/v1/observability/review-runs/missing/agent-session", None),
+        (
+            "POST",
+            "/api/v1/review-runs/missing/session/start",
+            {"workspace_path": "/tmp/missing"},
+        ),
+        ("POST", "/api/v1/review-runs/missing/session/sync", None),
+        (
+            "POST",
+            "/api/v1/review-runs/missing/session/cancel",
+            {"reason": "test"},
+        ),
+        (
+            "POST",
+            "/api/v1/review-runs/missing/session/messages",
+            {"message": "answer", "delivery": "answer"},
+        ),
+        (
+            "POST",
+            "/api/v1/review-runs/missing/result",
+            {"raw_output": {"summary": "none", "findings": []}},
+        ),
+        ("POST", "/api/v1/review-runs/missing/retry", None),
+        ("POST", "/api/v1/review-runs/missing/cancel", None),
+        ("GET", "/api/v1/workspaces/missing", None),
+        ("POST", "/api/v1/workspaces/missing/lease", {}),
+        ("POST", "/api/v1/workspace-leases/missing/release", None),
+        ("POST", "/api/v1/workspaces/missing/cleanup", {"force": False}),
+    ]
+
+    with make_client(tmp_path) as client:
+        for method, path, body in requests:
+            response = client.request(method, path, json=body)
+            assert response.status_code == 404, (method, path, response.text)
+
+
+def test_webhook_rejects_unknown_provider_and_malformed_payload(tmp_path: Path) -> None:
+    malformed = b"not-json"
+    with make_signed_client(tmp_path) as client:
+        unsupported = client.post("/api/v1/webhooks/unknown", content=b"{}")
+        invalid = client.post(
+            "/api/v1/webhooks/github",
+            content=malformed,
+            headers=github_headers(malformed, delivery_id="malformed"),
+        )
+
+    assert unsupported.status_code == 404
+    assert unsupported.json()["detail"] == "Unsupported provider: unknown"
+    assert invalid.status_code == 400
+
+
+def test_runtime_required_endpoint_fails_cleanly_when_disabled(tmp_path: Path) -> None:
+    with make_client_with_settings(tmp_path, pi_agent_base_url=None) as client:
+        response = client.get("/api/v1/agent-tasks/missing/agent-session")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "pi-agent runtime base URL is not configured."
+    )
+
+
+def test_retry_failed_review_run_creates_next_attempt(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+
+    async def mark_failed(client: TestClient, review_run_id: str) -> None:
+        async with client.app.state.session_factory() as session:
+            review_run = await session.get(ReviewRun, review_run_id)
+            assert review_run is not None
+            review_run.status = "failed"
+            review_run.failure_code = "agent_failed"
+            await session.commit()
+
+    with make_client(tmp_path) as client:
+        original = client.post("/api/v1/review-runs", json=payload).json()
+        client.portal.call(mark_failed, client, original["id"])
+        response = client.post(f"/api/v1/review-runs/{original['id']}/retry")
+
+    assert response.status_code == 202
+    assert response.json()["review_run_id"] != original["id"]
+    assert response.json()["status"] == "queued"

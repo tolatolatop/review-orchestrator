@@ -1,4 +1,55 @@
 services:
+  pi-agent-runtime:
+    build:
+      context: ./pi-agent-runtime
+    image: review-orchestrator-pi-agent:0.80.7
+    environment:
+      PI_AGENT_STATE_ROOT: /var/lib/pi-agent
+      PI_AGENT_TASK_ENVIRONMENT_ROOT: /var/lib/pi-agent-task
+      PI_AGENT_WORKSPACE_ROOT: /var/lib/review-orchestrator/workspaces
+      PI_AGENT_ENVIRONMENT_TEMPLATE_ROOT: /opt/pi-agent/environment-template
+      PI_AGENT_TASK_UID_MIN: 20000
+      PI_AGENT_TASK_UID_MAX: 60000
+      PI_AGENT_TASK_GID: 65532
+      PI_AGENT_WORKSPACE_OWNER_UID: 1000
+      PI_AGENT_WORKSPACE_OWNER_GID: 1000
+      PI_AGENT_SKILLS_ROOT: /opt/pi-agent/skills
+      PI_AGENT_MODELS_FILE: /etc/pi-agent/models.json
+      PI_AGENT_RUNTIME_TOKEN: ${PI_AGENT_RUNTIME_TOKEN:-}
+      PI_AGENT_PROVIDER: ${PI_AGENT_PROVIDER:-openai}
+      PI_AGENT_MODEL: ${PI_AGENT_MODEL:-gpt-5.4}
+      PI_AGENT_THINKING_LEVEL: ${PI_AGENT_THINKING_LEVEL:-high}
+      PI_AGENT_MODEL_BASE_URL: ${PI_AGENT_MODEL_BASE_URL:-}
+      PI_AGENT_LLM_API_KEY: ${PI_AGENT_LLM_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_GENERATIVE_AI_API_KEY: ${GOOGLE_GENERATIVE_AI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    ports:
+      - "127.0.0.1:${PI_AGENT_RUNTIME_PORT:-3210}:3210"
+    volumes:
+      - pi_agent_state:/var/lib/pi-agent
+      - review_workspace:/var/lib/review-orchestrator/workspaces
+      - ${PI_AGENT_SKILLS_PATH:-./pi-agent-runtime/skills}:/opt/pi-agent/skills:ro
+      - ${PI_AGENT_CONFIG_PATH:-./pi-agent-runtime/config}:/etc/pi-agent:ro
+      - ${PI_AGENT_ENVIRONMENT_TEMPLATE_PATH:-./pi-agent-runtime/environment-template}:/opt/pi-agent/environment-template:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+      - /var/lib/pi-agent-task:size=1g,mode=0755
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    restart: unless-stopped
+
   review-orchestrator:
     build:
       context: .
@@ -13,13 +64,21 @@ services:
       PORT: 8000
       WORKSPACE_ROOT: /var/lib/review-orchestrator/workspaces
       GIT_CACHE_ROOT: /var/lib/review-orchestrator/git-cache
-      OPENHANDS_BASE_URL: ${OPENHANDS_BASE_URL:-http://host.docker.internal:3000}
+      PI_AGENT_BASE_URL: http://pi-agent-runtime:3210
+      PI_AGENT_RUNTIME_TOKEN: ${PI_AGENT_RUNTIME_TOKEN:-}
+      PI_AGENT_REVIEW_AGENT: ${PI_AGENT_REVIEW_AGENT:-code-review}
+      PI_AGENT_REVIEW_SKILL: ${PI_AGENT_REVIEW_SKILL:-code-review}
+      AGENT_COMMAND_AGENT: ${AGENT_COMMAND_AGENT:-pr-assistant}
+      AGENT_COMMAND_SKILL: ${AGENT_COMMAND_SKILL:-pr-assistant}
     ports:
       - "${PORT:-8000}:8000"
     volumes:
       - review_orchestrator_data:/var/lib/review-orchestrator
+      - review_workspace:/var/lib/review-orchestrator/workspaces
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      - pi-agent-runtime
     healthcheck:
       test:
         [
@@ -35,4 +94,6 @@ services:
     restart: unless-stopped
 
 volumes:
+  pi_agent_state:
   review_orchestrator_data:
+  review_workspace:
