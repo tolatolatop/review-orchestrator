@@ -6,8 +6,10 @@ from uuid import uuid4
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     String,
     Text,
     UniqueConstraint,
@@ -106,7 +108,252 @@ class ProviderEventInbox(Base):
     )
 
 
-class ReviewRun(Base):
+class Task(Base):
+    """Unified durable task control plane.
+
+    Domain-specific task types use joined-table inheritance. Scheduling,
+    leasing and lifecycle state live here so workers do not maintain separate
+    queue implementations for reviews and message commands.
+    """
+
+    __tablename__ = "task"
+    __table_args__ = (
+        CheckConstraint("priority >= 0 AND priority <= 100", name="ck_task_priority"),
+        CheckConstraint(
+            "effective_priority >= 0 AND effective_priority <= 100",
+            name="ck_task_effective_priority",
+        ),
+        UniqueConstraint("dedupe_key", name="uq_task_dedupe_key"),
+        Index(
+            "ix_task_claim",
+            "status",
+            "queue",
+            "effective_priority",
+            "available_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    capability_id: Mapped[str] = mapped_column(
+        String(128), nullable=False, default="generic"
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    stage: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    execution_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending"
+    )
+    delivery_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="not_required"
+    )
+    queue: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="default", index=True
+    )
+    priority: Mapped[int] = mapped_column(nullable=False, default=0)
+    effective_priority: Mapped[int] = mapped_column(nullable=False, default=0)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False, index=True
+    )
+    dedupe_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    concurrency_key: Mapped[str | None] = mapped_column(
+        String(512), nullable=True, index=True
+    )
+    resource_class: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="agent-standard", index=True
+    )
+    resource_context_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    resolved_preset_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    max_attempts: Mapped[int] = mapped_column(nullable=False, default=2)
+    lock_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    locked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+    __mapper_args__ = {
+        "polymorphic_on": kind,
+        "polymorphic_identity": "task",
+        "with_polymorphic": "*",
+    }
+
+
+class TaskAttempt(Base):
+    __tablename__ = "task_attempt"
+    __table_args__ = (
+        UniqueConstraint("task_id", "attempt_no", name="uq_task_attempt"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("task.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    attempt_no: Mapped[int] = mapped_column(nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    stage: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    agent_run_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, index=True
+    )
+    workspace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    workspace_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_preset_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    usage_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    failure_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class SessionArchive(Base):
+    __tablename__ = "session_archive"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id", "agent_run_id", name="uq_session_archive_agent_run"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("task.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    task_attempt_id: Mapped[str | None] = mapped_column(
+        ForeignKey("task_attempt.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    agent_run_id: Mapped[str] = mapped_column(
+        String(128), nullable=False, index=True
+    )
+    session_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    task_metadata_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    workspace_diff: Mapped[str | None] = mapped_column(Text, nullable=True)
+    workspace_diff_truncated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    redaction_version: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="1"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class ResourcePool(Base):
+    __tablename__ = "resource_pool"
+
+    resource_key: Mapped[str] = mapped_column(String(512), primary_key=True)
+    dimension: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    capacity: Mapped[int] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class ResourceLease(Base):
+    __tablename__ = "resource_lease"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id", "stage", "resource_key", name="uq_task_resource_lease"
+        ),
+        Index("ix_resource_lease_active", "resource_key", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("task.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    stage: Mapped[str] = mapped_column(String(64), nullable=False)
+    resource_key: Mapped[str] = mapped_column(
+        ForeignKey("resource_pool.resource_key", ondelete="CASCADE"),
+        nullable=False,
+    )
+    units: Mapped[int] = mapped_column(nullable=False, default=1)
+    owner: Mapped[str] = mapped_column(String(128), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class DeliveryOutbox(Base):
+    __tablename__ = "delivery_outbox"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_delivery_idempotency_key"),
+        Index(
+            "ix_delivery_claim",
+            "status",
+            "queue",
+            "priority",
+            "available_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("task.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    operation: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    destination_key: Mapped[str] = mapped_column(
+        String(1024), nullable=False, index=True
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    payload_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    payload_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    mandatory: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    queue: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="provider-delivery"
+    )
+    priority: Mapped[int] = mapped_column(nullable=False, default=0)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    attempt: Mapped[int] = mapped_column(nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(nullable=False, default=5)
+    lock_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    locked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    provider_message_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class ReviewRun(Task):
     __tablename__ = "review_run"
     __table_args__ = (
         UniqueConstraint(
@@ -120,7 +367,7 @@ class ReviewRun(Base):
     )
 
     id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=lambda: str(uuid4())
+        ForeignKey("task.id", ondelete="CASCADE"), primary_key=True
     )
     pull_request_context_id: Mapped[str | None] = mapped_column(
         ForeignKey("pull_request_context.id"), nullable=True, index=True
@@ -137,8 +384,6 @@ class ReviewRun(Base):
     trigger_event_id: Mapped[str | None] = mapped_column(
         ForeignKey("provider_event_inbox.id"), nullable=True, index=True
     )
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
-    stage: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     summary_comment_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     workspace_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     agent_session_id: Mapped[str | None] = mapped_column(
@@ -159,10 +404,6 @@ class ReviewRun(Base):
     validation_errors_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
     failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    lock_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    locked_until: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
     superseded_by_review_run_id: Mapped[str | None] = mapped_column(
         String(36), nullable=True, index=True
     )
@@ -172,15 +413,7 @@ class ReviewRun(Base):
     hard_timeout_emitted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
-    )
+    __mapper_args__ = {"polymorphic_identity": "review"}
 
 
 class ReviewSession(Base):
@@ -319,11 +552,11 @@ class RetryJob(Base):
     )
 
 
-class AgentTask(Base):
+class AgentTask(Task):
     __tablename__ = "agent_task"
 
     id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=lambda: str(uuid4())
+        ForeignKey("task.id", ondelete="CASCADE"), primary_key=True
     )
     provider_event_id: Mapped[str | None] = mapped_column(
         ForeignKey("provider_event_inbox.id"), nullable=True, index=True
@@ -337,8 +570,6 @@ class AgentTask(Base):
     task_type: Mapped[str] = mapped_column(
         String(64), nullable=False, default="mention"
     )
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
-    stage: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     source_kind: Mapped[str | None] = mapped_column(String(64), nullable=True)
     source_comment_id: Mapped[str | None] = mapped_column(
         String(128), nullable=True, index=True
@@ -366,13 +597,6 @@ class AgentTask(Base):
     failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     attempt: Mapped[int] = mapped_column(nullable=False, default=1)
     agent_start_attempts: Mapped[int] = mapped_column(nullable=False, default=0)
-    lock_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    locked_until: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     soft_timeout_emitted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -382,12 +606,7 @@ class AgentTask(Base):
     input_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, nullable=False
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
-    )
+    __mapper_args__ = {"polymorphic_identity": "agent"}
 
 
 class ReviewConfig(Base):
@@ -418,15 +637,9 @@ class ReviewConfig(Base):
     default_review_skill: Mapped[str] = mapped_column(
         String(128), nullable=False, default="code-review"
     )
-    default_review_profile: Mapped[str] = mapped_column(
-        String(128), nullable=False, default="default"
-    )
     agent_commands_enabled: Mapped[bool] = mapped_column(nullable=False, default=True)
     default_agent_command_skill: Mapped[str] = mapped_column(
         String(128), nullable=False, default="pr-assistant"
-    )
-    default_agent_command_profile: Mapped[str] = mapped_column(
-        String(128), nullable=False, default="default"
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False

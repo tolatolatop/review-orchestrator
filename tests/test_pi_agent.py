@@ -5,6 +5,7 @@ import pytest
 
 from review_orchestrator.config import Settings
 from review_orchestrator.pi_agent import (
+    AgentDomainPreset,
     AgentInstructionInput,
     AgentInstructionRepositoryContext,
     PiAgentClient,
@@ -25,6 +26,14 @@ def review_input() -> ReviewSkillInput:
     )
 
 
+def review_preset() -> AgentDomainPreset:
+    return AgentDomainPreset(
+        agent_id="code-review",
+        task_type="code-review",
+        repository_skills=["builtin:code-review"],
+    )
+
+
 def test_runtime_token_uses_public_environment_name(monkeypatch) -> None:
     monkeypatch.setenv("PI_AGENT_RUNTIME_TOKEN", "runtime-secret")
 
@@ -33,30 +42,23 @@ def test_runtime_token_uses_public_environment_name(monkeypatch) -> None:
     assert settings.pi_agent_runtime_token == "runtime-secret"
 
 
-def test_start_payload_keeps_isolated_workspace_and_llm_configuration() -> None:
+def test_start_payload_keeps_workspace_and_only_domain_preset_selectors() -> None:
     client = PiAgentClient(base_url="http://pi-agent:3210")
 
     payload = client._start_payload(
         review_input(),
-        skill="security-review",
-        profile="strict",
-        provider="openai",
-        model="gpt-5.4",
-        thinking_level="high",
-        model_base_url="https://llm-gateway.example/v1",
+        preset=review_preset(),
     )
 
     assert payload["workspace_path"] == review_input().workspace_path
-    assert payload["review"]["base_sha"] == "a" * 40
-    assert payload["review"]["head_sha"] == "b" * 40
-    assert payload["skills"] == ["security-review"]
-    assert payload["profile"] == "strict"
-    assert payload["model"] == {
-        "provider": "openai",
-        "id": "gpt-5.4",
-        "thinking_level": "high",
-        "base_url": "https://llm-gateway.example/v1",
-    }
+    assert payload["agent_id"] == "code-review"
+    assert payload["input"]["base_sha"] == "a" * 40
+    assert payload["input"]["head_sha"] == "b" * 40
+    assert payload["task_type"] == "code-review"
+    assert payload["repository_skills"] == ["builtin:code-review"]
+    assert "profile" not in payload
+    assert "model" not in payload
+    assert "agent_version" not in payload
 
 
 def test_instruction_payload_keeps_command_context_history_and_idempotency() -> None:
@@ -87,21 +89,25 @@ def test_instruction_payload_keeps_command_context_history_and_idempotency() -> 
 
     payload = client._instruction_start_payload(
         instruction,
-        skill="pr-assistant",
-        profile="default",
-        provider="openai",
-        model="gpt-5.4",
-        thinking_level="high",
-        model_base_url=None,
+        preset=AgentDomainPreset(
+            agent_id="pr-assistant",
+            task_type="message-command",
+            repository_skills=["npm:@example/pr-skill"],
+        ),
     )
 
-    assert payload["kind"] == "instruction"
+    assert payload["agent_id"] == "pr-assistant"
     assert payload["idempotency_key"] == "agent-task:task-1:attempt:1"
     assert payload["workspace_path"] == instruction.workspace_path
-    assert payload["repository_context"]["head_sha"] == "b" * 40
-    assert payload["instruction"]["text"] == "Explain why this retry is safe."
-    assert payload["instruction"]["history"][0]["answer"] == "In src/retry.py."
-    assert payload["skills"] == ["pr-assistant"]
+    assert payload["input"]["repository_context"]["head_sha"] == "b" * 40
+    assert payload["input"]["instruction"]["text"] == (
+        "Explain why this retry is safe."
+    )
+    assert payload["input"]["instruction"]["history"][0]["answer"] == (
+        "In src/retry.py."
+    )
+    assert payload["task_type"] == "message-command"
+    assert payload["repository_skills"] == ["npm:@example/pr-skill"]
 
 
 @pytest.mark.asyncio
@@ -142,22 +148,70 @@ async def test_client_starts_instruction_session() -> None:
 
     session = await client.start_instruction_session(
         instruction,
-        skill="pr-assistant",
-        profile="default",
-        provider="openai",
-        model="gpt-5.4",
-        thinking_level="high",
+        preset=AgentDomainPreset(
+            agent_id="pr-assistant",
+            task_type="message-command",
+            repository_skills=["builtin:pr-assistant"],
+        ),
     )
 
     assert session.id == "instruction-session-1"
     assert session.kind == "instruction"
-    assert json.loads(requests[0].content)["instruction"]["text"] == (
+    assert json.loads(requests[0].content)["input"]["instruction"]["text"] == (
         "Explain the retry."
     )
 
 
 @pytest.mark.asyncio
-async def test_client_starts_syncs_and_steers_session() -> None:
+async def test_client_starts_a_generic_domain_preset() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            202,
+            json={
+                "id": "assistant-session-1",
+                "kind": "agent",
+                "agent_id": "pr-assistant",
+                "agent_version": "1.0.0",
+                "status": "preparing",
+                "stage": "preparing",
+            },
+        )
+
+    client = PiAgentClient(
+        base_url="http://pi-agent:3210",
+        transport=httpx.MockTransport(handler),
+    )
+    session = await client.start_agent_session(
+        preset=AgentDomainPreset(
+            agent_id="pr-assistant",
+            task_type="message-command",
+            repository_skills=["builtin:pr-assistant"],
+        ),
+        workspace_path="/workspaces/example/repo",
+        input_data={
+            "repository_context": {
+                "provider": "github",
+                "repo_full_name": "example/repo",
+                "pr_number": 42,
+                "base_sha": "a" * 40,
+                "head_sha": "b" * 40,
+            },
+            "instruction": {"text": "Explain this", "author_login": "alice"},
+        },
+    )
+
+    assert session.kind == "agent"
+    assert session.agent_id == "pr-assistant"
+    payload = json.loads(requests[0].content)
+    assert "agent_version" not in payload
+    assert payload["task_type"] == "message-command"
+
+
+@pytest.mark.asyncio
+async def test_client_starts_syncs_and_cancels_session() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -178,20 +232,16 @@ async def test_client_starts_syncs_and_steers_session() -> None:
                 200,
                 json={
                     "id": "session-1",
-                    "status": "waiting_for_input",
-                    "stage": "waiting_for_human",
-                    "pending_input": {
-                        "id": "question-1",
-                        "question": "Is this flag intentionally public?",
-                    },
+                    "status": "running",
+                    "stage": "analyzing",
                 },
             )
         return httpx.Response(
-            202,
+            200,
             json={
                 "id": "session-1",
-                "status": "running",
-                "stage": "analyzing",
+                "status": "cancelled",
+                "stage": "cancelled",
             },
         )
 
@@ -203,28 +253,16 @@ async def test_client_starts_syncs_and_steers_session() -> None:
 
     started = await client.start_session(
         review_input(),
-        skill="code-review",
-        profile="default",
-        provider="openai",
-        model="gpt-5.4",
-        thinking_level="high",
+        preset=review_preset(),
     )
-    waiting = await client.get_session(started.id)
-    resumed = await client.send_message(
-        started.id,
-        "Yes, it is intentional.",
-        delivery="answer",
-    )
+    running = await client.get_session(started.id)
+    cancelled = await client.cancel_session(started.id)
 
     assert started.status == PiAgentSessionStatus.running
-    assert waiting.status == PiAgentSessionStatus.waiting_for_input
-    assert waiting.pending_input is not None
-    assert resumed.status == PiAgentSessionStatus.running
+    assert running.status == PiAgentSessionStatus.running
+    assert cancelled.status == PiAgentSessionStatus.cancelled
     assert requests[0].headers["Authorization"] == "Bearer service-secret"
-    assert json.loads(requests[2].content) == {
-        "message": "Yes, it is intentional.",
-        "delivery": "answer",
-    }
+    assert requests[2].method == "DELETE"
 
 
 @pytest.mark.asyncio

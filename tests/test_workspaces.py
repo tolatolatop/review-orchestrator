@@ -108,6 +108,7 @@ def test_prepare_workspace_checkouts_head_and_is_idempotent(tmp_path: Path) -> N
     assert first.json()["workspace_id"] == second.json()["workspace_id"]
     workspace_path = Path(first.json()["workspace_path"])
     assert workspace_path.exists()
+    assert workspace_path.stat().st_mode & 0o777 == 0o700
     assert run(["git", "rev-parse", "HEAD"], workspace_path) == head_sha
     assert run(["git", "cat-file", "-t", base_sha], workspace_path) == "commit"
 

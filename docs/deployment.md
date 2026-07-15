@@ -70,15 +70,15 @@ parameter for browser pages.
 | `PI_AGENT_PROVIDER` | `openai` | pi model provider. |
 | `PI_AGENT_MODEL` | `gpt-5.4` | pi model ID. |
 | `PI_AGENT_THINKING_LEVEL` | `high` | `minimal`, `low`, `medium`, `high`, or `xhigh`. |
-| `PI_AGENT_MODEL_BASE_URL` | empty | Optional provider/gateway URL override. |
+| `PI_AGENT_MODEL_BASE_URL` | empty | Deployment-level provider/gateway URL; Task requests cannot override it. |
 | `PI_AGENT_LLM_API_KEY` | empty | Generic runtime-only key for the selected provider. |
 | `OPENAI_API_KEY` | empty | Standard key discovered by pi's OpenAI provider. |
 | `ANTHROPIC_API_KEY` | empty | Standard key discovered by pi's Anthropic provider. |
-| `PI_AGENT_REVIEW_SKILL` | `code-review` | Default Agent Skill name. |
-| `PI_AGENT_REVIEW_PROFILE` | `default` | Default profile metadata. |
+| `PI_AGENT_REVIEW_AGENT` | `code-review` | Installed Agent selected for automatic reviews. |
+| `PI_AGENT_REVIEW_SKILL` | `code-review` | Default Repository Skill ref for reviews. Prefix with `builtin:`, `npm:`, or `prebuilt:` when needed. |
 | `AGENT_COMMAND_ENABLED` | `true` | Enable trusted `@bot` PR message commands. |
-| `AGENT_COMMAND_SKILL` | `pr-assistant` | Read-only skill for message commands. |
-| `AGENT_COMMAND_PROFILE` | `default` | Message-command profile metadata. |
+| `AGENT_COMMAND_AGENT` | `pr-assistant` | Installed Agent selected for PR message commands. |
+| `AGENT_COMMAND_SKILL` | `pr-assistant` | Default Repository Skill ref for message commands. |
 | `AGENT_TASK_SOFT_TIMEOUT_SECONDS` | `120` | Refresh a delayed command placeholder once. |
 | `AGENT_TASK_TIMEOUT_SECONDS` | `600` | Cancel a command session and publish timeout. |
 | `AGENT_TASK_MAX_HISTORY_TURNS` | `6` | Prior successful PR command exchanges supplied to the agent. |
@@ -87,6 +87,7 @@ parameter for browser pages.
 | `AGENT_TASK_MAX_COMMAND_CHARS` | `8000` | Maximum command length after removing the bot mention. |
 | `PI_AGENT_SKILLS_PATH` | `./pi-agent-runtime/skills` | Host directory mounted read-only at `/opt/pi-agent/skills`. |
 | `PI_AGENT_CONFIG_PATH` | `./pi-agent-runtime/config` | Host directory containing optional `models.json`. |
+| `PI_AGENT_ENVIRONMENT_TEMPLATE_PATH` | `./pi-agent-runtime/environment-template` | Read-only prebuilt directory cloned into every Task overlay. |
 | `PI_AGENT_TIMEOUT_SECONDS` | `30` | Runtime HTTP request timeout. |
 
 Built-in providers use the environment variable names supported by `pi-ai`.
@@ -95,7 +96,12 @@ For an OpenAI-compatible or company provider, copy
 provider/model data, then select it with `PI_AGENT_PROVIDER` and
 `PI_AGENT_MODEL`. The runtime never returns API keys in session state or events.
 
-## Skills
+## Agents and Skills
+
+The Runtime has one installed definition for each production Agent. The control
+plane starts it with `agent_id`, `repository_skills`, `task_type`, and
+schema-validated input. The Task Type maps to an installed named preset; Runtime
+requests cannot select semantic versions, profiles, models, Base URLs, or Tools.
 
 Skills use the Agent Skills `SKILL.md` convention:
 
@@ -105,57 +111,34 @@ pi-agent-runtime/skills/
     └── SKILL.md
 ```
 
-To add a skill, create `${PI_AGENT_SKILLS_PATH}/security-review/SKILL.md` with
-frontmatter whose `name` matches the directory. Set the repository's
-`default_review_skill`, change `PI_AGENT_REVIEW_SKILL`, or pass
-`{"skill":"security-review"}` to `session/start`. The runtime validates skill
-names and loads only files beneath its configured skill root.
+Builtin Skills use `${PI_AGENT_SKILLS_PATH}/<name>/SKILL.md`. Repository policy
+may instead select `npm:<package>`, which runs the package's normal `npm install`
+inside the disposable Task overlay, or `prebuilt:<name>` from the cloned
+template. Skill content and installation have Task-level execution capability,
+but never register or grant a Tool implicitly. Runtime records content digests.
 
 ## Isolation Model
 
-The self-host runtime is intentionally narrower than a general coding shell:
+The self-host Runtime gives the Agent complete coding capability inside one
+Task boundary:
 
-- the repository volume is read-only;
+- only the dedicated Workspace volume is mounted read-write; database, Git
+  credential, and Provider secret storage are not mounted;
 - the container root filesystem is read-only;
-- all Linux capabilities are dropped and `no-new-privileges` is set;
+- the Controller retains only the capabilities needed to change Task UID and
+  Workspace ownership; `no-new-privileges` remains set;
 - no Docker socket or provider private-key directory is mounted;
-- the SDK receives only custom `list_files`, `read_file`, `search_code`, and
-  commit-range `git_diff` tools;
+- explicit Tools provide list/read/search/diff, file writes, and shell execution;
 - every tool canonicalizes paths and rejects traversal/symlink escape;
-- no arbitrary shell, write, or edit tool is exposed;
+- concurrent shell/npm children receive distinct UIDs from 20000–60000 while
+  the credentialed Controller runs as root, so they cannot read Controller
+  environment/state or another active Task Workspace;
+- child environments contain only Task paths and non-secret process settings;
 - each checkout path is isolated by provider, repository hash, PR number, and
   head SHA.
 
 The runtime still needs outbound network access to the selected LLM. Apply an
 egress allowlist at the container/network layer when your platform supports it.
-
-## Human in the Loop
-
-The agent can call `request_human_input`. The runtime then reports
-`waiting_for_input`, and the review run stage becomes `waiting_for_human`.
-
-Inspect the question:
-
-```bash
-curl -H "X-Review-Token: $REVIEW_PROXY_TOKEN" \
-  http://localhost:${REVIEW_PROXY_PORT:-18080}/api/v1/observability/review-runs/\
-<review-run-id>/agent-session
-```
-
-Answer it:
-
-```bash
-curl -X POST \
-  -H "X-Review-Token: $REVIEW_PROXY_TOKEN" \
-  -H 'Content-Type: application/json' \
-  http://localhost:${REVIEW_PROXY_PORT:-18080}/api/v1/review-runs/\
-<review-run-id>/session/messages \
-  -d '{"message":"Yes, this flag is intentionally public.","delivery":"answer"}'
-```
-
-Use `delivery=steer` to affect the active turn or `delivery=follow_up` to queue
-input after the current work. Messages are delivered through pi-agent's native
-steering/follow-up APIs.
 
 ## Pull Request Message Commands
 
@@ -168,9 +151,9 @@ Set `REVIEW_BOT_LOGIN` to the GitHub App bot login, for example
 
 The webhook stores a `message_command` AgentTask and returns immediately. The
 worker must create or recover its placeholder before starting pi-agent. It then
-updates the same comment with the validated answer. The command is read-only;
-requests to edit or push code are answered within that boundary rather than
-executed.
+updates the same comment with the validated answer. The Agent may edit, build,
+and test in its Task Workspace; Provider delivery and credentialed Git side
+effects remain deterministic Orchestrator operations.
 
 Inspect or control a command:
 
@@ -197,19 +180,9 @@ curl -X POST http://127.0.0.1:${REVIEW_LOCAL_PORT:-18000}/api/v1/review-runs/\
   -d '{"workspace_path":"/var/lib/review-orchestrator/workspaces/.../repo"}'
 ```
 
-Per-session model and skill overrides are supported:
-
-```json
-{
-  "workspace_path": "/var/lib/review-orchestrator/workspaces/.../repo",
-  "skill": "security-review",
-  "profile": "strict",
-  "provider": "company-openai",
-  "model": "review-model",
-  "thinking_level": "high",
-  "model_base_url": "https://llm-gateway.example/v1"
-}
-```
+The only request field is `workspace_path`. Agent, Repository Skill, and Task
+Type are resolved from domain configuration; arbitrary per-session overrides
+return HTTP 422.
 
 Use `/session/sync` to refresh database state and `/session/cancel` to abort.
 Normal operation uses the worker and does not require manual calls.
@@ -293,7 +266,7 @@ Common failure categories:
 If a model is unknown, verify `PI_AGENT_PROVIDER`, `PI_AGENT_MODEL`, and
 `models.json`. If authentication is missing, use the provider's standard key or
 `PI_AGENT_LLM_API_KEY`. If a skill is missing, verify its directory name,
-frontmatter name, description, and read-only mount.
+frontmatter name and selected `builtin:`, `npm:`, or `prebuilt:` source.
 
 ## Production Checklist
 
@@ -307,4 +280,5 @@ frontmatter name, description, and read-only mount.
 - Size `WORKSPACE_ROOT`, `GIT_CACHE_ROOT`, and `pi_agent_state` for concurrency.
 - Apply outbound network policy for provider and LLM endpoints.
 - Verify `/health`, one signed webhook, one completed structured review, one
-  human-input round trip, hard-timeout cancellation, and provider publishing.
+  writable Workspace build/test run, hard-timeout cancellation, SessionArchive,
+  and Provider publishing.

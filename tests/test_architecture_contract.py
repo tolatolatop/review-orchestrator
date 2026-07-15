@@ -33,7 +33,6 @@ def test_public_route_inventory_survives_directory_refactors() -> None:
         ("GET", "/api/v1/review-runs/{review_run_id}"),
         ("POST", "/api/v1/review-runs/{review_run_id}/session/start"),
         ("POST", "/api/v1/review-runs/{review_run_id}/session/sync"),
-        ("POST", "/api/v1/review-runs/{review_run_id}/session/messages"),
         ("POST", "/api/v1/review-runs/{review_run_id}/session/cancel"),
         ("POST", "/api/v1/review-runs/{review_run_id}/result"),
         ("POST", "/api/v1/review-runs/{review_run_id}/retry"),
@@ -150,6 +149,7 @@ def test_layered_implementations_do_not_import_legacy_aliases() -> None:
 def test_core_execution_paths_do_not_branch_on_builtin_platform_names() -> None:
     package_root = Path(__file__).parents[1] / "src" / "review_orchestrator"
     core_paths = [
+        package_root / "application" / "delivery.py",
         package_root / "application" / "services.py",
         package_root / "application" / "worker.py",
         package_root / "infrastructure" / "workspaces.py",

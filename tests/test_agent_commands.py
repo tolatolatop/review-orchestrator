@@ -1,10 +1,10 @@
-import asyncio
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
 from sqlalchemy import select
 
+from review_orchestrator.application.delivery import process_next_delivery
 from review_orchestrator.comments import (
     agent_task_marker,
     publish_github_agent_task_comment,
@@ -274,6 +274,50 @@ async def add_command_task(
     return task
 
 
+async def _deliver_once(session, github_client, *, worker_id="publisher-1"):
+    return await process_next_delivery(
+        session,
+        worker_id=worker_id,
+        provider_registry=github_registry(github_client),
+        retry_delay_seconds=0,
+    )
+
+
+async def _run_command_until(
+    session,
+    *,
+    task_id: str,
+    settings: Settings,
+    pi_agent_client,
+    github_client,
+    statuses: set[str],
+    max_cycles: int = 10,
+):
+    for index in range(max_cycles):
+        await _deliver_once(
+            session,
+            github_client,
+            worker_id=f"publisher-{index}-before",
+        )
+        await process_next_agent_task(
+            session,
+            settings=settings,
+            pi_agent_client=pi_agent_client,
+            worker_id=f"worker-{index}",
+            provider_registry=github_registry(github_client),
+        )
+        await _deliver_once(
+            session,
+            github_client,
+            worker_id=f"publisher-{index}-after",
+        )
+        task = await session.get(AgentTask, task_id)
+        assert task is not None
+        if task.status in statuses:
+            return task
+    raise AssertionError(f"Task {task_id} did not reach {statuses}.")
+
+
 async def test_command_task_publishes_placeholder_before_agent_and_updates_it(
     session_factory,
     tmp_path: Path,
@@ -283,12 +327,13 @@ async def test_command_task_publishes_placeholder_before_agent_and_updates_it(
     async with session_factory() as session:
         task = await add_command_task(session, tmp_path)
 
-        processed = await process_next_agent_task(
+        processed = await _run_command_until(
             session,
+            task_id=task.id,
             settings=command_settings(tmp_path),
             pi_agent_client=pi_agent_client,
-            worker_id="worker-1",
-            provider_registry=github_registry(github_client),
+            github_client=github_client,
+            statuses={"completed"},
         )
         review_runs = list((await session.execute(select(ReviewRun))).scalars())
 
@@ -319,12 +364,13 @@ async def test_empty_command_returns_guidance_without_starting_agent(
         task.command_text = ""
         await session.commit()
 
-        completed = await process_next_agent_task(
+        completed = await _run_command_until(
             session,
+            task_id=task.id,
             settings=command_settings(tmp_path),
             pi_agent_client=pi_agent_client,
-            worker_id="worker-1",
-            provider_registry=github_registry(github_client),
+            github_client=github_client,
+            statuses={"completed"},
         )
 
     assert completed is not None
@@ -371,7 +417,7 @@ async def test_agent_does_not_start_until_placeholder_retry_succeeds(
     pi_agent_client = CompletedInstructionClient(github_client)
     settings = command_settings(tmp_path, worker_poll_interval_seconds=0.001)
     async with session_factory() as session:
-        await add_command_task(session, tmp_path)
+        task = await add_command_task(session, tmp_path)
 
         waiting = await process_next_agent_task(
             session,
@@ -383,16 +429,19 @@ async def test_agent_does_not_start_until_placeholder_retry_succeeds(
         assert waiting is not None
         waiting_state = (waiting.status, waiting.stage)
         assert pi_agent_client.started_inputs == []
-        await asyncio.sleep(0.01)
-        completed = await process_next_agent_task(
+        failed_delivery = await _deliver_once(session, github_client)
+        assert failed_delivery is not None
+        assert failed_delivery.status == "queued"
+        completed = await _run_command_until(
             session,
+            task_id=task.id,
             settings=settings,
             pi_agent_client=pi_agent_client,
-            worker_id="worker-1",
-            provider_registry=github_registry(github_client),
+            github_client=github_client,
+            statuses={"completed"},
         )
 
-    assert waiting_state == ("queued", "placeholder_pending")
+    assert waiting_state == ("awaiting_delivery", "placeholder_delivery_pending")
     assert completed is not None
     assert completed.status == "completed"
     assert len(pi_agent_client.started_inputs) == 1
@@ -430,12 +479,13 @@ async def test_command_task_includes_bounded_completed_history(
         session.add(previous)
         await session.commit()
 
-        await process_next_agent_task(
+        await _run_command_until(
             session,
+            task_id=current.id,
             settings=command_settings(tmp_path),
             pi_agent_client=pi_agent_client,
-            worker_id="worker-1",
-            provider_registry=github_registry(github_client),
+            github_client=github_client,
+            statuses={"completed"},
         )
 
     instruction, _ = pi_agent_client.started_inputs[0]
@@ -467,13 +517,22 @@ async def test_newer_command_gets_placeholder_but_waits_for_older_pr_task(
         session.add(older)
         await session.commit()
 
-        waiting = await process_next_agent_task(
+        await process_next_agent_task(
             session,
             settings=command_settings(tmp_path),
             pi_agent_client=pi_agent_client,
             worker_id="worker-1",
             provider_registry=github_registry(github_client),
         )
+        await _deliver_once(session, github_client)
+        waiting = await process_next_agent_task(
+            session,
+            settings=command_settings(tmp_path),
+            pi_agent_client=pi_agent_client,
+            worker_id="worker-2",
+            provider_registry=github_registry(github_client),
+        )
+        await _deliver_once(session, github_client)
 
     assert waiting is not None
     assert waiting.id == current.id
@@ -495,14 +554,15 @@ async def test_command_runtime_failure_updates_existing_placeholder(
     github_client = FakeGitHubClient()
     pi_agent_client = FailingInstructionClient(github_client)
     async with session_factory() as session:
-        await add_command_task(session, tmp_path)
+        task = await add_command_task(session, tmp_path)
 
-        processed = await process_next_agent_task(
+        processed = await _run_command_until(
             session,
+            task_id=task.id,
             settings=command_settings(tmp_path),
             pi_agent_client=pi_agent_client,
-            worker_id="worker-1",
-            provider_registry=github_registry(github_client),
+            github_client=github_client,
+            statuses={"failed"},
         )
 
     assert processed is not None
@@ -523,14 +583,15 @@ async def test_invalid_agent_result_is_not_copied_into_failure_comment(
     github_client = FakeGitHubClient()
     pi_agent_client = InvalidInstructionResultClient(github_client)
     async with session_factory() as session:
-        await add_command_task(session, tmp_path)
+        task = await add_command_task(session, tmp_path)
 
-        processed = await process_next_agent_task(
+        processed = await _run_command_until(
             session,
+            task_id=task.id,
             settings=command_settings(tmp_path),
             pi_agent_client=pi_agent_client,
-            worker_id="worker-1",
-            provider_registry=github_registry(github_client),
+            github_client=github_client,
+            statuses={"failed"},
         )
 
     assert processed is not None
@@ -554,22 +615,31 @@ async def test_command_retries_infrastructure_start_with_same_idempotency_key(
         retry_initial_delay_seconds=0,
     )
     async with session_factory() as session:
-        await add_command_task(session, tmp_path)
+        task = await add_command_task(session, tmp_path)
 
-        retrying = await process_next_agent_task(
+        await process_next_agent_task(
             session,
             settings=settings,
             pi_agent_client=pi_agent_client,
             worker_id="worker-1",
             provider_registry=github_registry(github_client),
         )
-        retrying_state = (retrying.status, retrying.stage) if retrying else None
-        completed = await process_next_agent_task(
+        await _deliver_once(session, github_client)
+        retrying = await process_next_agent_task(
             session,
             settings=settings,
             pi_agent_client=pi_agent_client,
-            worker_id="worker-1",
+            worker_id="worker-2",
             provider_registry=github_registry(github_client),
+        )
+        retrying_state = (retrying.status, retrying.stage) if retrying else None
+        completed = await _run_command_until(
+            session,
+            task_id=task.id,
+            settings=settings,
+            pi_agent_client=pi_agent_client,
+            github_client=github_client,
+            statuses={"completed"},
         )
 
     assert retrying is not None
@@ -591,28 +661,39 @@ async def test_final_comment_publish_retries_without_rerunning_agent(
     pi_agent_client = CompletedInstructionClient(github_client)
     settings = command_settings(tmp_path, worker_poll_interval_seconds=0.001)
     async with session_factory() as session:
-        await add_command_task(session, tmp_path)
+        task = await add_command_task(session, tmp_path)
 
-        publishing = await process_next_agent_task(
+        await process_next_agent_task(
             session,
             settings=settings,
             pi_agent_client=pi_agent_client,
             worker_id="worker-1",
+            provider_registry=github_registry(github_client),
+        )
+        await _deliver_once(session, github_client)
+        publishing = await process_next_agent_task(
+            session,
+            settings=settings,
+            pi_agent_client=pi_agent_client,
+            worker_id="worker-2",
             provider_registry=github_registry(github_client),
         )
         publishing_state = (
             (publishing.status, publishing.stage) if publishing else None
         )
-        await asyncio.sleep(0.01)
-        completed = await process_next_agent_task(
+        failed_delivery = await _deliver_once(session, github_client)
+        assert failed_delivery is not None
+        assert failed_delivery.status == "queued"
+        completed = await _run_command_until(
             session,
+            task_id=task.id,
             settings=settings,
             pi_agent_client=pi_agent_client,
-            worker_id="worker-1",
-            provider_registry=github_registry(github_client),
+            github_client=github_client,
+            statuses={"completed"},
         )
 
-    assert publishing_state == ("running", "publishing_result")
+    assert publishing_state == ("awaiting_delivery", "result_delivery_pending")
     assert completed is not None
     assert completed.status == "completed"
     assert len(pi_agent_client.started_inputs) == 1
@@ -632,28 +713,39 @@ async def test_failure_comment_publish_retries_until_placeholder_is_terminal(
     pi_agent_client = FailingInstructionClient(github_client)
     settings = command_settings(tmp_path, worker_poll_interval_seconds=0.001)
     async with session_factory() as session:
-        await add_command_task(session, tmp_path)
+        task = await add_command_task(session, tmp_path)
 
-        publishing = await process_next_agent_task(
+        await process_next_agent_task(
             session,
             settings=settings,
             pi_agent_client=pi_agent_client,
             worker_id="worker-1",
+            provider_registry=github_registry(github_client),
+        )
+        await _deliver_once(session, github_client)
+        publishing = await process_next_agent_task(
+            session,
+            settings=settings,
+            pi_agent_client=pi_agent_client,
+            worker_id="worker-2",
             provider_registry=github_registry(github_client),
         )
         publishing_state = (
             (publishing.status, publishing.stage) if publishing else None
         )
-        await asyncio.sleep(0.01)
-        failed = await process_next_agent_task(
+        failed_delivery = await _deliver_once(session, github_client)
+        assert failed_delivery is not None
+        assert failed_delivery.status == "queued"
+        failed = await _run_command_until(
             session,
+            task_id=task.id,
             settings=settings,
             pi_agent_client=pi_agent_client,
-            worker_id="worker-1",
-            provider_registry=github_registry(github_client),
+            github_client=github_client,
+            statuses={"failed"},
         )
 
-    assert publishing_state == ("running", "publishing_failure")
+    assert publishing_state == ("awaiting_delivery", "failure_delivery_pending")
     assert failed is not None
     assert failed.status == "failed"
     assert failed.stage == "failed"
@@ -675,11 +767,19 @@ async def test_command_soft_and_hard_timeout_refresh_same_placeholder(
     settings = command_settings(tmp_path)
     async with session_factory() as session:
         await add_command_task(session, tmp_path)
-        running = await process_next_agent_task(
+        await process_next_agent_task(
             session,
             settings=settings,
             pi_agent_client=pi_agent_client,
             worker_id="worker-1",
+            provider_registry=github_registry(github_client),
+        )
+        await _deliver_once(session, github_client)
+        running = await process_next_agent_task(
+            session,
+            settings=settings,
+            pi_agent_client=pi_agent_client,
+            worker_id="worker-2",
             provider_registry=github_registry(github_client),
         )
         assert running is not None
@@ -694,6 +794,7 @@ async def test_command_soft_and_hard_timeout_refresh_same_placeholder(
             provider_registry=github_registry(github_client),
             now=started_at + timedelta(seconds=11),
         )
+        await _deliver_once(session, github_client)
         hard = await process_agent_task_timeouts(
             session,
             settings=settings,
@@ -701,6 +802,8 @@ async def test_command_soft_and_hard_timeout_refresh_same_placeholder(
             provider_registry=github_registry(github_client),
             now=started_at + timedelta(seconds=21),
         )
+        await _deliver_once(session, github_client)
+        await session.refresh(running)
 
     assert len(soft) == 1
     assert soft[0].soft_timeout_emitted_at is not None
@@ -728,9 +831,10 @@ async def test_hard_timeout_does_not_discard_result_waiting_for_provider_publish
         task = await add_command_task(
             session,
             tmp_path,
-            status="running",
-            stage="publishing_result",
+            status="awaiting_delivery",
+            stage="result_delivery_pending",
         )
+        task.execution_status = "completed"
         task.started_at = utc_now() - timedelta(minutes=10)
         task.agent_session_id = "completed-session"
         task.result_text = "Validated answer waiting for GitHub."
@@ -750,8 +854,8 @@ async def test_hard_timeout_does_not_discard_result_waiting_for_provider_publish
         )
 
     assert touched == []
-    assert task.status == "running"
-    assert task.stage == "publishing_result"
+    assert task.status == "awaiting_delivery"
+    assert task.stage == "result_delivery_pending"
     assert task.failure_code is None
     assert pi_agent_client.cancelled_session_ids == []
 
@@ -787,6 +891,8 @@ async def test_pending_pr_close_cancellation_updates_task_placeholder(
             worker_id="worker-1",
             provider_registry=github_registry(github_client),
         )
+        await _deliver_once(session, github_client)
+        await session.refresh(cancelled)
 
     assert cancelled is not None
     assert cancelled.status == "cancelled"

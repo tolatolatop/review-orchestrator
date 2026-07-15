@@ -14,19 +14,29 @@ from review_orchestrator.application.services import (
     collect_review_result,
     create_review_run,
     get_agent_task_detail,
+    get_delivery_outbox,
     get_pi_agent_session_diagnostics_for_agent_task,
     get_pi_agent_session_diagnostics_for_review_run,
     get_pi_agent_session_diagnostics_for_session,
     get_provider_event_inbox_detail,
     get_review_run,
     get_review_run_detail,
+    get_session_archive,
+    get_task_summary,
     list_agent_tasks,
+    list_delivery_outbox,
     list_provider_event_inbox,
+    list_resource_pools,
     list_review_runs,
+    list_task_session_archives,
+    list_tasks,
     retry_agent_task,
     retry_review_run,
+    set_resource_pool_capacity,
     start_review_session,
     sync_review_session,
+    update_delivery_scheduling,
+    update_task_scheduling,
 )
 from review_orchestrator.domain.models import AgentTask
 from review_orchestrator.domain.review_results import ReviewResultError
@@ -34,6 +44,9 @@ from review_orchestrator.domain.schemas import (
     AgentTaskDetail,
     AgentTaskListResponse,
     CleanupSummary,
+    DeliveryOutboxListResponse,
+    DeliveryOutboxSummary,
+    DeliverySchedulingUpdate,
     PiAgentSessionDiagnostics,
     PlatformPermissionDiagnosticRequest,
     PlatformPermissionDiagnosticResponse,
@@ -42,6 +55,9 @@ from review_orchestrator.domain.schemas import (
     ProviderInfo,
     ProviderListResponse,
     PullRequestWorkspaceCleanupRequest,
+    ResourcePoolListResponse,
+    ResourcePoolRead,
+    ResourcePoolUpdate,
     ReviewResultCollect,
     ReviewResultCollectResponse,
     ReviewRunActionResult,
@@ -50,8 +66,12 @@ from review_orchestrator.domain.schemas import (
     ReviewRunListResponse,
     ReviewRunRead,
     ReviewSessionCancel,
-    ReviewSessionMessage,
     ReviewSessionStart,
+    SessionArchiveListResponse,
+    SessionArchiveRead,
+    TaskListResponse,
+    TaskSchedulingUpdate,
+    TaskSummary,
     WebhookAccepted,
     WorkspaceCleanupRequest,
     WorkspaceLeaseRead,
@@ -70,7 +90,7 @@ from review_orchestrator.infrastructure.workspaces import (
     prepare_workspace,
     release_workspace,
 )
-from review_orchestrator.integrations.pi_agent import PiAgentClient, PiAgentClientError
+from review_orchestrator.integrations.pi_agent import PiAgentClient
 from review_orchestrator.integrations.platform_diagnostics import (
     diagnose_platform_permissions,
 )
@@ -266,6 +286,190 @@ async def get_provider_event_endpoint(
     if event is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return event
+
+
+@router.get("/tasks", response_model=TaskListResponse)
+@router.get("/observability/tasks", response_model=TaskListResponse)
+async def list_tasks_endpoint(
+    kind: str | None = Query(default=None, min_length=1, max_length=32),
+    capability_id: str | None = Query(default=None, min_length=1, max_length=128),
+    status_filter: str | None = Query(
+        default=None,
+        alias="status",
+        min_length=1,
+        max_length=32,
+    ),
+    queue: str | None = Query(default=None, min_length=1, max_length=64),
+    resource_class: str | None = Query(default=None, min_length=1, max_length=64),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = session_dependency,
+) -> TaskListResponse:
+    return await list_tasks(
+        session,
+        kind=kind,
+        capability_id=capability_id,
+        status=status_filter,
+        queue=queue,
+        resource_class=resource_class,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/tasks/{task_id}", response_model=TaskSummary)
+@router.get("/observability/tasks/{task_id}", response_model=TaskSummary)
+async def get_task_endpoint(
+    task_id: str,
+    session: AsyncSession = session_dependency,
+) -> TaskSummary:
+    task = await get_task_summary(session, task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return task
+
+
+@router.get(
+    "/tasks/{task_id}/sessions",
+    response_model=SessionArchiveListResponse,
+)
+@router.get(
+    "/observability/tasks/{task_id}/sessions",
+    response_model=SessionArchiveListResponse,
+)
+async def list_task_sessions_endpoint(
+    task_id: str,
+    session: AsyncSession = session_dependency,
+) -> SessionArchiveListResponse:
+    archives = await list_task_session_archives(session, task_id)
+    if archives is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return archives
+
+
+@router.get(
+    "/session-archives/{archive_id}",
+    response_model=SessionArchiveRead,
+)
+@router.get(
+    "/observability/session-archives/{archive_id}",
+    response_model=SessionArchiveRead,
+)
+async def get_session_archive_endpoint(
+    archive_id: str,
+    session: AsyncSession = session_dependency,
+) -> SessionArchiveRead:
+    archive = await get_session_archive(session, archive_id)
+    if archive is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return archive
+
+
+@router.patch("/tasks/{task_id}/scheduling", response_model=TaskSummary)
+async def update_task_scheduling_endpoint(
+    task_id: str,
+    payload: TaskSchedulingUpdate,
+    session: AsyncSession = session_dependency,
+) -> TaskSummary:
+    try:
+        task = await update_task_scheduling(session, task_id, payload)
+    except ReviewRunTransitionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return task
+
+
+@router.get("/resource-pools", response_model=ResourcePoolListResponse)
+@router.get(
+    "/observability/resource-pools",
+    response_model=ResourcePoolListResponse,
+)
+async def list_resource_pools_endpoint(
+    session: AsyncSession = session_dependency,
+) -> ResourcePoolListResponse:
+    return await list_resource_pools(session)
+
+
+@router.put("/resource-pools/{resource_key:path}", response_model=ResourcePoolRead)
+async def update_resource_pool_endpoint(
+    resource_key: str,
+    payload: ResourcePoolUpdate,
+    session: AsyncSession = session_dependency,
+) -> ResourcePoolRead:
+    try:
+        pool = await set_resource_pool_capacity(
+            session,
+            resource_key,
+            capacity=payload.capacity,
+            dimension=payload.dimension,
+        )
+    except ReviewRunTransitionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    return pool
+
+
+@router.get("/deliveries", response_model=DeliveryOutboxListResponse)
+@router.get(
+    "/observability/deliveries",
+    response_model=DeliveryOutboxListResponse,
+)
+async def list_deliveries_endpoint(
+    task_id: str | None = Query(default=None, min_length=1, max_length=36),
+    provider: str | None = Query(default=None, min_length=1, max_length=64),
+    status_filter: str | None = Query(
+        default=None,
+        alias="status",
+        min_length=1,
+        max_length=32,
+    ),
+    queue: str | None = Query(default=None, min_length=1, max_length=64),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = session_dependency,
+) -> DeliveryOutboxListResponse:
+    return await list_delivery_outbox(
+        session,
+        task_id=task_id,
+        provider=provider,
+        status=status_filter,
+        queue=queue,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/deliveries/{delivery_id}", response_model=DeliveryOutboxSummary)
+@router.get(
+    "/observability/deliveries/{delivery_id}",
+    response_model=DeliveryOutboxSummary,
+)
+async def get_delivery_endpoint(
+    delivery_id: str,
+    session: AsyncSession = session_dependency,
+) -> DeliveryOutboxSummary:
+    delivery = await get_delivery_outbox(session, delivery_id)
+    if delivery is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return delivery
+
+
+@router.patch(
+    "/deliveries/{delivery_id}/scheduling",
+    response_model=DeliveryOutboxSummary,
+)
+async def update_delivery_scheduling_endpoint(
+    delivery_id: str,
+    payload: DeliverySchedulingUpdate,
+    session: AsyncSession = session_dependency,
+) -> DeliveryOutboxSummary:
+    try:
+        delivery = await update_delivery_scheduling(session, delivery_id, payload)
+    except ReviewRunTransitionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    if delivery is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return delivery
 
 
 @router.get("/agent-tasks", response_model=AgentTaskListResponse)
@@ -521,12 +725,6 @@ async def start_review_session_endpoint(
             pi_agent_client=pi_agent_client,
             settings=request.app.state.settings,
             workspace_path=payload.workspace_path,
-            skill=payload.skill,
-            profile=payload.profile,
-            provider=payload.provider,
-            model=payload.model,
-            thinking_level=payload.thinking_level,
-            model_base_url=payload.model_base_url,
         )
     except ReviewRunTransitionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
@@ -566,43 +764,6 @@ async def cancel_review_session_endpoint(
         review_run,
         pi_agent_client=pi_agent_client,
         reason=payload.reason,
-    )
-
-
-@router.post(
-    "/review-runs/{review_run_id}/session/messages",
-    response_model=ReviewRunRead,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def send_review_session_message_endpoint(
-    review_run_id: str,
-    payload: ReviewSessionMessage,
-    session: AsyncSession = session_dependency,
-    pi_agent_client: PiAgentClient = pi_agent_client_dependency,
-) -> ReviewRunRead:
-    review_run = await get_review_run(session, review_run_id)
-    if review_run is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    if not review_run.agent_session_id:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Review run has no active pi-agent session.",
-        )
-    try:
-        await pi_agent_client.send_message(
-            review_run.agent_session_id,
-            payload.message,
-            delivery=payload.delivery,
-        )
-    except PiAgentClientError as exc:
-        raise HTTPException(
-            status_code=exc.status_code or status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(exc),
-        ) from exc
-    return await sync_review_session(
-        session,
-        review_run,
-        pi_agent_client=pi_agent_client,
     )
 
 

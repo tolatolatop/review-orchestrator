@@ -1,8 +1,9 @@
-"""Database engine, sessions, and additive startup migrations."""
+"""Database engine, sessions, and startup migrations."""
 
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 
-from sqlalchemy import inspect, text
+from sqlalchemy import MetaData, Table, inspect, select, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -51,7 +52,141 @@ async def init_models(engine: AsyncEngine) -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_migrate_unified_tasks)
         await conn.run_sync(_migrate_agent_runtime_columns)
+
+
+_LEGACY_TASK_CONTROL_COLUMNS = (
+    "status",
+    "stage",
+    "lock_owner",
+    "locked_until",
+    "started_at",
+    "completed_at",
+    "deadline_at",
+    "created_at",
+    "updated_at",
+)
+
+
+def _migrate_unified_tasks(connection: Connection) -> None:
+    """Move legacy review/agent lifecycle rows into the unified task table.
+
+    Joined-table inheritance requires control columns to be owned by ``task``.
+    Existing feature databases may still have those columns on the domain
+    tables, so copy their values and remove only the migrated columns. The
+    domain tables and their foreign keys remain intact.
+    """
+
+    from review_orchestrator.domain.models import Task
+
+    inspector = inspect(connection)
+    table_names = set(inspector.get_table_names())
+    if "task" not in table_names:
+        return
+
+    existing_task_ids = set(connection.execute(select(Task.__table__.c.id)).scalars())
+    now = datetime.now(UTC)
+    specs = (
+        ("review_run", "review", "code-review"),
+        ("agent_task", "agent", "pr-assistant"),
+    )
+    for table_name, kind, capability_id in specs:
+        if table_name not in table_names:
+            continue
+        legacy = Table(table_name, MetaData(), autoload_with=connection)
+        rows = list(connection.execute(select(legacy)).mappings())
+        inserts: list[dict[str, object]] = []
+        for row in rows:
+            task_id = str(row["id"])
+            if task_id in existing_task_ids:
+                continue
+            created_at = row.get("created_at") or now
+            is_interactive = (
+                kind == "agent" and row.get("task_type") == "message_command"
+            )
+            is_manual = kind == "review" and row.get("trigger_type") == "manual"
+            queue = (
+                "interactive"
+                if is_interactive
+                else "manual-review"
+                if is_manual
+                else "webhook-review"
+            )
+            priority = 80 if is_interactive else 60 if is_manual else 40
+            repository = row.get("repo_full_name")
+            provider = row.get("provider")
+            pr_number = row.get("pull_request_number")
+            head_sha = row.get("head_sha")
+            concurrency_parts = [provider, repository, "pr", pr_number]
+            if kind == "review" and head_sha:
+                concurrency_parts.extend(["head", head_sha])
+            concurrency_key = ":".join(
+                str(part) for part in concurrency_parts if part is not None
+            ) or None
+            status = str(row.get("status") or "queued")
+            inserts.append(
+                {
+                    "id": task_id,
+                    "kind": kind,
+                    "capability_id": capability_id,
+                    "status": status,
+                    "stage": row.get("stage"),
+                    "execution_status": _legacy_execution_status(status),
+                    "delivery_status": "not_required",
+                    "queue": queue,
+                    "priority": priority,
+                    "effective_priority": priority,
+                    "available_at": created_at,
+                    "concurrency_key": concurrency_key,
+                    "resource_class": "agent-standard",
+                    "max_attempts": 2,
+                    "lock_owner": row.get("lock_owner"),
+                    "locked_until": row.get("locked_until"),
+                    "started_at": row.get("started_at"),
+                    "completed_at": row.get("completed_at"),
+                    "deadline_at": row.get("deadline_at"),
+                    "created_at": created_at,
+                    "updated_at": row.get("updated_at") or created_at,
+                }
+            )
+            existing_task_ids.add(task_id)
+        if inserts:
+            connection.execute(Task.__table__.insert(), inserts)
+        _drop_legacy_task_control_columns(connection, table_name)
+
+
+def _legacy_execution_status(status: str) -> str:
+    if status == "completed":
+        return "completed"
+    if status in {"failed", "cancelled", "superseded"}:
+        return "failed"
+    if status == "running":
+        return "running"
+    return "pending"
+
+
+def _drop_legacy_task_control_columns(
+    connection: Connection,
+    table_name: str,
+) -> None:
+    inspector = inspect(connection)
+    columns = {column["name"] for column in inspector.get_columns(table_name)}
+    moved = [name for name in _LEGACY_TASK_CONTROL_COLUMNS if name in columns]
+    if not moved:
+        return
+
+    quote = connection.dialect.identifier_preparer.quote
+    for index in inspector.get_indexes(table_name):
+        indexed_columns = set(index.get("column_names") or [])
+        if indexed_columns.intersection(moved):
+            connection.exec_driver_sql(
+                f"DROP INDEX IF EXISTS {quote(str(index['name']))}"
+            )
+    for name in moved:
+        connection.exec_driver_sql(
+            f"ALTER TABLE {quote(table_name)} DROP COLUMN {quote(name)}"
+        )
 
 
 def _migrate_agent_runtime_columns(connection: Connection) -> None:
@@ -120,7 +255,6 @@ def _migrate_agent_runtime_columns(connection: Connection) -> None:
         column["name"] for column in inspect(connection).get_columns("agent_task")
     }
     task_additions = {
-        "stage": "VARCHAR(64)",
         "source_kind": "VARCHAR(64)",
         "source_comment_id": "VARCHAR(128)",
         "source_url": "TEXT",
@@ -142,11 +276,6 @@ def _migrate_agent_runtime_columns(connection: Connection) -> None:
         "failure_code": "VARCHAR(64)",
         "attempt": "INTEGER DEFAULT 1",
         "agent_start_attempts": "INTEGER DEFAULT 0",
-        "lock_owner": "VARCHAR(128)",
-        "locked_until": "TIMESTAMP",
-        "started_at": "TIMESTAMP",
-        "completed_at": "TIMESTAMP",
-        "deadline_at": "TIMESTAMP",
         "soft_timeout_emitted_at": "TIMESTAMP",
         "hard_timeout_emitted_at": "TIMESTAMP",
     }
@@ -175,7 +304,6 @@ def _migrate_agent_runtime_columns(connection: Connection) -> None:
     config_additions = {
         "agent_commands_enabled": "BOOLEAN DEFAULT TRUE",
         "default_agent_command_skill": "VARCHAR(128) DEFAULT 'pr-assistant'",
-        "default_agent_command_profile": "VARCHAR(128) DEFAULT 'default'",
     }
     for name, sql_type in config_additions.items():
         if name not in review_config_columns:

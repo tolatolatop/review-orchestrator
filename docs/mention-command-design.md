@@ -1,5 +1,11 @@
 # Mention Command Agent Design
 
+> Historical note: trigger parsing, placeholder semantics, and result schemas
+> remain useful, but the read-only Runtime, per-request Profile, and interaction
+> assumptions below are superseded by `agent-task-architecture-redesign_zh.md`.
+> The current Agent has full Task Workspace read/write/shell capability and is
+> configured only through Agent + Repository Skills + Task Type preset composition.
+
 ## Status
 
 Implemented on `feat/pi-agent`; this document is the behavioral and acceptance
@@ -447,7 +453,6 @@ application logs.
 
 - `agent_commands_enabled` (default `true`);
 - `default_agent_command_skill` (default `pr-assistant`);
-- `default_agent_command_profile` (default `default`).
 
 Automatic review enablement and command enablement are independent. Disabling
 automatic review must not disable explicitly requested bot commands.

@@ -63,6 +63,11 @@ async def test_worker_builds_and_reuses_one_provider_registry(monkeypatch) -> No
         registries.append(kwargs["provider_registry"])
         return None
 
+    async def process_delivery(session, **kwargs):
+        del session
+        registries.append(kwargs["provider_registry"])
+        return None
+
     async def process_review_run(session, **kwargs):
         del session
         registries.append(kwargs["provider_registry"])
@@ -87,13 +92,14 @@ async def test_worker_builds_and_reuses_one_provider_registry(monkeypatch) -> No
     )
     monkeypatch.setattr(worker_cli, "process_review_run_timeouts", process_timeouts)
     monkeypatch.setattr(worker_cli, "process_agent_task_timeouts", process_timeouts)
+    monkeypatch.setattr(worker_cli, "process_next_delivery", process_delivery)
     monkeypatch.setattr(worker_cli, "process_next_agent_task", process_agent_task)
     monkeypatch.setattr(worker_cli, "process_next_review_run", process_review_run)
 
     await run_worker(settings=Settings(), once=True, worker_id="worker-test")
 
-    assert len(registries) == 4
-    assert registries[0] is registries[1] is registries[2] is registries[3]
+    assert len(registries) == 5
+    assert all(registry is registries[0] for registry in registries)
     assert registries[0].require("github").client is github_client
     assert registries[0].require("gitlab").client is gitlab_client
     assert github_client.closed is True

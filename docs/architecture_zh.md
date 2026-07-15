@@ -1,5 +1,9 @@
 # Review Orchestrator 目录架构
 
+> 当前文档描述已实现结构。下一阶段的任务调度、上下文审计、Capability Pack 和
+> 薄 Agent Runtime 重规划见
+> [`agent-task-architecture-redesign_zh.md`](agent-task-architecture-redesign_zh.md)。
+
 后端源码按职责分为五个层级。业务实现只能从这些层级目录导入其他实现；仓库根部的
 同名模块仅用于兼容旧导入路径，不承载业务逻辑。
 
@@ -73,3 +77,10 @@ npm --prefix pi-agent-runtime test
 ```
 
 Python 分支覆盖率门禁记录在 `pyproject.toml`；任何后续拆分不得降低该基线。
+
+## pi-agent Agent 框架
+
+`pi-agent-runtime` 内部使用独立的 Agent Definition、Registry、Runner、Tool Registry
+和 Skill 组合层。Review、PR Assistant 和 Change Summary 都是注册 Agent，公共 Runner
+不包含按 Agent ID 或结果类型分支的逻辑。完整扩展契约、Profile、执行预算和测试说明见
+`docs/pi-agent-framework_zh.md`。

@@ -42,7 +42,7 @@ def make_review_run(**overrides) -> ReviewRun:
             make_review_run(
                 status="running",
                 lock_owner="worker",
-                locked_until=datetime.now(UTC) + timedelta(minutes=1),
+                locked_until=datetime.now(UTC) + timedelta(hours=1),
             ),
             "locked",
             "none",
@@ -295,7 +295,6 @@ async def test_review_config_get_or_create_is_idempotent(tmp_path) -> None:
                 provider="github",
                 repo_full_name="example/repo",
                 default_skill="security-review",
-                default_profile="strict",
             )
             second = await get_or_create_review_config(
                 session,
@@ -307,4 +306,3 @@ async def test_review_config_get_or_create_is_idempotent(tmp_path) -> None:
 
     assert second.id == first.id
     assert second.default_review_skill == "security-review"
-    assert second.default_review_profile == "strict"

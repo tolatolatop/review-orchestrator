@@ -174,7 +174,7 @@ async def test_start_classifies_runtime_failures(
     ("runtime_status", "runtime_stage", "expected_status", "expected_stage"),
     [
         ("running", "tool:read_file", "running", "tool:read_file"),
-        ("waiting_for_input", "waiting", "running", "waiting_for_human"),
+        ("waiting_for_input", "waiting", "running", "waiting"),
         ("completed", "completed", "running", "agent_completed"),
         ("cancelled", "cancelled", "cancelled", "cancelled"),
     ],
@@ -300,7 +300,7 @@ async def test_collect_requires_base_sha(
         )
 
 
-async def test_review_run_diagnostics_include_pending_input_and_linked_tasks(
+async def test_review_run_diagnostics_include_runtime_state_and_linked_tasks(
     service_context: tuple[AsyncSession, Settings],
 ) -> None:
     session, _settings = service_context
@@ -323,12 +323,7 @@ async def test_review_run_diagnostics_include_pending_input_and_linked_tasks(
     client.session = client.session.model_copy(
         update={
             "status": "waiting_for_input",
-            "stage": "waiting_for_human",
-            "pending_input": {
-                "id": "question-1",
-                "question": "Is this expected?",
-                "choices": ["yes", "no"],
-            },
+            "stage": "waiting_for_runtime",
             "events": [
                 {
                     "at": "2026-07-15T00:00:00Z",
@@ -347,9 +342,7 @@ async def test_review_run_diagnostics_include_pending_input_and_linked_tasks(
 
     assert diagnostics.agent_task_ids == [task.id]
     assert diagnostics.execution_status == "waiting_for_input"
-    assert diagnostics.execution_stage == "waiting_for_human"
-    assert diagnostics.pending_input is not None
-    assert diagnostics.pending_input.id == "question-1"
+    assert diagnostics.execution_stage == "waiting_for_runtime"
     assert diagnostics.event_count == 1
     assert diagnostics.live_status_available is True
 

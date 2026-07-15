@@ -8,6 +8,8 @@ from typing import Any
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from review_orchestrator.application.delivery import enqueue_delivery
+from review_orchestrator.application.scheduler import claim_next_task
 from review_orchestrator.config import Settings
 from review_orchestrator.github import GitHubAdapter
 from review_orchestrator.main import create_app
@@ -19,6 +21,9 @@ from review_orchestrator.models import (
     ReviewCommentRef,
     ReviewRun,
     ReviewSession,
+    SessionArchive,
+    Task,
+    TaskAttempt,
     Workspace,
 )
 from review_orchestrator.pi_agent import (
@@ -32,7 +37,6 @@ class FakePiAgentClient:
         self.started_inputs: list[Any] = []
         self.started_options: list[dict[str, Any]] = []
         self.cancelled_session_ids: list[str] = []
-        self.sent_messages: list[tuple[str, str, str]] = []
         self.session = PiAgentSession(
             id="session-1",
             status="running",
@@ -57,17 +61,6 @@ class FakePiAgentClient:
             update={"status": "cancelled", "stage": "cancelled"}
         )
         return self.session
-
-    async def send_message(
-        self,
-        session_id: str,
-        message: str,
-        *,
-        delivery: str,
-    ) -> PiAgentSession:
-        self.sent_messages.append((session_id, message, delivery))
-        return self.session
-
 
 def make_client(tmp_path: Path) -> TestClient:
     settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path}/test.db")
@@ -149,6 +142,230 @@ def test_observability_list_aliases_are_available(tmp_path: Path) -> None:
             response = client.get(f"/api/v1/observability/{resource}")
             assert response.status_code == 200
             assert response.json()["items"] == []
+
+
+def test_unified_task_scheduling_api_exposes_and_updates_review_task(
+    tmp_path: Path,
+) -> None:
+    with make_client(tmp_path) as client:
+        created = client.post(
+            "/api/v1/review-runs",
+            json={
+                "provider": "github",
+                "repo_full_name": "owner/repo",
+                "pull_request_number": 42,
+                "base_sha": "a" * 40,
+                "head_sha": "b" * 40,
+            },
+        )
+        assert created.status_code == 201
+        task_id = created.json()["id"]
+
+        listed = client.get(
+            "/api/v1/tasks",
+            params={"kind": "review", "queue": "manual-review"},
+        )
+        assert listed.status_code == 200
+        assert listed.json()["total"] == 1
+        task = listed.json()["items"][0]
+        assert task["id"] == task_id
+        assert task["capability_id"] == "code-review"
+        assert task["priority"] == 60
+        assert task["domain_metadata"]["repo_full_name"] == "owner/repo"
+
+        updated = client.patch(
+            f"/api/v1/tasks/{task_id}/scheduling",
+            json={
+                "queue": "interactive",
+                "priority": 90,
+                "resource_class": "agent-heavy",
+                "resource_context": {
+                    "repository": {
+                        "keys": ["github/owner/repo"],
+                        "units": 1,
+                    },
+                    "model": "gpt-5.4",
+                },
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["queue"] == "interactive"
+        assert updated.json()["priority"] == 90
+        assert updated.json()["effective_priority"] == 90
+        assert updated.json()["resource_class"] == "agent-heavy"
+        assert updated.json()["resource_context"]["model"] == "gpt-5.4"
+        assert updated.json()["resource_context"]["repository"] == {
+            "keys": ["github/owner/repo"],
+            "units": 1,
+        }
+
+
+async def _claim_task_for_api_test(client: TestClient) -> str:
+    async with client.app.state.session_factory() as session:
+        task = await claim_next_task(
+            session,
+            worker_id="api-test-worker",
+            task_kinds={"review"},
+        )
+        assert task is not None
+        return task.id
+
+
+def test_resource_pool_api_updates_counted_lock_capacity(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        created = client.post(
+            "/api/v1/review-runs",
+            json={
+                "provider": "github",
+                "repo_full_name": "owner/repo",
+                "pull_request_number": 42,
+                "head_sha": "b" * 40,
+            },
+        )
+        assert created.status_code == 201
+        client.portal.call(_claim_task_for_api_test, client)
+
+        pools = client.get("/api/v1/resource-pools")
+        assert pools.status_code == 200
+        concurrency_pool = next(
+            item
+            for item in pools.json()["items"]
+            if item["dimension"] == "concurrency"
+        )
+        assert concurrency_pool["capacity"] == 1
+        assert concurrency_pool["active_units"] == 1
+
+        updated = client.put(
+            f"/api/v1/resource-pools/{concurrency_pool['resource_key']}",
+            json={"capacity": 3},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["capacity"] == 3
+        assert updated.json()["active_units"] == 1
+
+        created_pool = client.put(
+            "/api/v1/resource-pools/custom:gpu-a",
+            json={"capacity": 2, "dimension": "custom"},
+        )
+        assert created_pool.status_code == 200
+        assert created_pool.json()["resource_key"] == "custom:gpu-a"
+        assert created_pool.json()["dimension"] == "custom"
+        assert created_pool.json()["capacity"] == 2
+        dimension_conflict = client.put(
+            "/api/v1/resource-pools/custom:gpu-a",
+            json={"capacity": 3, "dimension": "model"},
+        )
+        assert dimension_conflict.status_code == 409
+
+
+async def _enqueue_delivery_for_api_test(client: TestClient, task_id: str) -> str:
+    async with client.app.state.session_factory() as session:
+        task = await session.get(Task, task_id)
+        assert task is not None
+        delivery = await enqueue_delivery(
+            session,
+            task,
+            provider="github",
+            operation="review_summary",
+            destination_key=f"task:{task.id}:summary",
+            idempotency_key=f"task:{task.id}:summary:completed",
+            payload={"status_text": "completed"},
+        )
+        await session.commit()
+        return delivery.id
+
+
+def test_delivery_scheduling_api_lists_and_reschedules_outbox(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        created = client.post(
+            "/api/v1/review-runs",
+            json={
+                "provider": "github",
+                "repo_full_name": "owner/repo",
+                "pull_request_number": 42,
+                "head_sha": "b" * 40,
+            },
+        )
+        assert created.status_code == 201
+        task_id = created.json()["id"]
+        delivery_id = client.portal.call(
+            _enqueue_delivery_for_api_test,
+            client,
+            task_id,
+        )
+
+        listed = client.get(
+            "/api/v1/deliveries",
+            params={"task_id": task_id, "status": "queued"},
+        )
+        assert listed.status_code == 200
+        assert listed.json()["total"] == 1
+        assert listed.json()["items"][0]["id"] == delivery_id
+
+        updated = client.patch(
+            f"/api/v1/deliveries/{delivery_id}/scheduling",
+            json={"queue": "provider-urgent", "priority": 95, "max_attempts": 8},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["queue"] == "provider-urgent"
+        assert updated.json()["priority"] == 95
+        assert updated.json()["max_attempts"] == 8
+
+
+async def _archive_session_for_api_test(client: TestClient, task_id: str) -> str:
+    async with client.app.state.session_factory() as session:
+        attempt = TaskAttempt(
+            task_id=task_id,
+            attempt_no=1,
+            status="completed",
+            agent_run_id="agent-run-api",
+        )
+        session.add(attempt)
+        await session.flush()
+        archive = SessionArchive(
+            task_id=task_id,
+            task_attempt_id=attempt.id,
+            agent_run_id="agent-run-api",
+            session_json={"entries": [{"role": "assistant", "content": "done"}]},
+            task_metadata_json={"task": {"id": task_id}},
+        )
+        session.add(archive)
+        await session.commit()
+        return archive.id
+
+
+def test_session_archive_api_lists_permanent_task_sessions(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        created = client.post(
+            "/api/v1/review-runs",
+            json={
+                "provider": "github",
+                "repo_full_name": "owner/repo",
+                "pull_request_number": 42,
+                "head_sha": "b" * 40,
+            },
+        )
+        assert created.status_code == 201
+        task_id = created.json()["id"]
+        archive_id = client.portal.call(
+            _archive_session_for_api_test,
+            client,
+            task_id,
+        )
+
+        listed = client.get(f"/api/v1/tasks/{task_id}/sessions")
+        fetched = client.get(f"/api/v1/session-archives/{archive_id}")
+        alias = client.get(
+            f"/api/v1/observability/session-archives/{archive_id}"
+        )
+
+        assert listed.status_code == 200
+        assert [item["id"] for item in listed.json()["items"]] == [archive_id]
+        assert fetched.status_code == 200
+        assert fetched.json()["task_attempt"]["attempt_no"] == 1
+        assert fetched.json()["session"]["entries"][0]["content"] == "done"
+        assert alias.json() == fetched.json()
+        assert client.get("/api/v1/tasks/missing/sessions").status_code == 404
 
 
 def test_observability_detail_aliases_match_legacy_routes(tmp_path: Path) -> None:
@@ -1458,7 +1675,7 @@ def test_start_review_session_requires_workspace_path(tmp_path: Path) -> None:
     assert "workspace_path" in start_response.json()["detail"]
 
 
-def test_start_review_session_forwards_model_skill_and_profile_overrides(
+def test_start_review_session_rejects_request_overrides_and_uses_domain_preset(
     tmp_path: Path,
 ) -> None:
     fake_pi_agent = FakePiAgentClient()
@@ -1473,7 +1690,7 @@ def test_start_review_session_forwards_model_skill_and_profile_overrides(
     with make_client(tmp_path) as client:
         client.app.state.pi_agent_client = fake_pi_agent
         review_run = client.post("/api/v1/review-runs", json=payload).json()
-        response = client.post(
+        rejected = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
             json={
                 "workspace_path": "/workspaces/example/repo/pr-42/bbbbbbb",
@@ -1485,18 +1702,20 @@ def test_start_review_session_forwards_model_skill_and_profile_overrides(
                 "model_base_url": "https://llm-gateway.example/v1",
             },
         )
+        response = client.post(
+            f"/api/v1/review-runs/{review_run['id']}/session/start",
+            json={"workspace_path": "/workspaces/example/repo/pr-42/bbbbbbb"},
+        )
 
+    assert rejected.status_code == 422
     assert response.status_code == 200
-    assert fake_pi_agent.started_options == [
-        {
-            "skill": "security-review",
-            "profile": "strict",
-            "provider": "company-openai",
-            "model": "review-model",
-            "thinking_level": "xhigh",
-            "model_base_url": "https://llm-gateway.example/v1",
-        }
-    ]
+    assert len(fake_pi_agent.started_options) == 1
+    preset = fake_pi_agent.started_options[0]["preset"]
+    assert preset.model_dump() == {
+        "agent_id": "code-review",
+        "task_type": "code-review",
+        "repository_skills": ["code-review"],
+    }
 
 
 def test_sync_review_session_marks_pi_agent_failure(tmp_path: Path) -> None:
@@ -1682,7 +1901,7 @@ def test_cancel_review_session_cancels_pi_agent_session(tmp_path: Path) -> None:
     assert fake_pi_agent.cancelled_session_ids == ["session-1"]
 
 
-def test_human_message_is_forwarded_to_pi_agent_session(tmp_path: Path) -> None:
+def test_review_session_does_not_expose_human_message_route(tmp_path: Path) -> None:
     payload = {
         "provider": "github",
         "repo_full_name": "example/repo",
@@ -1704,10 +1923,7 @@ def test_human_message_is_forwarded_to_pi_agent_session(tmp_path: Path) -> None:
             json={"message": "Yes, this is intentional.", "delivery": "answer"},
         )
 
-    assert response.status_code == 202
-    assert fake_pi_agent.sent_messages == [
-        ("session-1", "Yes, this is intentional.", "answer")
-    ]
+    assert response.status_code == 404
 
 
 def test_public_api_not_found_contracts(tmp_path: Path) -> None:
