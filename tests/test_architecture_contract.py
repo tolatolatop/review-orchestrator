@@ -27,7 +27,6 @@ def test_public_route_inventory_survives_directory_refactors() -> None:
         ("GET", "/api/v1/agent-tasks"),
         ("POST", "/api/v1/agent-tasks/{task_id}/cancel"),
         ("POST", "/api/v1/agent-tasks/{task_id}/retry"),
-        ("POST", "/api/v1/review-runs"),
         ("GET", "/api/v1/review-runs"),
         ("GET", "/api/v1/review-runs/{review_run_id}"),
         ("POST", "/api/v1/review-runs/{review_run_id}/session/start"),
@@ -35,6 +34,7 @@ def test_public_route_inventory_survives_directory_refactors() -> None:
         ("POST", "/api/v1/review-runs/{review_run_id}/session/cancel"),
         ("POST", "/api/v1/review-runs/{review_run_id}/result"),
         ("POST", "/api/v1/review-runs/{review_run_id}/retry"),
+        ("POST", "/api/v1/review-runs/{review_run_id}/rerun"),
         ("POST", "/api/v1/review-runs/{review_run_id}/cancel"),
         ("POST", "/api/v1/workspaces/prepare"),
         ("GET", "/api/v1/workspaces/{workspace_id}"),
@@ -46,6 +46,7 @@ def test_public_route_inventory_survives_directory_refactors() -> None:
     }
 
     assert required_routes <= routes
+    assert ("POST", "/api/v1/review-runs") not in routes
 
 
 def test_legacy_modules_are_true_aliases_of_layered_implementations() -> None:

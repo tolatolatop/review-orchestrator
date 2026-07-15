@@ -77,7 +77,7 @@ locally:
 - `GET /health`
 - `POST /api/v1/diagnostics/platform-permissions`
 - `POST /api/v1/webhooks/{provider}`
-- `POST /api/v1/review-runs`
+- `GET /api/v1/review-runs`
 - `GET /api/v1/review-runs/{review_run_id}`
 - `POST /api/v1/review-runs/{review_run_id}/session/start`
 - `POST /api/v1/review-runs/{review_run_id}/session/sync`
@@ -85,6 +85,7 @@ locally:
 - `POST /api/v1/review-runs/{review_run_id}/session/cancel`
 - `POST /api/v1/review-runs/{review_run_id}/result`
 - `POST /api/v1/review-runs/{review_run_id}/retry`
+- `POST /api/v1/review-runs/{review_run_id}/rerun`
 - `POST /api/v1/review-runs/{review_run_id}/cancel`
 - `GET /api/v1/agent-tasks/{agent_task_id}/agent-session`
 - `POST /api/v1/agent-tasks/{agent_task_id}/cancel`
@@ -98,10 +99,22 @@ Secure self-host exposure, authentication boundaries, raw-payload risks, and
 the deployment verification checklist are documented in
 [`docs/observability-deployment.md`](docs/observability-deployment.md).
 
-`POST /api/v1/review-runs` is idempotent for
-`provider + repo_full_name + pull_request_number + head_sha`. A repeated request
-returns the latest existing run unless `force=true` is supplied. Failed runs can
-be retried through the retry endpoint without `force=true`.
+The service does not expose a collection endpoint that creates a `ReviewRun`
+from repository and PR number alone. Automatic reviews start from a verified
+provider webhook, which persists the PR context and passes a review request to
+the shared handler. A first manual review by repository and PR number is
+intentionally outside the current API.
+
+Operators can retry a failed run with the retry endpoint. The request is stored
+as an internal `review_requested / retry` inbox event and uses
+`review-retry:{source_review_run_id}` as its idempotency key. Repeating the same
+request returns the same event and attempt.
+
+A completed or cancelled current-revision run can be reviewed again through the
+rerun endpoint. Rerun uses a caller-supplied idempotency key and records an
+internal `review_requested / rerun` event. Stale revisions, closed pull requests,
+and revisions with active runs are rejected while retaining the event and its
+explainable error code in the operator dashboard.
 
 ### Platform permission diagnostics
 

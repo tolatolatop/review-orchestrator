@@ -19,9 +19,10 @@ from review_orchestrator.application.scheduler import (
     release_task_claim,
 )
 from review_orchestrator.application.services import (
+    ReviewRequest,
     collect_review_result,
-    create_review_run,
     get_or_create_review_config,
+    handle_review_requested,
     start_review_session,
     sync_review_session,
 )
@@ -34,7 +35,7 @@ from review_orchestrator.domain.models import (
     utc_now,
 )
 from review_orchestrator.domain.review_results import ChangedFile
-from review_orchestrator.domain.schemas import ReviewRunCreate, WorkspacePrepareRequest
+from review_orchestrator.domain.schemas import WorkspacePrepareRequest
 from review_orchestrator.infrastructure.config import Settings
 from review_orchestrator.infrastructure.workspaces import prepare_workspace
 from review_orchestrator.integrations.github import (
@@ -217,21 +218,25 @@ async def process_next_agent_task(
                 provider_registry=registry,
             )
 
-        review_run = await create_review_run(
+        trigger_event = await _review_request_event_for_agent_task(
             session,
-            ReviewRunCreate(
-                provider=context.provider,
-                repo_full_name=context.repo_full_name,
-                pull_request_number=context.pull_request_number,
-                base_sha=context.base_sha,
-                head_sha=context.head_sha,
-                force=True,
-            ),
-            trigger_type="mention",
-            trigger_event_id=task.provider_event_id,
+            task,
+            context,
         )
+        review_run, _ = await handle_review_requested(
+            session,
+            ReviewRequest(
+                reason="mention",
+                trigger_event_id=trigger_event.id,
+                pull_request_context_id=context.id,
+            ),
+        )
+        trigger_event.status = "queued"
+        trigger_event.review_run_id = review_run.id
+        trigger_event.processed_at = utc_now()
         task.status = "completed"
         task.result_json = {"review_run_id": review_run.id, "status": review_run.status}
+        session.add(trigger_event)
         session.add(task)
         await session.commit()
         await session.refresh(task)
@@ -763,18 +768,40 @@ async def _fail_agent_task(
     provider_registry: ProviderRegistry,
 ) -> AgentTask:
     task.status = "failed"
+    task.failure_code = failure_code
     task.error_message = error
     session.add(task)
     await session.commit()
     await session.refresh(task)
 
+    context = await _task_context(session, task)
+    if context is None:
+        return task
     try:
-        review_run = await _review_run_for_failed_agent_task(
+        trigger_event = await _review_request_event_for_agent_task(
             session,
             task,
-            failure_code=failure_code,
-            error=error,
+            context,
         )
+        review_run, _ = await handle_review_requested(
+            session,
+            ReviewRequest(
+                reason="mention",
+                trigger_event_id=trigger_event.id,
+                pull_request_context_id=context.id,
+            ),
+        )
+        review_run.status = "failed"
+        review_run.failure_code = failure_code
+        review_run.error = error
+        review_run.completed_at = utc_now()
+        trigger_event.status = "queued"
+        trigger_event.review_run_id = review_run.id
+        trigger_event.processed_at = utc_now()
+        session.add(trigger_event)
+        session.add(review_run)
+        await session.commit()
+        await session.refresh(review_run)
         await publish_review_run_status_comment(
             session,
             review_run,
@@ -792,62 +819,41 @@ async def _fail_agent_task(
     return task
 
 
-async def _review_run_for_failed_agent_task(
+async def _review_request_event_for_agent_task(
     session: AsyncSession,
     task: AgentTask,
-    *,
-    failure_code: str,
-    error: str,
-) -> ReviewRun:
-    context = await _task_context(session, task)
-    review_run = await create_review_run(
-        session,
-        ReviewRunCreate(
-            provider=task.provider,
-            repo_full_name=task.repo_full_name,
-            pull_request_number=task.pull_request_number,
-            base_sha=context.base_sha if context else None,
-            head_sha=(context.head_sha if context else _task_head_sha(task)),
-            force=True,
-        ),
-        trigger_type="mention",
-        trigger_event_id=task.provider_event_id,
+    context: PullRequestContext,
+) -> ProviderEventInbox:
+    if task.provider_event_id:
+        existing = await session.get(ProviderEventInbox, task.provider_event_id)
+        if existing is not None:
+            return existing
+    delivery_id = f"agent-task:{task.id}:review-request"
+    event = ProviderEventInbox(
+        provider="internal",
+        delivery_id=delivery_id,
+        provider_event="review_request",
+        provider_action="mention",
+        internal_event="review_requested",
+        repo_full_name=context.repo_full_name,
+        pull_request_number=context.pull_request_number,
+        head_sha=context.head_sha,
+        dedupe_key=delivery_id,
+        coalesce_key=f"review-request:agent-task:{task.id}",
+        payload_digest=hashlib.sha256(delivery_id.encode()).hexdigest(),
+        payload={
+            "schema_version": "1",
+            "trigger_type": "mention",
+            "source_agent_task_id": task.id,
+            "target_provider": context.provider,
+        },
+        status="received",
     )
-    review_run.status = "failed"
-    review_run.failure_code = failure_code
-    review_run.error = error
-    review_run.completed_at = utc_now()
-    session.add(review_run)
-    await session.commit()
-    await session.refresh(review_run)
-    return review_run
-
-
-def _task_head_sha(task: AgentTask) -> str:
-    payload = (task.input_json or {}).get("payload")
-    if isinstance(payload, dict):
-        head_sha = _head_sha_from_payload(payload)
-        if head_sha:
-            return head_sha
-    return "unknown"
-
-
-def _head_sha_from_payload(payload: dict[str, Any]) -> str | None:
-    pull_request = payload.get("pull_request")
-    if isinstance(pull_request, dict):
-        head = pull_request.get("head")
-        if isinstance(head, dict):
-            return _str_or_none(head.get("sha"))
-    merge_request = payload.get("merge_request") or payload.get("object_attributes")
-    if isinstance(merge_request, dict):
-        last_commit = merge_request.get("last_commit")
-        last_commit_sha = (
-            _str_or_none(last_commit.get("id"))
-            if isinstance(last_commit, dict)
-            else None
-        )
-        return _str_or_none(merge_request.get("sha")) or last_commit_sha
-    return None
+    session.add(event)
+    await session.flush()
+    task.provider_event_id = event.id
+    session.add(task)
+    return event
 
 
 async def process_next_review_run(

@@ -1,7 +1,10 @@
 """Review lifecycle use cases, queries, and webhook orchestration."""
 
+import hashlib
+import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
@@ -48,7 +51,8 @@ from review_orchestrator.domain.schemas import (
     ProviderEventInboxSummary,
     ResourcePoolListResponse,
     ResourcePoolRead,
-    ReviewRunCreate,
+    ReviewRunActionAvailability,
+    ReviewRunAvailableActions,
     ReviewRunDetail,
     ReviewRunFindingsSummary,
     ReviewRunLinkedEventSummary,
@@ -59,6 +63,8 @@ from review_orchestrator.domain.schemas import (
     ReviewRunProviderPublishing,
     ReviewRunPullRequestContext,
     ReviewRunRead,
+    ReviewRunRerunResult,
+    ReviewRunRetryResult,
     ReviewRunSessionSummary,
     ReviewRunWorkspaceSummary,
     SessionArchiveListResponse,
@@ -93,6 +99,27 @@ from review_orchestrator.integrations.providers import (
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "superseded"}
 CANCELLABLE_STATUSES = {"queued", "running"}
+ACTIVE_REVIEW_STATUSES = {"queued", "running", "awaiting_delivery"}
+RERUN_SOURCE_STATUSES = {"completed", "cancelled"}
+
+
+@dataclass(frozen=True)
+class ReviewRunSpec:
+    provider: str
+    repo_full_name: str
+    pull_request_number: int
+    base_sha: str | None
+    head_sha: str
+    force: bool = False
+
+
+@dataclass(frozen=True)
+class ReviewRequest:
+    reason: Literal["automatic", "mention", "retry", "rerun"]
+    trigger_event_id: str
+    pull_request_context_id: str
+    source_review_run_id: str | None = None
+    dedupe_key: str | None = None
 
 
 class ReviewRunTransitionError(ValueError):
@@ -102,30 +129,48 @@ class ReviewRunTransitionError(ValueError):
         self.status_code = status_code
 
 
-async def create_review_run(
+class ReviewRequestRejected(ReviewRunTransitionError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        event_id: str,
+        existing_review_run_id: str | None = None,
+    ) -> None:
+        super().__init__(message, status_code=409)
+        self.code = code
+        self.event_id = event_id
+        self.existing_review_run_id = existing_review_run_id
+
+
+async def _create_review_run_record(
     session: AsyncSession,
-    payload: ReviewRunCreate,
+    spec: ReviewRunSpec,
     *,
-    trigger_type: str = "manual",
-    trigger_event_id: str | None = None,
-) -> ReviewRun:
+    trigger_type: str,
+    trigger_event_id: str,
+    dedupe_key: str | None = None,
+) -> tuple[ReviewRun, bool]:
     latest = await get_latest_review_run_by_head(
         session,
-        provider=payload.provider,
-        repo_full_name=payload.repo_full_name,
-        pull_request_number=payload.pull_request_number,
-        head_sha=payload.head_sha,
+        provider=spec.provider,
+        repo_full_name=spec.repo_full_name,
+        pull_request_number=spec.pull_request_number,
+        head_sha=spec.head_sha,
     )
-    if latest and not payload.force:
-        return latest
+    if latest and not spec.force:
+        return latest, False
 
     next_attempt = 1 if latest is None else latest.attempt + 1
 
-    values = payload.model_dump(exclude={"force"})
-    queue = "manual-review" if trigger_type == "manual" else "webhook-review"
-    priority = 60 if trigger_type == "manual" else 40
+    queue, priority = _review_trigger_policy(trigger_type)
     review_run = ReviewRun(
-        **values,
+        provider=spec.provider,
+        repo_full_name=spec.repo_full_name,
+        pull_request_number=spec.pull_request_number,
+        base_sha=spec.base_sha,
+        head_sha=spec.head_sha,
         capability_id="code-review",
         status="queued",
         execution_status="pending",
@@ -133,39 +178,44 @@ async def create_review_run(
         queue=queue,
         priority=priority,
         effective_priority=priority,
+        dedupe_key=dedupe_key,
         concurrency_key=(
-            f"{payload.provider}:{payload.repo_full_name}:pr:"
-            f"{payload.pull_request_number}:head:{payload.head_sha}"
+            f"{spec.provider}:{spec.repo_full_name}:pr:"
+            f"{spec.pull_request_number}:head:{spec.head_sha}"
         ),
         resource_context_json={
-            "repository": f"{payload.provider}/{payload.repo_full_name}",
+            "repository": f"{spec.provider}/{spec.repo_full_name}",
             "pr_head": (
-                f"{payload.provider}/{payload.repo_full_name}/"
-                f"{payload.pull_request_number}/{payload.head_sha}"
+                f"{spec.provider}/{spec.repo_full_name}/"
+                f"{spec.pull_request_number}/{spec.head_sha}"
             ),
         },
         trigger_type=trigger_type,
         trigger_event_id=trigger_event_id,
         attempt=next_attempt,
     )
-    session.add(review_run)
     try:
-        await session.flush()
+        async with session.begin_nested():
+            session.add(review_run)
+            await session.flush()
     except IntegrityError:
-        await session.rollback()
         existing = await get_latest_review_run_by_head(
             session,
-            provider=payload.provider,
-            repo_full_name=payload.repo_full_name,
-            pull_request_number=payload.pull_request_number,
-            head_sha=payload.head_sha,
+            provider=spec.provider,
+            repo_full_name=spec.repo_full_name,
+            pull_request_number=spec.pull_request_number,
+            head_sha=spec.head_sha,
         )
         if existing is None:
             raise
-        return existing
-    await session.commit()
-    await session.refresh(review_run)
-    return review_run
+        return existing, False
+    return review_run, True
+
+
+def _review_trigger_policy(trigger_type: str) -> tuple[str, int]:
+    if trigger_type in {"retry", "dashboard_rerun"}:
+        return "manual-review", 60
+    return "webhook-review", 40
 
 
 async def get_review_run(
@@ -401,6 +451,18 @@ async def get_review_run_detail(
     findings = await _findings_summary_for_run(session, review_run.id)
     trigger_event = await _trigger_event_for_run(session, review_run)
     agent_task = await _agent_task_for_run(session, review_run)
+    available_actions = ReviewRunAvailableActions(
+        retry=await get_review_run_retry_availability(
+            session,
+            review_run,
+            context=context,
+        ),
+        rerun=await get_review_run_rerun_availability(
+            session,
+            review_run,
+            context=context,
+        )
+    )
     list_item = _review_run_list_item(review_run, publishing, context)
 
     return ReviewRunDetail(
@@ -412,6 +474,7 @@ async def get_review_run_detail(
         validation_errors=review_run.validation_errors_json or [],
         trigger_event=_linked_event_summary(trigger_event),
         agent_task=_linked_task_summary(agent_task),
+        available_actions=available_actions,
     )
 
 
@@ -725,24 +788,492 @@ async def get_latest_review_run_by_head(
     return result.scalar_one_or_none()
 
 
-async def retry_review_run(
+async def get_review_run_rerun_availability(
     session: AsyncSession,
-    review_run_id: str,
-) -> ReviewRun | None:
-    review_run = await get_review_run(session, review_run_id)
-    if review_run is None:
-        return None
-    if review_run.status != "failed":
-        return review_run
-    payload = ReviewRunCreate(
+    review_run: ReviewRun,
+    *,
+    context: PullRequestContext | None = None,
+) -> ReviewRunActionAvailability:
+    return await _get_source_review_action_availability(
+        session,
+        review_run,
+        action="rerun",
+        allowed_statuses=RERUN_SOURCE_STATUSES,
+        context=context,
+    )
+
+
+async def get_review_run_retry_availability(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    context: PullRequestContext | None = None,
+    request_event_id: str | None = None,
+) -> ReviewRunActionAvailability:
+    existing_event = await get_provider_event(
+        session,
+        "internal",
+        f"review-retry:{review_run.id}",
+    )
+    if existing_event is not None and existing_event.id != request_event_id:
+        if existing_event.review_run_id:
+            return ReviewRunActionAvailability(
+                allowed=False,
+                reason_code="retry_already_requested",
+                message="该失败任务已经创建过重试任务。",
+                existing_review_run_id=existing_event.review_run_id,
+                current_base_sha=(context.base_sha if context else None),
+                current_head_sha=(context.head_sha if context else None),
+            )
+        return ReviewRunActionAvailability(
+            allowed=False,
+            reason_code=existing_event.error_code or "retry_request_pending",
+            message=(
+                existing_event.error_message
+                or "该失败任务已有重试请求正在处理。"
+            ),
+            current_base_sha=(context.base_sha if context else None),
+            current_head_sha=(context.head_sha if context else None),
+        )
+    return await _get_source_review_action_availability(
+        session,
+        review_run,
+        action="retry",
+        allowed_statuses={"failed"},
+        context=context,
+    )
+
+
+async def _get_source_review_action_availability(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    action: Literal["retry", "rerun"],
+    allowed_statuses: set[str],
+    context: PullRequestContext | None = None,
+) -> ReviewRunActionAvailability:
+    context = context or await _pull_request_context_for_run(session, review_run)
+    current_base_sha = context.base_sha if context else None
+    current_head_sha = context.head_sha if context else None
+
+    if review_run.status not in allowed_statuses:
+        if review_run.status == "superseded":
+            reason_code = "revision_not_current"
+            message = "该任务审查的是旧版本，请从最新版本重新审查。"
+        elif action == "retry":
+            reason_code = "run_not_failed"
+            message = "只有失败的审查任务可以重试。"
+        elif review_run.status == "failed":
+            reason_code = "failed_run_requires_retry"
+            message = "失败的审查任务应使用重试操作。"
+        else:
+            reason_code = "run_not_terminal"
+            message = "当前审查尚未结束，不能创建重复审查。"
+        return ReviewRunActionAvailability(
+            allowed=False,
+            reason_code=reason_code,
+            message=message,
+            current_base_sha=current_base_sha,
+            current_head_sha=current_head_sha,
+        )
+    if context is None:
+        return ReviewRunActionAvailability(
+            allowed=False,
+            reason_code="missing_pr_context",
+            message="找不到该任务对应的 PR 上下文。",
+        )
+    if context.status.lower() not in {"open", "opened"}:
+        return ReviewRunActionAvailability(
+            allowed=False,
+            reason_code="pull_request_closed",
+            message="该 PR 已关闭，不能重新审查。",
+            current_base_sha=current_base_sha,
+            current_head_sha=current_head_sha,
+        )
+    if not review_run.base_sha:
+        return ReviewRunActionAvailability(
+            allowed=False,
+            reason_code="base_revision_missing",
+            message="源任务缺少 Base commit，不能重新审查。",
+            current_base_sha=current_base_sha,
+            current_head_sha=current_head_sha,
+        )
+    if review_run.head_sha != context.head_sha or (
+        context.base_sha is not None and review_run.base_sha != context.base_sha
+    ):
+        return ReviewRunActionAvailability(
+            allowed=False,
+            reason_code="revision_not_current",
+            message="该任务审查的版本已过期，请从最新版本重新审查。",
+            current_base_sha=current_base_sha,
+            current_head_sha=current_head_sha,
+        )
+
+    active_result = await session.execute(
+        select(ReviewRun)
+        .where(
+            ReviewRun.provider == review_run.provider,
+            ReviewRun.repo_full_name == review_run.repo_full_name,
+            ReviewRun.pull_request_number == review_run.pull_request_number,
+            ReviewRun.head_sha == review_run.head_sha,
+            ReviewRun.id != review_run.id,
+            ReviewRun.status.in_(ACTIVE_REVIEW_STATUSES),
+        )
+        .order_by(ReviewRun.created_at.desc(), ReviewRun.id.desc())
+        .limit(1)
+    )
+    active = active_result.scalar_one_or_none()
+    if active is not None:
+        return ReviewRunActionAvailability(
+            allowed=False,
+            reason_code="active_review_exists",
+            message="该版本已有审查正在执行。",
+            existing_review_run_id=active.id,
+            current_base_sha=current_base_sha,
+            current_head_sha=current_head_sha,
+        )
+
+    latest = await get_latest_review_run_by_head(
+        session,
         provider=review_run.provider,
         repo_full_name=review_run.repo_full_name,
         pull_request_number=review_run.pull_request_number,
-        base_sha=review_run.base_sha,
         head_sha=review_run.head_sha,
-        force=True,
     )
-    return await create_review_run(session, payload, trigger_type="retry")
+    return ReviewRunActionAvailability(
+        allowed=True,
+        reason_code=f"{action}_allowed",
+        message=(
+            "可以为当前失败任务创建一次重试。"
+            if action == "retry"
+            else "可以为当前版本创建一次新的完整审查。"
+        ),
+        next_attempt=(latest.attempt if latest else review_run.attempt) + 1,
+        current_base_sha=current_base_sha,
+        current_head_sha=current_head_sha,
+    )
+
+
+async def request_review_rerun(
+    session: AsyncSession,
+    review_run_id: str,
+    *,
+    idempotency_key: str,
+) -> ReviewRunRerunResult | None:
+    result = await _request_source_review_action(
+        session,
+        review_run_id,
+        action="rerun",
+        delivery_id=f"dashboard-rerun:{idempotency_key}",
+    )
+    return ReviewRunRerunResult(**result) if result is not None else None
+
+
+async def request_review_retry(
+    session: AsyncSession,
+    review_run_id: str,
+) -> ReviewRunRetryResult | None:
+    result = await _request_source_review_action(
+        session,
+        review_run_id,
+        action="retry",
+        delivery_id=f"review-retry:{review_run_id}",
+    )
+    return ReviewRunRetryResult(**result) if result is not None else None
+
+
+async def _request_source_review_action(
+    session: AsyncSession,
+    review_run_id: str,
+    *,
+    action: Literal["retry", "rerun"],
+    delivery_id: str,
+) -> dict[str, Any] | None:
+    existing_event = await get_provider_event(session, "internal", delivery_id)
+    if existing_event is not None:
+        source_id = (existing_event.payload or {}).get("source_review_run_id")
+        if source_id != review_run_id:
+            raise ReviewRequestRejected(
+                "该幂等键已用于另一个审查请求。",
+                code="idempotency_conflict",
+                event_id=existing_event.id,
+                existing_review_run_id=existing_event.review_run_id,
+            )
+        if existing_event.review_run_id:
+            existing_run = await session.get(ReviewRun, existing_event.review_run_id)
+            if existing_run is not None:
+                return _review_request_result(
+                    source_id=review_run_id,
+                    event=existing_event,
+                    review_run=existing_run,
+                    deduplicated=True,
+                )
+        raise ReviewRequestRejected(
+            existing_event.error_message or "审查请求未创建任务。",
+            code=existing_event.error_code or "review_request_not_queued",
+            event_id=existing_event.id,
+        )
+
+    source = await session.get(ReviewRun, review_run_id)
+    if source is None:
+        return None
+    context = await _pull_request_context_for_run(session, source)
+    trigger_type = "retry" if action == "retry" else "dashboard_rerun"
+    event_payload = {
+        "schema_version": "1",
+        "target_provider": source.provider,
+        "trigger_type": trigger_type,
+        "source_review_run_id": source.id,
+        "revision_policy": "source_run",
+        "revision": {"base_sha": source.base_sha, "head_sha": source.head_sha},
+    }
+    encoded_payload = json.dumps(
+        event_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    event = ProviderEventInbox(
+        provider="internal",
+        delivery_id=delivery_id,
+        provider_event="review_request",
+        provider_action=action,
+        internal_event="review_requested",
+        repo_full_name=source.repo_full_name,
+        pull_request_number=source.pull_request_number,
+        head_sha=source.head_sha,
+        dedupe_key=delivery_id,
+        coalesce_key=f"review-request:{source.provider}:{source.id}:{action}",
+        payload_digest=hashlib.sha256(encoded_payload).hexdigest(),
+        payload=event_payload,
+        status="received",
+    )
+    try:
+        async with session.begin_nested():
+            session.add(event)
+            await session.flush()
+    except IntegrityError:
+        duplicate = await get_provider_event(session, "internal", delivery_id)
+        if duplicate is None:
+            raise
+        return await _request_source_review_action(
+            session,
+            review_run_id,
+            action=action,
+            delivery_id=delivery_id,
+        )
+
+    availability = (
+        await get_review_run_retry_availability(
+            session,
+            source,
+            context=context,
+            request_event_id=event.id,
+        )
+        if action == "retry"
+        else await get_review_run_rerun_availability(session, source, context=context)
+    )
+    if not availability.allowed:
+        await _reject_review_request(
+            session,
+            event,
+            code=availability.reason_code,
+            message=availability.message,
+            existing_review_run_id=availability.existing_review_run_id,
+        )
+    if context is None:
+        raise AssertionError("allowed review request is missing PR context")
+    assert context is not None
+    request = ReviewRequest(
+        reason=action,
+        trigger_event_id=event.id,
+        pull_request_context_id=context.id,
+        source_review_run_id=source.id,
+        dedupe_key=event.dedupe_key,
+    )
+    try:
+        review_run, created = await handle_review_requested(session, request)
+    except ReviewRequestRejected as exc:
+        await _reject_review_request(
+            session,
+            event,
+            code=exc.code,
+            message=exc.message,
+            existing_review_run_id=exc.existing_review_run_id,
+        )
+        raise AssertionError("unreachable") from exc
+
+    event.status = "queued"
+    event.review_run_id = review_run.id
+    event.processed_at = utc_now()
+    session.add(event)
+    await session.commit()
+    await session.refresh(event)
+    await session.refresh(review_run)
+    return _review_request_result(
+        source_id=source.id,
+        event=event,
+        review_run=review_run,
+        deduplicated=not created,
+    )
+
+
+async def _reject_review_request(
+    session: AsyncSession,
+    event: ProviderEventInbox,
+    *,
+    code: str,
+    message: str,
+    existing_review_run_id: str | None = None,
+) -> None:
+    event.status = "rejected"
+    event.error_code = code
+    event.error_message = message
+    event.processed_at = utc_now()
+    session.add(event)
+    await session.commit()
+    await session.refresh(event)
+    raise ReviewRequestRejected(
+        message,
+        code=code,
+        event_id=event.id,
+        existing_review_run_id=existing_review_run_id,
+    )
+
+
+def _review_request_result(
+    *,
+    source_id: str,
+    event: ProviderEventInbox,
+    review_run: ReviewRun,
+    deduplicated: bool,
+) -> dict[str, Any]:
+    return {
+        "source_review_run_id": source_id,
+        "review_request_event_id": event.id,
+        "review_run_id": review_run.id,
+        "attempt": review_run.attempt,
+        "status": review_run.status,
+        "deduplicated": deduplicated,
+    }
+
+
+async def handle_review_requested(
+    session: AsyncSession,
+    request: ReviewRequest,
+) -> tuple[ReviewRun, bool]:
+    """The only production entry point allowed to create a ReviewRun record."""
+
+    event = await session.get(ProviderEventInbox, request.trigger_event_id)
+    if event is None:
+        raise ValueError("Review request trigger event does not exist.")
+    source_action = request.reason in {"retry", "rerun"}
+    if source_action != (request.source_review_run_id is not None):
+        raise ValueError(
+            "Retry and rerun requests must reference exactly one source review run."
+        )
+    context_statement = select(PullRequestContext).where(
+        PullRequestContext.id == request.pull_request_context_id
+    )
+    if session.get_bind().dialect.name == "postgresql":
+        context_statement = context_statement.with_for_update()
+    context = (await session.execute(context_statement)).scalar_one_or_none()
+    if context is None:
+        raise ReviewRequestRejected(
+            "找不到审查请求对应的 PR 上下文。",
+            code="missing_pr_context",
+            event_id=event.id,
+        )
+    if context.status.lower() not in {"open", "opened"}:
+        raise ReviewRequestRejected(
+            "该 PR 已关闭，不能创建审查任务。",
+            code="pull_request_closed",
+            event_id=event.id,
+        )
+
+    source: ReviewRun | None = None
+    if request.source_review_run_id:
+        source = await session.get(ReviewRun, request.source_review_run_id)
+        if source is None:
+            raise ReviewRequestRejected(
+                "找不到源审查任务。",
+                code="source_review_run_missing",
+                event_id=event.id,
+            )
+        if (
+            source.provider,
+            source.repo_full_name,
+            source.pull_request_number,
+        ) != (
+            context.provider,
+            context.repo_full_name,
+            context.pull_request_number,
+        ):
+            raise ReviewRequestRejected(
+                "源审查任务与 PR 上下文不匹配。",
+                code="source_context_mismatch",
+                event_id=event.id,
+            )
+        availability = (
+            await get_review_run_retry_availability(
+                session,
+                source,
+                context=context,
+                request_event_id=event.id,
+            )
+            if request.reason == "retry"
+            else await get_review_run_rerun_availability(
+                session, source, context=context
+            )
+        )
+        if not availability.allowed:
+            raise ReviewRequestRejected(
+                availability.message,
+                code=availability.reason_code,
+                event_id=event.id,
+                existing_review_run_id=availability.existing_review_run_id,
+            )
+        base_sha = source.base_sha
+        head_sha = source.head_sha
+        force = True
+    else:
+        if not context.base_sha:
+            raise ReviewRequestRejected(
+                "PR 上下文缺少 Base commit。",
+                code="base_revision_missing",
+                event_id=event.id,
+            )
+        base_sha = context.base_sha
+        head_sha = context.head_sha
+        force = request.reason == "mention"
+
+    trigger_type = {
+        "automatic": "webhook",
+        "mention": "mention",
+        "retry": "retry",
+        "rerun": "dashboard_rerun",
+    }[request.reason]
+    review_run, created = await _create_review_run_record(
+        session,
+        ReviewRunSpec(
+            provider=context.provider,
+            repo_full_name=context.repo_full_name,
+            pull_request_number=context.pull_request_number,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            force=force,
+        ),
+        trigger_type=trigger_type,
+        trigger_event_id=event.id,
+        dedupe_key=request.dedupe_key,
+    )
+    review_run.pull_request_context_id = context.id
+    context.latest_review_run_id = review_run.id
+    if request.reason == "automatic" and created:
+        await supersede_older_review_runs(session, review_run)
+    session.add(context)
+    session.add(review_run)
+    await session.flush()
+    return review_run, created
 
 
 async def cancel_review_run(
@@ -831,13 +1362,16 @@ async def accept_provider_webhook(
         )
 
     if normalized_event.should_create_review_run:
-        review_run = await create_review_run_from_provider_payload(
+        if context is None:
+            raise ValueError("Review-triggering event is missing PR context.")
+        review_run, _ = await handle_review_requested(
             session,
-            event.provider,
-            payload,
-            trigger_event_id=event.id,
+            ReviewRequest(
+                reason="automatic",
+                trigger_event_id=event.id,
+                pull_request_context_id=context.id,
+            ),
         )
-        await supersede_older_review_runs(session, review_run)
         review_run_id = review_run.id
         event.review_run_id = review_run_id
         event.status = "queued"
@@ -1023,6 +1557,9 @@ async def upsert_pull_request_context(
     context.closed_at = identity["closed_at"]
     context.merged_at = identity["merged_at"]
 
+    # ReviewRequest stores the durable context ID; a newly added context does
+    # not receive its generated ID until SQLAlchemy flushes the insert.
+    await session.flush()
     return context
 
 
@@ -1872,6 +2409,9 @@ def _provider_event_summary(
         payload_digest=event.payload_digest,
         coalesce_key=event.coalesce_key,
         review_run_id=event.review_run_id,
+        source_review_run_id=_str_or_none(
+            (event.payload or {}).get("source_review_run_id")
+        ),
         agent_task_id=agent_task_id,
         error_code=event.error_code,
         error_message=_safe_error_message(event.error_message),
@@ -2268,6 +2808,9 @@ def _linked_event_summary(
         status=event.status,
         error_code=event.error_code,
         error_message=_safe_error_message(event.error_message),
+        source_review_run_id=_str_or_none(
+            (event.payload or {}).get("source_review_run_id")
+        ),
         created_at=event.created_at,
         processed_at=event.processed_at,
     )
@@ -2387,66 +2930,6 @@ async def supersede_older_review_runs(
         review_run.completed_at = now
         session.add(review_run)
     return older_runs
-
-
-async def create_review_run_from_github_payload(
-    session: AsyncSession,
-    payload: dict[str, Any],
-    *,
-    trigger_event_id: str | None = None,
-) -> ReviewRun:
-    pull_request = payload.get("pull_request")
-    repository = payload.get("repository")
-    if not isinstance(pull_request, dict) or not isinstance(repository, dict):
-        raise ValueError("GitHub pull_request payload is missing required objects.")
-
-    repository_name = _str_or_none(repository.get("full_name"))
-    pull_request_number = pull_request.get("number")
-    head_sha = _head_sha(pull_request)
-    if not repository_name or not isinstance(pull_request_number, int) or not head_sha:
-        raise ValueError("GitHub pull_request payload is missing PR identity fields.")
-
-    return await create_review_run(
-        session,
-        ReviewRunCreate(
-            provider="github",
-            repo_full_name=repository_name,
-            pull_request_number=pull_request_number,
-            base_sha=_base_sha(pull_request),
-            head_sha=head_sha,
-        ),
-        trigger_type="webhook",
-        trigger_event_id=trigger_event_id,
-    )
-
-
-async def create_review_run_from_provider_payload(
-    session: AsyncSession,
-    provider: str,
-    payload: dict[str, Any],
-    *,
-    trigger_event_id: str | None = None,
-) -> ReviewRun:
-    if provider == "github":
-        return await create_review_run_from_github_payload(
-            session, payload, trigger_event_id=trigger_event_id
-        )
-
-    identity = _pull_request_identity(provider, payload)
-    if identity is None:
-        raise ValueError(f"{provider} payload is missing PR identity fields.")
-    return await create_review_run(
-        session,
-        ReviewRunCreate(
-            provider=provider,
-            repo_full_name=identity["repository"],
-            pull_request_number=identity["number"],
-            base_sha=identity["base_sha"],
-            head_sha=identity["head_sha"],
-        ),
-        trigger_type="webhook",
-        trigger_event_id=trigger_event_id,
-    )
 
 
 async def get_or_create_review_config(

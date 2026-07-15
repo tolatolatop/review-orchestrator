@@ -7,7 +7,6 @@ from review_orchestrator.application.services import (
     ReviewRunTransitionError,
     cancel_review_session,
     collect_review_result,
-    create_review_run,
     get_pi_agent_session_diagnostics_for_agent_task,
     get_pi_agent_session_diagnostics_for_review_run,
     get_pi_agent_session_diagnostics_for_session,
@@ -15,7 +14,6 @@ from review_orchestrator.application.services import (
     sync_review_session,
 )
 from review_orchestrator.domain.models import AgentTask
-from review_orchestrator.domain.schemas import ReviewRunCreate
 from review_orchestrator.infrastructure.config import Settings
 from review_orchestrator.infrastructure.db import (
     create_engine,
@@ -26,6 +24,7 @@ from review_orchestrator.integrations.pi_agent import (
     PiAgentClientError,
     PiAgentSession,
 )
+from tests.factories import ReviewRunCreate, create_review_run
 
 
 @pytest.fixture

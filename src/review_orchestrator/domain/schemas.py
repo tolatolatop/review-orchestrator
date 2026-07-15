@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -19,15 +21,6 @@ class ReviewRunStatus(StrEnum):
     failed = "failed"
     cancelled = "cancelled"
     superseded = "superseded"
-
-
-class ReviewRunCreate(BaseModel):
-    provider: str = Field(min_length=1, max_length=64)
-    repo_full_name: str = Field(min_length=1, max_length=512)
-    pull_request_number: int = Field(gt=0)
-    head_sha: str = Field(min_length=7, max_length=80)
-    base_sha: str | None = Field(default=None, max_length=80)
-    force: bool = False
 
 
 class ReviewRunRead(BaseModel):
@@ -153,6 +146,7 @@ class ReviewRunLinkedEventSummary(BaseModel):
     status: str
     error_code: str | None
     error_message: str | None
+    source_review_run_id: str | None = None
     created_at: datetime
     processed_at: datetime | None
 
@@ -167,6 +161,21 @@ class ReviewRunLinkedTaskSummary(BaseModel):
     updated_at: datetime
 
 
+class ReviewRunActionAvailability(BaseModel):
+    allowed: bool
+    reason_code: str
+    message: str
+    next_attempt: int | None = None
+    existing_review_run_id: str | None = None
+    current_base_sha: str | None = None
+    current_head_sha: str | None = None
+
+
+class ReviewRunAvailableActions(BaseModel):
+    retry: ReviewRunActionAvailability
+    rerun: ReviewRunActionAvailability
+
+
 class ReviewRunDetail(ReviewRunListItem):
     workspace: ReviewRunWorkspaceSummary | None = None
     review_session: ReviewRunSessionSummary | None = None
@@ -175,6 +184,32 @@ class ReviewRunDetail(ReviewRunListItem):
     validation_errors: list = Field(default_factory=list)
     trigger_event: ReviewRunLinkedEventSummary | None = None
     agent_task: ReviewRunLinkedTaskSummary | None = None
+    available_actions: ReviewRunAvailableActions
+
+
+class ReviewRunRerunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision: Literal["same_revision"] = "same_revision"
+    idempotency_key: UUID
+
+
+class ReviewRunRerunResult(BaseModel):
+    source_review_run_id: str
+    review_request_event_id: str
+    review_run_id: str
+    attempt: int
+    status: ReviewRunStatus
+    deduplicated: bool = False
+
+
+class ReviewRunRetryResult(BaseModel):
+    source_review_run_id: str
+    review_request_event_id: str
+    review_run_id: str
+    attempt: int
+    status: ReviewRunStatus
+    deduplicated: bool = False
 
 
 class ReviewSessionStart(BaseModel):
@@ -260,6 +295,7 @@ class ProviderEventInboxSummary(BaseModel):
     payload_digest: str
     coalesce_key: str | None
     review_run_id: str | None
+    source_review_run_id: str | None = None
     agent_task_id: str | None
     error_code: str | None
     error_message: str | None

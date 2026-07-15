@@ -28,6 +28,7 @@ from review_orchestrator.models import (
 from review_orchestrator.pi_agent import (
     PiAgentSession,
 )
+from tests.factories import ReviewRunCreate, create_review_run
 
 
 class FakePiAgentClient:
@@ -106,6 +107,72 @@ def json_body(payload: dict) -> bytes:
     return json.dumps(payload, separators=(",", ":")).encode()
 
 
+async def _seed_review_run_for_api(client: TestClient, payload: dict) -> str:
+    async with client.app.state.session_factory() as session:
+        review_run = await create_review_run(
+            session,
+            ReviewRunCreate(**payload),
+        )
+        return review_run.id
+
+
+def seed_review_run(client: TestClient, payload: dict) -> dict:
+    review_run_id = client.portal.call(_seed_review_run_for_api, client, payload)
+    response = client.get(f"/api/v1/review-runs/{review_run_id}")
+    assert response.status_code == 200
+    return response.json()
+
+
+async def make_review_run_rerunnable(
+    client: TestClient,
+    review_run_id: str,
+    context_head_sha: str | None = None,
+) -> None:
+    async with client.app.state.session_factory() as session:
+        review_run = await session.get(ReviewRun, review_run_id)
+        assert review_run is not None
+        context = PullRequestContext(
+            provider=review_run.provider,
+            repo_full_name=review_run.repo_full_name,
+            pull_request_number=review_run.pull_request_number,
+            base_sha=review_run.base_sha,
+            head_sha=context_head_sha or review_run.head_sha,
+            status="open",
+        )
+        session.add(context)
+        await session.flush()
+        review_run.pull_request_context_id = context.id
+        review_run.status = "completed"
+        review_run.stage = "completed"
+        await session.commit()
+
+
+async def make_review_run_retryable(
+    client: TestClient,
+    review_run_id: str,
+    context_head_sha: str | None = None,
+    context_status: str = "open",
+) -> None:
+    async with client.app.state.session_factory() as session:
+        review_run = await session.get(ReviewRun, review_run_id)
+        assert review_run is not None
+        context = PullRequestContext(
+            provider=review_run.provider,
+            repo_full_name=review_run.repo_full_name,
+            pull_request_number=review_run.pull_request_number,
+            base_sha=review_run.base_sha,
+            head_sha=context_head_sha or review_run.head_sha,
+            status=context_status,
+        )
+        session.add(context)
+        await session.flush()
+        review_run.pull_request_context_id = context.id
+        review_run.status = "failed"
+        review_run.stage = "failed"
+        review_run.failure_code = "agent_failed"
+        await session.commit()
+
+
 def test_bundled_dashboard_is_mounted(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
         redirect = client.get("/dashboard", follow_redirects=False)
@@ -117,6 +184,9 @@ def test_bundled_dashboard_is_mounted(tmp_path: Path) -> None:
     assert response.headers["content-type"].startswith("text/html")
     assert "Review operations" in response.text
     assert "/api/v1/observability" in response.text
+    assert "headers['X-Review-Token']=PROXY_TOKEN" in response.text
+    assert "Review requested · rerun" in response.text
+    assert "<option>rejected</option>" in response.text
 
 
 def test_review_ledger_dashboard_is_mounted(tmp_path: Path) -> None:
@@ -132,6 +202,10 @@ def test_review_ledger_dashboard_is_mounted(tmp_path: Path) -> None:
     assert "/api/v1/observability/review-runs" in response.text
     assert "REFRESH_SECONDS=30" in response.text
     assert "headers['X-Review-Token']=PROXY_TOKEN" in response.text
+    assert "重新审查" in response.text
+    assert 'data-review-action="retry"' in response.text
+    assert "重试失败审查" in response.text
+    assert "idempotency_key" in response.text
 
 
 def test_observability_list_aliases_are_available(tmp_path: Path) -> None:
@@ -146,9 +220,9 @@ def test_unified_task_scheduling_api_exposes_and_updates_review_task(
     tmp_path: Path,
 ) -> None:
     with make_client(tmp_path) as client:
-        created = client.post(
-            "/api/v1/review-runs",
-            json={
+        review_run = seed_review_run(
+            client,
+            {
                 "provider": "github",
                 "repo_full_name": "owner/repo",
                 "pull_request_number": 42,
@@ -156,8 +230,7 @@ def test_unified_task_scheduling_api_exposes_and_updates_review_task(
                 "head_sha": "b" * 40,
             },
         )
-        assert created.status_code == 201
-        task_id = created.json()["id"]
+        task_id = review_run["id"]
 
         listed = client.get(
             "/api/v1/tasks",
@@ -211,16 +284,15 @@ async def _claim_task_for_api_test(client: TestClient) -> str:
 
 def test_resource_pool_api_updates_counted_lock_capacity(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
-        created = client.post(
-            "/api/v1/review-runs",
-            json={
+        seed_review_run(
+            client,
+            {
                 "provider": "github",
                 "repo_full_name": "owner/repo",
                 "pull_request_number": 42,
                 "head_sha": "b" * 40,
             },
         )
-        assert created.status_code == 201
         client.portal.call(_claim_task_for_api_test, client)
 
         pools = client.get("/api/v1/resource-pools")
@@ -275,17 +347,16 @@ async def _enqueue_delivery_for_api_test(client: TestClient, task_id: str) -> st
 
 def test_delivery_scheduling_api_lists_and_reschedules_outbox(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
-        created = client.post(
-            "/api/v1/review-runs",
-            json={
+        review_run = seed_review_run(
+            client,
+            {
                 "provider": "github",
                 "repo_full_name": "owner/repo",
                 "pull_request_number": 42,
                 "head_sha": "b" * 40,
             },
         )
-        assert created.status_code == 201
-        task_id = created.json()["id"]
+        task_id = review_run["id"]
         delivery_id = client.portal.call(
             _enqueue_delivery_for_api_test,
             client,
@@ -334,17 +405,16 @@ async def _archive_session_for_api_test(client: TestClient, task_id: str) -> str
 
 def test_session_archive_api_lists_permanent_task_sessions(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
-        created = client.post(
-            "/api/v1/review-runs",
-            json={
+        review_run = seed_review_run(
+            client,
+            {
                 "provider": "github",
                 "repo_full_name": "owner/repo",
                 "pull_request_number": 42,
                 "head_sha": "b" * 40,
             },
         )
-        assert created.status_code == 201
-        task_id = created.json()["id"]
+        task_id = review_run["id"]
         archive_id = client.portal.call(
             _archive_session_for_api_test,
             client,
@@ -547,7 +617,7 @@ def test_health(tmp_path: Path) -> None:
     assert response.json() == {"status": "ok"}
 
 
-def test_create_and_get_review_run(tmp_path: Path) -> None:
+def test_get_seeded_review_run(tmp_path: Path) -> None:
     payload = {
         "provider": "github",
         "repo_full_name": "example/repo",
@@ -557,10 +627,7 @@ def test_create_and_get_review_run(tmp_path: Path) -> None:
     }
 
     with make_client(tmp_path) as client:
-        create_response = client.post("/api/v1/review-runs", json=payload)
-        assert create_response.status_code == 201
-        review_run = create_response.json()
-
+        review_run = seed_review_run(client, payload)
         get_response = client.get(f"/api/v1/review-runs/{review_run['id']}")
 
     assert get_response.status_code == 200
@@ -568,7 +635,7 @@ def test_create_and_get_review_run(tmp_path: Path) -> None:
     assert get_response.json()["attempt"] == 1
 
 
-def test_create_review_run_is_idempotent_without_force(tmp_path: Path) -> None:
+def test_direct_review_run_creation_is_not_exposed(tmp_path: Path) -> None:
     payload = {
         "provider": "github",
         "repo_full_name": "example/repo",
@@ -578,30 +645,11 @@ def test_create_review_run_is_idempotent_without_force(tmp_path: Path) -> None:
     }
 
     with make_client(tmp_path) as client:
-        first = client.post("/api/v1/review-runs", json=payload).json()
-        second = client.post("/api/v1/review-runs", json=payload).json()
+        response = client.post("/api/v1/review-runs", json=payload)
+        openapi = client.get("/openapi.json").json()
 
-    assert second["id"] == first["id"]
-    assert second["attempt"] == 1
-
-
-def test_force_create_review_run_creates_new_attempt(tmp_path: Path) -> None:
-    payload = {
-        "provider": "github",
-        "repo_full_name": "example/repo",
-        "pull_request_number": 42,
-        "base_sha": "a" * 40,
-        "head_sha": "b" * 40,
-    }
-
-    with make_client(tmp_path) as client:
-        first = client.post("/api/v1/review-runs", json=payload).json()
-        forced = client.post(
-            "/api/v1/review-runs", json={**payload, "force": True}
-        ).json()
-
-    assert forced["id"] != first["id"]
-    assert forced["attempt"] == 2
+    assert response.status_code == 405
+    assert "post" not in openapi["paths"]["/api/v1/review-runs"]
 
 
 def test_list_review_runs_filters_and_reports_worker_state(tmp_path: Path) -> None:
@@ -629,8 +677,8 @@ def test_list_review_runs_filters_and_reports_worker_state(tmp_path: Path) -> No
             await session.commit()
 
     with make_client(tmp_path) as client:
-        first = client.post("/api/v1/review-runs", json=first_payload).json()
-        second = client.post("/api/v1/review-runs", json=second_payload).json()
+        first = seed_review_run(client, first_payload)
+        second = seed_review_run(client, second_payload)
         client.portal.call(mark_second_running, client, second["id"])
 
         locked_response = client.get(
@@ -722,12 +770,8 @@ def test_list_review_runs_includes_pull_request_context_in_bulk(
             await session.commit()
 
     with make_client(tmp_path) as client:
-        github_run = client.post(
-            "/api/v1/review-runs", json=github_payload
-        ).json()
-        gitlab_run = client.post(
-            "/api/v1/review-runs", json=gitlab_payload
-        ).json()
+        github_run = seed_review_run(client, github_payload)
+        gitlab_run = seed_review_run(client, gitlab_payload)
         client.portal.call(seed_contexts, client, github_run["id"])
 
         github_response = client.get(
@@ -908,7 +952,7 @@ def test_get_review_run_detail_exposes_operator_context(tmp_path: Path) -> None:
             await session.commit()
 
     with make_client(tmp_path) as client:
-        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        review_run = seed_review_run(client, payload)
         client.portal.call(seed_detail_context, client, review_run["id"])
         response = client.get(f"/api/v1/review-runs/{review_run['id']}")
 
@@ -940,10 +984,21 @@ def test_retry_rejects_non_failed_run(tmp_path: Path) -> None:
     }
 
     with make_client(tmp_path) as client:
-        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        review_run = seed_review_run(client, payload)
         response = client.post(f"/api/v1/review-runs/{review_run['id']}/retry")
+        event = client.get(
+            "/api/v1/observability/provider-events/"
+            f"{response.json()['detail']['review_request_event_id']}"
+        )
 
     assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "run_not_failed"
+    assert event.status_code == 200
+    assert event.json()["status"] == "rejected"
+    assert event.json()["provider"] == "internal"
+    assert event.json()["provider_action"] == "retry"
+    assert event.json()["source_review_run_id"] == review_run["id"]
+    assert event.json()["review_run_id"] is None
 
 
 def test_cancel_review_run(tmp_path: Path) -> None:
@@ -956,7 +1011,7 @@ def test_cancel_review_run(tmp_path: Path) -> None:
     }
 
     with make_client(tmp_path) as client:
-        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        review_run = seed_review_run(client, payload)
         response = client.post(f"/api/v1/review-runs/{review_run['id']}/cancel")
 
     assert response.status_code == 202
@@ -983,10 +1038,14 @@ def test_accept_github_pull_request_webhook_creates_review_run(
     assert data["status"] == "queued"
     assert data["duplicate"] is False
     assert review_run_response.status_code == 200
+    review_run = review_run_response.json()
     assert (
-        review_run_response.json()["head_sha"]
-        == payload["pull_request"]["head"]["sha"]
+        review_run["head_sha"] == payload["pull_request"]["head"]["sha"]
     )
+    assert review_run["trigger_type"] == "webhook"
+    assert review_run["trigger_event"] is not None
+    assert review_run["trigger_event"]["provider_event"] == "pull_request"
+    assert review_run["trigger_event"]["internal_event"] == "pr_opened"
 
 
 def test_duplicate_github_delivery_is_idempotent(tmp_path: Path) -> None:
@@ -1628,8 +1687,7 @@ def test_start_review_session_records_pi_agent_identifiers(tmp_path: Path) -> No
 
     with make_client(tmp_path) as client:
         client.app.state.pi_agent_client = fake_pi_agent
-        create_response = client.post("/api/v1/review-runs", json=payload)
-        review_run = create_response.json()
+        review_run = seed_review_run(client, payload)
 
         start_response = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
@@ -1660,8 +1718,7 @@ def test_start_review_session_requires_workspace_path(tmp_path: Path) -> None:
 
     with make_client(tmp_path) as client:
         client.app.state.pi_agent_client = FakePiAgentClient()
-        create_response = client.post("/api/v1/review-runs", json=payload)
-        review_run = create_response.json()
+        review_run = seed_review_run(client, payload)
         start_response = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
             json={},
@@ -1685,7 +1742,7 @@ def test_start_review_session_rejects_request_overrides_and_uses_domain_preset(
 
     with make_client(tmp_path) as client:
         client.app.state.pi_agent_client = fake_pi_agent
-        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        review_run = seed_review_run(client, payload)
         rejected = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
             json={
@@ -1729,7 +1786,7 @@ def test_sync_review_session_marks_pi_agent_failure(tmp_path: Path) -> None:
 
     with make_client(tmp_path) as client:
         client.app.state.pi_agent_client = fake_pi_agent
-        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        review_run = seed_review_run(client, payload)
         started = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
             json={"workspace_path": "/workspaces/example-repo/pr-42/bbbbbbb"},
@@ -1758,7 +1815,7 @@ def test_observability_pi_agent_session_returns_safe_metadata(
 
     with make_client(tmp_path) as client:
         client.app.state.pi_agent_client = fake_pi_agent
-        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        review_run = seed_review_run(client, payload)
         started = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
             json={"workspace_path": "/workspaces/example-repo/pr-42/bbbbbbb"},
@@ -1804,7 +1861,7 @@ def test_observability_pi_agent_session_reports_disabled_configuration(
         tmp_path,
         pi_agent_base_url=None,
     ) as client:
-        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        review_run = seed_review_run(client, payload)
         response = client.get(
             "/api/v1/observability/review-runs/"
             f"{review_run['id']}/agent-session"
@@ -1852,7 +1909,7 @@ def test_collect_review_result_completes_review_run(tmp_path: Path) -> None:
     }
 
     with make_client(tmp_path) as client:
-        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        review_run = seed_review_run(client, payload)
         collect_response = client.post(
             f"/api/v1/review-runs/{review_run['id']}/result",
             json={
@@ -1882,7 +1939,7 @@ def test_cancel_review_session_cancels_pi_agent_session(tmp_path: Path) -> None:
 
     with make_client(tmp_path) as client:
         client.app.state.pi_agent_client = fake_pi_agent
-        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        review_run = seed_review_run(client, payload)
         started = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
             json={"workspace_path": "/workspaces/example-repo/pr-42/bbbbbbb"},
@@ -1909,7 +1966,7 @@ def test_review_session_does_not_expose_human_message_route(tmp_path: Path) -> N
 
     with make_client(tmp_path) as client:
         client.app.state.pi_agent_client = fake_pi_agent
-        review_run = client.post("/api/v1/review-runs", json=payload).json()
+        review_run = seed_review_run(client, payload)
         started = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
             json={"workspace_path": "/workspaces/example-repo/pr-42/bbbbbbb"},
@@ -1954,6 +2011,14 @@ def test_public_api_not_found_contracts(tmp_path: Path) -> None:
             {"raw_output": {"summary": "none", "findings": []}},
         ),
         ("POST", "/api/v1/review-runs/missing/retry", None),
+        (
+            "POST",
+            "/api/v1/review-runs/missing/rerun",
+            {
+                "revision": "same_revision",
+                "idempotency_key": "11111111-1111-4111-8111-111111111111",
+            },
+        ),
         ("POST", "/api/v1/review-runs/missing/cancel", None),
         ("GET", "/api/v1/workspaces/missing", None),
         ("POST", "/api/v1/workspaces/missing/lease", {}),
@@ -2001,19 +2066,247 @@ def test_retry_failed_review_run_creates_next_attempt(tmp_path: Path) -> None:
         "head_sha": "b" * 40,
     }
 
-    async def mark_failed(client: TestClient, review_run_id: str) -> None:
+    async def inspect_created(
+        client: TestClient,
+        source_id: str,
+        run_id: str,
+        event_id: str,
+    ) -> None:
         async with client.app.state.session_factory() as session:
-            review_run = await session.get(ReviewRun, review_run_id)
+            source = await session.get(ReviewRun, source_id)
+            review_run = await session.get(ReviewRun, run_id)
+            event = await session.get(ProviderEventInbox, event_id)
+            assert source is not None
             assert review_run is not None
-            review_run.status = "failed"
-            review_run.failure_code = "agent_failed"
-            await session.commit()
+            assert event is not None
+            assert review_run.pull_request_context_id == source.pull_request_context_id
+            assert review_run.trigger_type == "retry"
+            assert review_run.trigger_event_id == event.id
+            assert review_run.queue == "manual-review"
+            assert review_run.priority == 60
+            assert review_run.attempt == 2
+            assert event.provider == "internal"
+            assert event.provider_event == "review_request"
+            assert event.provider_action == "retry"
+            assert event.internal_event == "review_requested"
+            assert event.status == "queued"
+            assert event.review_run_id == review_run.id
+            assert event.payload["source_review_run_id"] == source.id
 
     with make_client(tmp_path) as client:
-        original = client.post("/api/v1/review-runs", json=payload).json()
-        client.portal.call(mark_failed, client, original["id"])
-        response = client.post(f"/api/v1/review-runs/{original['id']}/retry")
+        original = seed_review_run(client, payload)
+        client.portal.call(make_review_run_retryable, client, original["id"])
+        detail_before = client.get(
+            f"/api/v1/observability/review-runs/{original['id']}"
+        )
+        first = client.post(f"/api/v1/review-runs/{original['id']}/retry")
+        duplicate = client.post(f"/api/v1/review-runs/{original['id']}/retry")
+        detail_after = client.get(
+            f"/api/v1/observability/review-runs/{original['id']}"
+        )
 
-    assert response.status_code == 202
-    assert response.json()["review_run_id"] != original["id"]
-    assert response.json()["status"] == "queued"
+        assert detail_before.status_code == 200
+        assert detail_before.json()["available_actions"]["retry"]["allowed"] is True
+        assert (
+            detail_before.json()["available_actions"]["rerun"]["reason_code"]
+            == "failed_run_requires_retry"
+        )
+        assert first.status_code == 202
+        assert first.json()["source_review_run_id"] == original["id"]
+        assert first.json()["review_run_id"] != original["id"]
+        assert first.json()["attempt"] == 2
+        assert first.json()["status"] == "queued"
+        assert first.json()["deduplicated"] is False
+        assert duplicate.status_code == 202
+        assert duplicate.json()["review_run_id"] == first.json()["review_run_id"]
+        assert duplicate.json()["review_request_event_id"] == first.json()[
+            "review_request_event_id"
+        ]
+        assert duplicate.json()["deduplicated"] is True
+        assert (
+            detail_after.json()["available_actions"]["retry"]["reason_code"]
+            == "retry_already_requested"
+        )
+        client.portal.call(
+            inspect_created,
+            client,
+            original["id"],
+            first.json()["review_run_id"],
+            first.json()["review_request_event_id"],
+        )
+
+
+def test_retry_rejections_keep_explainable_internal_events(tmp_path: Path) -> None:
+    def assert_rejected(client: TestClient, run_id: str, code: str) -> dict:
+        response = client.post(f"/api/v1/review-runs/{run_id}/retry")
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == code
+        event_id = response.json()["detail"]["review_request_event_id"]
+        event = client.get(f"/api/v1/observability/provider-events/{event_id}")
+        assert event.status_code == 200
+        assert event.json()["status"] == "rejected"
+        assert event.json()["error_code"] == code
+        assert event.json()["source_review_run_id"] == run_id
+        assert event.json()["review_run_id"] is None
+        run = client.get(f"/api/v1/observability/review-runs/{run_id}")
+        assert run.status_code == 200
+        assert run.json()["available_actions"]["retry"]["allowed"] is False
+        assert run.json()["available_actions"]["retry"]["reason_code"] == code
+        return response.json()["detail"]
+
+    base_payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+
+    with make_client(tmp_path) as client:
+        stale = seed_review_run(
+            client,
+            {**base_payload, "pull_request_number": 41},
+        )
+        client.portal.call(
+            make_review_run_retryable,
+            client,
+            stale["id"],
+            "c" * 40,
+        )
+        assert_rejected(client, stale["id"], "revision_not_current")
+
+        closed = seed_review_run(
+            client,
+            {**base_payload, "pull_request_number": 42},
+        )
+        client.portal.call(
+            make_review_run_retryable,
+            client,
+            closed["id"],
+            None,
+            "closed",
+        )
+        assert_rejected(client, closed["id"], "pull_request_closed")
+
+        blocked = seed_review_run(
+            client,
+            {**base_payload, "pull_request_number": 43},
+        )
+        client.portal.call(make_review_run_retryable, client, blocked["id"])
+        active = seed_review_run(
+            client,
+            {**base_payload, "pull_request_number": 43, "force": True},
+        )
+        rejection = assert_rejected(client, blocked["id"], "active_review_exists")
+        assert rejection["existing_review_run_id"] == active["id"]
+
+
+def test_dashboard_rerun_records_internal_event_and_creates_new_attempt(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+    request_payload = {
+        "revision": "same_revision",
+        "idempotency_key": "11111111-1111-4111-8111-111111111111",
+    }
+
+    async def inspect_created(client: TestClient, run_id: str, event_id: str) -> None:
+        async with client.app.state.session_factory() as session:
+            review_run = await session.get(ReviewRun, run_id)
+            event = await session.get(ProviderEventInbox, event_id)
+            assert review_run is not None
+            assert event is not None
+            assert review_run.trigger_type == "dashboard_rerun"
+            assert review_run.trigger_event_id == event.id
+            assert review_run.queue == "manual-review"
+            assert review_run.priority == 60
+            assert review_run.attempt == 2
+            assert event.provider == "internal"
+            assert event.provider_event == "review_request"
+            assert event.provider_action == "rerun"
+            assert event.internal_event == "review_requested"
+            assert event.status == "queued"
+            assert event.review_run_id == review_run.id
+            assert event.payload["source_review_run_id"] == original["id"]
+
+    with make_client(tmp_path) as client:
+        original = seed_review_run(client, payload)
+        client.portal.call(make_review_run_rerunnable, client, original["id"])
+
+        detail = client.get(
+            f"/api/v1/observability/review-runs/{original['id']}"
+        )
+        first = client.post(
+            f"/api/v1/review-runs/{original['id']}/rerun",
+            json=request_payload,
+        )
+        duplicate = client.post(
+            f"/api/v1/review-runs/{original['id']}/rerun",
+            json=request_payload,
+        )
+
+        assert detail.status_code == 200
+        availability = detail.json()["available_actions"]["rerun"]
+        assert availability["allowed"] is True
+        assert availability["next_attempt"] == 2
+        assert first.status_code == 202
+        assert first.json()["source_review_run_id"] == original["id"]
+        assert first.json()["attempt"] == 2
+        assert first.json()["status"] == "queued"
+        assert first.json()["deduplicated"] is False
+        assert duplicate.status_code == 202
+        assert duplicate.json()["review_run_id"] == first.json()["review_run_id"]
+        assert duplicate.json()["review_request_event_id"] == first.json()[
+            "review_request_event_id"
+        ]
+        assert duplicate.json()["deduplicated"] is True
+        client.portal.call(
+            inspect_created,
+            client,
+            first.json()["review_run_id"],
+            first.json()["review_request_event_id"],
+        )
+
+
+def test_dashboard_rerun_rejects_stale_revision_and_keeps_event(tmp_path: Path) -> None:
+    payload = {
+        "provider": "github",
+        "repo_full_name": "example/repo",
+        "pull_request_number": 42,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+    }
+
+    with make_client(tmp_path) as client:
+        original = seed_review_run(client, payload)
+        client.portal.call(
+            make_review_run_rerunnable,
+            client,
+            original["id"],
+            "c" * 40,
+        )
+        response = client.post(
+            f"/api/v1/review-runs/{original['id']}/rerun",
+            json={
+                "revision": "same_revision",
+                "idempotency_key": "22222222-2222-4222-8222-222222222222",
+            },
+        )
+        events = client.get(
+            "/api/v1/observability/provider-events",
+            params={"provider": "internal", "internal_event": "review_requested"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "revision_not_current"
+    assert events.status_code == 200
+    assert events.json()["total"] == 1
+    event = events.json()["items"][0]
+    assert event["status"] == "rejected"
+    assert event["error_code"] == "revision_not_current"
+    assert event["review_run_id"] is None

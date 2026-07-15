@@ -6,13 +6,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from review_orchestrator.application.services import (
+    ReviewRequestRejected,
     ReviewRunTransitionError,
     accept_provider_webhook,
     cancel_agent_task,
     cancel_review_run,
     cancel_review_session,
     collect_review_result,
-    create_review_run,
     get_agent_task_detail,
     get_delivery_outbox,
     get_pi_agent_session_diagnostics_for_agent_task,
@@ -30,8 +30,9 @@ from review_orchestrator.application.services import (
     list_review_runs,
     list_task_session_archives,
     list_tasks,
+    request_review_rerun,
+    request_review_retry,
     retry_agent_task,
-    retry_review_run,
     set_resource_pool_capacity,
     start_review_session,
     sync_review_session,
@@ -59,10 +60,12 @@ from review_orchestrator.domain.schemas import (
     ReviewResultCollect,
     ReviewResultCollectResponse,
     ReviewRunActionResult,
-    ReviewRunCreate,
     ReviewRunDetail,
     ReviewRunListResponse,
     ReviewRunRead,
+    ReviewRunRerunRequest,
+    ReviewRunRerunResult,
+    ReviewRunRetryResult,
     ReviewSessionCancel,
     ReviewSessionStart,
     SessionArchiveListResponse,
@@ -102,6 +105,15 @@ from review_orchestrator.integrations.providers import (
 router = APIRouter(prefix="/api/v1")
 session_dependency = Depends(get_session)
 provider_registry = ProviderRegistry([GitHubAdapter(), GitLabAdapter()])
+
+
+def _review_request_rejection_detail(exc: ReviewRequestRejected) -> dict:
+    return {
+        "code": exc.code,
+        "message": exc.message,
+        "review_request_event_id": exc.event_id,
+        "existing_review_run_id": exc.existing_review_run_id,
+    }
 
 
 @router.post(
@@ -550,18 +562,6 @@ async def retry_agent_task_endpoint(
     return detail
 
 
-@router.post(
-    "/review-runs",
-    response_model=ReviewRunRead,
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_review_run_endpoint(
-    payload: ReviewRunCreate,
-    session: AsyncSession = session_dependency,
-) -> ReviewRunRead:
-    return await create_review_run(session, payload)
-
-
 @router.get("/review-runs", response_model=ReviewRunListResponse)
 @router.get("/observability/review-runs", response_model=ReviewRunListResponse)
 async def list_review_runs_endpoint(
@@ -750,25 +750,49 @@ async def collect_review_result_endpoint(
 
 @router.post(
     "/review-runs/{review_run_id}/retry",
-    response_model=ReviewRunActionResult,
+    response_model=ReviewRunRetryResult,
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def retry_review_run_endpoint(
     review_run_id: str,
     session: AsyncSession = session_dependency,
-) -> ReviewRunActionResult:
-    review_run = await retry_review_run(session, review_run_id)
-    if review_run is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    if review_run.id == review_run_id and review_run.status != "failed":
+) -> ReviewRunRetryResult:
+    try:
+        result = await request_review_retry(session, review_run_id)
+    except ReviewRequestRejected as exc:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Only failed review runs can be retried without force.",
+            status_code=exc.status_code,
+            detail=_review_request_rejection_detail(exc),
+        ) from exc
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return result
+
+
+@router.post(
+    "/review-runs/{review_run_id}/rerun",
+    response_model=ReviewRunRerunResult,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def rerun_review_run_endpoint(
+    review_run_id: str,
+    payload: ReviewRunRerunRequest,
+    session: AsyncSession = session_dependency,
+) -> ReviewRunRerunResult:
+    try:
+        result = await request_review_rerun(
+            session,
+            review_run_id,
+            idempotency_key=str(payload.idempotency_key),
         )
-    return ReviewRunActionResult(
-        review_run_id=review_run.id,
-        status=review_run.status,
-    )
+    except ReviewRequestRejected as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=_review_request_rejection_detail(exc),
+        ) from exc
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return result
 
 
 @router.post(

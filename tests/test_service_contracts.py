@@ -17,8 +17,6 @@ from review_orchestrator.services import (
     _safe_error_message,
     _timeout_state,
     _worker_state,
-    create_review_run_from_github_payload,
-    create_review_run_from_provider_payload,
     get_or_create_review_config,
 )
 
@@ -279,22 +277,6 @@ def test_safe_error_and_finding_count_helpers() -> None:
         object(),
     ]
     assert _finding_count_by_severity(findings) == {"high": 2, "unknown": 1}
-
-
-async def test_invalid_provider_payloads_fail_before_database_access() -> None:
-    with pytest.raises(ValueError, match="required objects"):
-        await create_review_run_from_github_payload(None, {})  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="identity fields"):
-        await create_review_run_from_github_payload(  # type: ignore[arg-type]
-            None,
-            {"repository": {}, "pull_request": {}},
-        )
-    with pytest.raises(ValueError, match="identity fields"):
-        await create_review_run_from_provider_payload(  # type: ignore[arg-type]
-            None,
-            "unknown",
-            {},
-        )
 
 
 async def test_review_config_get_or_create_is_idempotent(tmp_path) -> None:

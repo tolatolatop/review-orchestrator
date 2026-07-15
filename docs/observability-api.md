@@ -36,6 +36,8 @@ Operator clients should use these paths:
 | `GET /api/v1/observability/provider-events/{event_id}` | Event detail with linked run/task references. |
 | `GET /api/v1/observability/review-runs` | List review runs and current stage. |
 | `GET /api/v1/observability/review-runs/{review_run_id}` | Run detail with session, findings, retry, and publishing summaries. |
+| `POST /api/v1/review-runs/{review_run_id}/retry` | Record an idempotent `review_requested / retry` event for a failed current-revision run. |
+| `POST /api/v1/review-runs/{review_run_id}/rerun` | Record an idempotent `review_requested / rerun` event for a completed or cancelled current-revision run. |
 | `GET /api/v1/observability/agent-tasks` | List queued/running/completed agent tasks. |
 | `GET /api/v1/observability/agent-tasks/{agent_task_id}` | Agent task detail with redacted input and result. |
 | `GET /api/v1/agent-tasks/{agent_task_id}/agent-session` | Live pi-agent instruction session for a message task. |

@@ -11,8 +11,7 @@ from review_orchestrator.db import create_engine, create_session_factory, init_m
 from review_orchestrator.github import fetch_changed_files, parse_commentable_lines
 from review_orchestrator.models import Finding
 from review_orchestrator.review_results import ChangedFile
-from review_orchestrator.schemas import ReviewRunCreate
-from review_orchestrator.services import create_review_run
+from tests.factories import ReviewRunCreate, create_review_run
 
 
 class FakeGitHubClient:

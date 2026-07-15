@@ -2,6 +2,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 
 from review_orchestrator.application.delivery import process_next_delivery
 from review_orchestrator.config import Settings
@@ -20,8 +21,6 @@ from review_orchestrator.pi_agent import (
 )
 from review_orchestrator.providers import ProviderOperationError, ProviderRegistry
 from review_orchestrator.review_results import parse_review_result
-from review_orchestrator.schemas import ReviewRunCreate
-from review_orchestrator.services import create_review_run
 from review_orchestrator.worker import (
     acquire_next_review_run,
     build_worker_provider_registry,
@@ -31,6 +30,7 @@ from review_orchestrator.worker import (
     process_review_run_timeouts,
     release_review_run_lock,
 )
+from tests.factories import ReviewRunCreate, create_review_run
 
 
 class FakePiAgentClient:
@@ -605,7 +605,7 @@ async def test_agent_task_worker_uses_custom_provider_registry(
     assert processed.pull_request_context_id is not None
 
 
-async def test_agent_task_provider_failure_uses_same_registry_for_summary(
+async def test_agent_task_provider_failure_without_context_does_not_create_review(
     session_factory,
 ) -> None:
     adapter = CustomProviderAdapter(fail_context=True)
@@ -630,14 +630,16 @@ async def test_agent_task_provider_failure_uses_same_registry_for_summary(
             session,
             provider_registry=ProviderRegistry([adapter]),
         )
+        review_runs = list((await session.execute(select(ReviewRun))).scalars())
 
     assert processed is not None
     assert processed.status == "failed"
     assert processed.error_message == "Custom context lookup failed"
-    assert adapter.summary_statuses == ["failed"]
+    assert review_runs == []
+    assert adapter.summary_statuses == []
 
 
-async def test_agent_task_hydrate_failure_marks_failed_and_publishes_summary(
+async def test_agent_task_hydrate_failure_without_context_does_not_publish_summary(
     session_factory,
 ) -> None:
     github_client = FailingPullRequestGitHubClient()
@@ -670,17 +672,13 @@ async def test_agent_task_hydrate_failure_marks_failed_and_publishes_summary(
                 github_client=github_client
             ),
         )
+        review_runs = list((await session.execute(select(ReviewRun))).scalars())
 
     assert processed is not None
     assert processed.status == "failed"
     assert processed.error_message == "GitHub token invalid"
-    assert len(github_client.issue_comments) == 1
-    assert "Review status: failed" in github_client.issue_comments[0].body
-    assert (
-        "Failure category: provider_context_lookup_failed"
-        in github_client.issue_comments[0].body
-    )
-    assert "token [redacted]" in github_client.issue_comments[0].body
+    assert review_runs == []
+    assert github_client.issue_comments == []
 
 
 async def test_review_worker_releases_lock_when_pi_agent_result_not_ready(
