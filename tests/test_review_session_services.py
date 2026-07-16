@@ -13,7 +13,7 @@ from review_orchestrator.application.services import (
     start_review_session,
     sync_review_session,
 )
-from review_orchestrator.domain.models import AgentTask
+from review_orchestrator.domain.models import AgentTask, ReviewCommentSlot
 from review_orchestrator.infrastructure.config import Settings
 from review_orchestrator.infrastructure.db import (
     create_engine,
@@ -81,7 +81,7 @@ async def make_run(
     base_sha: str | None = "a" * 40,
     head_sha: str = "b" * 40,
 ):
-    return await create_review_run(
+    review_run = await create_review_run(
         session,
         ReviewRunCreate(
             provider="github",
@@ -91,6 +91,22 @@ async def make_run(
             head_sha=head_sha,
         ),
     )
+    session.add(
+        ReviewCommentSlot(
+            review_run_id=review_run.id,
+            provider=review_run.provider,
+            repo_full_name=review_run.repo_full_name,
+            pull_request_number=review_run.pull_request_number,
+            head_sha=review_run.head_sha,
+            marker=f"review-orchestrator:summary:slot:test-{review_run.id}",
+            provider_comment_id=f"placeholder-{review_run.id}",
+            status="ready",
+        )
+    )
+    review_run.stage = "placeholder_ready"
+    await session.commit()
+    await session.refresh(review_run)
+    return review_run
 
 
 @pytest.mark.parametrize("status", ["completed", "cancelled", "superseded"])

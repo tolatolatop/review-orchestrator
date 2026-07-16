@@ -353,6 +353,53 @@ class DeliveryOutbox(Base):
     )
 
 
+class ReviewCommentSlot(Base):
+    """Durable, per-run binding for the provider summary comment."""
+
+    __tablename__ = "review_comment_slot"
+    __table_args__ = (
+        UniqueConstraint("review_run_id", name="uq_review_comment_slot_run"),
+        UniqueConstraint("marker", name="uq_review_comment_slot_marker"),
+        UniqueConstraint(
+            "provider",
+            "repo_full_name",
+            "pull_request_number",
+            "provider_comment_id",
+            name="uq_review_comment_slot_provider_comment",
+        ),
+        Index("ix_review_comment_slot_status", "status", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    review_run_id: Mapped[str] = mapped_column(
+        ForeignKey("review_run.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    repo_full_name: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    pull_request_number: Mapped[int] = mapped_column(nullable=False, index=True)
+    head_sha: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    marker: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider_comment_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending"
+    )
+    placeholder_version: Mapped[int] = mapped_column(nullable=False, default=1)
+    result_version: Mapped[int] = mapped_column(nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    bound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
 class ReviewRun(Task):
     __tablename__ = "review_run"
     __table_args__ = (

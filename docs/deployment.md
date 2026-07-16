@@ -1,19 +1,20 @@
 # Deployment Guide
 
 This guide deploys Review Orchestrator with its embedded pi-agent SDK runtime,
-PostgreSQL, the worker, and the optional Nginx edge.
+PostgreSQL, isolated execution and delivery workers, and the optional Nginx edge.
 
 ## Architecture
 
-`docker-compose.self_host.yaml` starts five long-running services:
+`docker-compose.self_host.yaml` starts six long-running services:
 
 - `postgres`: orchestrator state;
 - `pi-agent-runtime`: `@earendil-works/pi-coding-agent` 0.80.7 over a small HTTP API;
 - `review-orchestrator`: webhook, review, workspace, human-input, and observability APIs;
-- `review-orchestrator-worker`: workspace preparation, agent polling, result validation, and provider publishing;
+- `review-orchestrator-worker`: workspace preparation, Agent polling, timeout handling, and result validation;
+- `review-orchestrator-delivery-worker`: durable placeholder/result comment delivery and expired-lease recovery;
 - `nginx`: the remote operator boundary.
 
-The orchestrator and worker share `review_orchestrator_data`. The pi-agent
+The orchestrator and both workers share `review_orchestrator_data`. The pi-agent
 container mounts that volume read-only and can see only prepared workspaces. Its
 own JSONL sessions and safe runtime snapshots live in `pi_agent_state`.
 
@@ -251,6 +252,7 @@ Runtime health and logs:
 ```bash
 docker compose -f docker-compose.self_host.yaml ps pi-agent-runtime
 docker compose -f docker-compose.self_host.yaml logs pi-agent-runtime review-orchestrator-worker
+docker compose -f docker-compose.self_host.yaml logs review-orchestrator-delivery-worker
 curl http://127.0.0.1:${PI_AGENT_RUNTIME_PORT:-3210}/health
 ```
 

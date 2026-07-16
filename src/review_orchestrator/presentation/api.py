@@ -858,6 +858,9 @@ async def cancel_review_run_endpoint(
     return ReviewRunActionResult(
         review_run_id=review_run.id,
         status=review_run.status,
+        stage=review_run.stage,
+        execution_status=review_run.execution_status,
+        delivery_status=review_run.delivery_status,
     )
 
 

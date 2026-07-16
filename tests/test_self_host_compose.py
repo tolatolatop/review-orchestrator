@@ -57,7 +57,7 @@ def test_pi_agent_runtime_supports_configurable_models_and_skills() -> None:
 def test_worker_receives_message_command_timeout_and_history_configuration() -> None:
     compose, example_env = root_files()
     worker = compose.split("  review-orchestrator-worker:", 1)[1].split(
-        "  nginx:", 1
+        "  review-orchestrator-delivery-worker:", 1
     )[0]
 
     assert "AGENT_TASK_SOFT_TIMEOUT_SECONDS:" in worker
@@ -69,6 +69,20 @@ def test_worker_receives_message_command_timeout_and_history_configuration() -> 
     assert "AGENT_TASK_TIMEOUT_SECONDS=600" in example_env
     assert "AGENT_TASK_MAX_HISTORY_TURNS=6" in example_env
     assert "AGENT_TASK_MAX_HISTORY_CHARS=24000" in example_env
+
+
+def test_provider_delivery_runs_in_a_separate_worker_process() -> None:
+    compose, _ = root_files()
+    execution_worker = compose.split("  review-orchestrator-worker:", 1)[1].split(
+        "  review-orchestrator-delivery-worker:", 1
+    )[0]
+    delivery_worker = compose.split(
+        "  review-orchestrator-delivery-worker:", 1
+    )[1].split("  nginx:", 1)[0]
+
+    assert '["review-orchestrator-worker", "--mode", "execution"]' in execution_worker
+    assert '["review-orchestrator-worker", "--mode", "delivery"]' in delivery_worker
+    assert "AGENT_TASK_SOFT_TIMEOUT_SECONDS:" not in delivery_worker
 
 
 def test_pi_agent_runtime_defaults_to_loopback_port_3210() -> None:
@@ -110,7 +124,7 @@ def test_openhands_services_and_privileged_runtime_are_removed() -> None:
 def test_github_app_private_key_is_mounted_only_into_orchestrator_services() -> None:
     compose, _ = root_files()
 
-    assert compose.count("- ./secrets:/run/secrets:ro") == 2
+    assert compose.count("- ./secrets:/run/secrets:ro") == 3
     runtime = compose.split("  pi-agent-runtime:", 1)[1].split(
         "  review-orchestrator:", 1
     )[0]

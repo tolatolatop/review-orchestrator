@@ -203,12 +203,19 @@ for permissions, webhook events, secrets, and the optional
 
 `ReviewRunRead.status` is one of:
 
+- `awaiting_delivery` (creating the durable placeholder or writing the final result)
 - `queued`
 - `running`
 - `completed`
 - `failed`
 - `cancelled`
 - `superseded`
+
+`execution_status` and `delivery_status` expose the independent Agent and
+Provider-comment lifecycles. A new run remains `awaiting_delivery` until its
+per-run placeholder comment is durably bound; only then can Agent execution be
+claimed. Terminal Agent output returns to `awaiting_delivery` until the exact
+same comment slot has been updated.
 
 ## Runtime Configuration
 
@@ -258,9 +265,14 @@ pi-agent SDK behind installed Agent definitions:
    overlay cloned from builtin/prebuilt content. Skills may be installed with
    npm, while Tools remain independently and explicitly configured.
 4. `session/cancel` marks the run cancelled and aborts the pi-agent session.
-5. The worker collects the structured `submit_review` result, validates it with
+5. The delivery worker first creates or recovers a per-run placeholder comment;
+   Agent execution is blocked until that comment ID is durably bound.
+6. The execution worker collects the structured `submit_review` result, validates it with
    `review_orchestrator.review_results`, permanently archives the redacted pi
-   Session plus Task metadata, and writes Provider delivery to the Outbox.
+   Session plus Task metadata, and writes the result event to the Outbox.
+7. The delivery worker updates the bound placeholder and only then makes the
+   aggregate ReviewRun terminal. Expired delivery leases are reclaimed, and
+   core placeholder/result events retry without an attempt limit.
 
 The production Runtime includes `code-review` and `pr-assistant`; additional
 definitions are installed code, not dynamically version-routed request data.

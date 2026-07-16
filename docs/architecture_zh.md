@@ -29,12 +29,13 @@ src/review_orchestrator/
 ### `application`
 
 - `services.py`：ReviewRun、AgentTask、Webhook、Session 的应用用例和查询。
-- `worker.py`：异步领取任务、Workspace 准备、Agent 执行、超时与发布编排。
-- `worker_cli.py`：独立 Worker 进程入口。
+- `worker.py`：异步领取任务、Workspace 准备、Agent 执行与超时编排。
+- `delivery.py`：独立的 Provider Outbox、占位/结果评论投递、无限重试与租约回收。
+- `worker_cli.py`：Worker 进程入口，可将 `execution` 与 `delivery` 部署为独立进程。
 
 ### `domain`
 
-- `models.py`：ReviewRun、Finding、ProviderEvent、Workspace 等持久化实体。
+- `models.py`：ReviewRun、ReviewCommentSlot、DeliveryOutbox、Finding、ProviderEvent、Workspace 等持久化实体。
 - `schemas.py`：API 与应用层共享的数据契约。
 - `review_results.py`：结构化结果校验、路径规范化和 fingerprint。
 - `reconciliation.py`：跨 ReviewRun 的 finding 新增、延续和解决状态对账。

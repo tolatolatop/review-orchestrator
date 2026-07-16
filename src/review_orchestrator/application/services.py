@@ -5,11 +5,13 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
+from uuid import uuid4
 
 from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from review_orchestrator.application.delivery import enqueue_delivery
 from review_orchestrator.application.session_archive import archive_agent_session
 from review_orchestrator.domain.models import (
     AgentTask,
@@ -20,6 +22,7 @@ from review_orchestrator.domain.models import (
     ResourceLease,
     ResourcePool,
     ReviewCommentRef,
+    ReviewCommentSlot,
     ReviewConfig,
     ReviewRun,
     ReviewSession,
@@ -51,6 +54,7 @@ from review_orchestrator.domain.schemas import (
     ProviderEventInboxSummary,
     ResourcePoolListResponse,
     ResourcePoolRead,
+    ReviewCommentSlotSummary,
     ReviewRunActionAvailability,
     ReviewRunAvailableActions,
     ReviewRunDetail,
@@ -98,7 +102,7 @@ from review_orchestrator.integrations.providers import (
 )
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "superseded"}
-CANCELLABLE_STATUSES = {"queued", "running"}
+CANCELLABLE_STATUSES = {"queued", "running", "awaiting_delivery"}
 ACTIVE_REVIEW_STATUSES = {"queued", "running", "awaiting_delivery"}
 RERUN_SOURCE_STATUSES = {"completed", "cancelled"}
 
@@ -172,7 +176,8 @@ async def _create_review_run_record(
         base_sha=spec.base_sha,
         head_sha=spec.head_sha,
         capability_id="code-review",
-        status="queued",
+        status="awaiting_delivery",
+        stage="placeholder_delivery_pending",
         execution_status="pending",
         delivery_status="pending",
         queue=queue,
@@ -210,6 +215,143 @@ async def _create_review_run_record(
             raise
         return existing, False
     return review_run, True
+
+
+async def ensure_review_placeholder_requested(
+    session: AsyncSession,
+    review_run: ReviewRun,
+) -> ReviewCommentSlot:
+    """Create the per-run comment slot and its durable core delivery event."""
+
+    result = await session.execute(
+        select(ReviewCommentSlot).where(
+            ReviewCommentSlot.review_run_id == review_run.id
+        )
+    )
+    slot = result.scalar_one_or_none()
+    if slot is None:
+        slot_id = str(uuid4())
+        slot = ReviewCommentSlot(
+            id=slot_id,
+            review_run_id=review_run.id,
+            provider=review_run.provider,
+            repo_full_name=review_run.repo_full_name,
+            pull_request_number=review_run.pull_request_number,
+            head_sha=review_run.head_sha,
+            marker=f"review-orchestrator:summary:slot:{slot_id}",
+            status="pending",
+        )
+        session.add(slot)
+        await session.flush()
+
+    if slot.status not in {"ready", "finalizing", "finalized"}:
+        placeholder_key = (
+            f"review:{review_run.id}:placeholder:v{slot.placeholder_version}"
+        )
+        existing_delivery = (
+            await session.execute(
+                select(DeliveryOutbox).where(
+                    DeliveryOutbox.idempotency_key == placeholder_key
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_delivery is not None:
+            return slot
+        execution_started = (
+            review_run.status == "running"
+            or review_run.execution_status == "running"
+            or review_run.agent_session_id is not None
+        )
+        resume_status = "running" if execution_started else "queued"
+        resume_stage = (
+            review_run.stage if execution_started else "placeholder_ready"
+        )
+        review_run.status = "awaiting_delivery"
+        review_run.stage = "placeholder_delivery_pending"
+        if not execution_started:
+            review_run.execution_status = "pending"
+        await enqueue_delivery(
+            session,
+            review_run,
+            provider=review_run.provider,
+            operation="review_placeholder",
+            destination_key=f"review-comment-slot:{slot.id}",
+            idempotency_key=placeholder_key,
+            payload={
+                "slot_id": slot.id,
+                "review_run_id": review_run.id,
+                "status_text": "reviewing",
+                "success_status": resume_status,
+                "success_stage": resume_stage,
+            },
+            mandatory=True,
+            priority=100,
+            max_attempts=0,
+        )
+        session.add(review_run)
+    return slot
+
+
+async def enqueue_review_comment_status(
+    session: AsyncSession,
+    review_run: ReviewRun,
+    *,
+    status_text: str,
+    commit: bool = True,
+) -> None:
+    """Persist a progress/result event bound to the run's exact comment slot."""
+
+    terminal = status_text in {"completed", "failed", "cancelled", "superseded"}
+    slot = (
+        await session.execute(
+            select(ReviewCommentSlot).where(
+                ReviewCommentSlot.review_run_id == review_run.id
+            )
+        )
+    ).scalar_one_or_none()
+    if slot is None:
+        slot = await ensure_review_placeholder_requested(session, review_run)
+    if terminal:
+        review_run.execution_status = (
+            "cancelled" if status_text == "superseded" else status_text
+        )
+        review_run.status = "awaiting_delivery"
+        review_run.stage = f"{status_text}_delivery_pending"
+        if slot.status == "ready":
+            slot.status = "finalizing"
+            session.add(slot)
+    result_version = slot.result_version + 1
+    slot.result_version = result_version
+    session.add(slot)
+    payload: dict[str, Any] = {
+        "slot_id": slot.id,
+        "review_run_id": review_run.id,
+        "status_text": status_text,
+        "result_version": result_version,
+    }
+    if terminal:
+        payload["final_status"] = status_text
+        payload["final_stage"] = status_text
+    await enqueue_delivery(
+        session,
+        review_run,
+        provider=review_run.provider,
+        operation="review_result" if terminal else "review_progress",
+        destination_key=f"review-comment-slot:{slot.id}",
+        idempotency_key=(
+            f"review:{review_run.id}:comment:{status_text}:v{result_version}"
+        ),
+        payload=payload,
+        mandatory=True,
+        priority=100,
+        max_attempts=0,
+    )
+    session.add(review_run)
+    if commit:
+        await session.commit()
+        await session.refresh(review_run)
+    else:
+        await session.flush()
 
 
 def _review_trigger_policy(trigger_type: str) -> tuple[str, int]:
@@ -451,6 +593,7 @@ async def get_review_run_detail(
     findings = await _findings_summary_for_run(session, review_run.id)
     trigger_event = await _trigger_event_for_run(session, review_run)
     agent_task = await _agent_task_for_run(session, review_run)
+    placeholder = await _review_comment_slot_summary(session, review_run.id)
     available_actions = ReviewRunAvailableActions(
         retry=await get_review_run_retry_availability(
             session,
@@ -474,6 +617,7 @@ async def get_review_run_detail(
         validation_errors=review_run.validation_errors_json or [],
         trigger_event=_linked_event_summary(trigger_event),
         agent_task=_linked_task_summary(agent_task),
+        placeholder=placeholder,
         available_actions=available_actions,
     )
 
@@ -489,6 +633,21 @@ async def start_review_session(
     if review_run.status in {"cancelled", "superseded", "completed"}:
         raise ReviewRunTransitionError(
             f"Review run {review_run.id} cannot be started from {review_run.status}."
+        )
+    comment_slot = (
+        await session.execute(
+            select(ReviewCommentSlot).where(
+                ReviewCommentSlot.review_run_id == review_run.id
+            )
+        )
+    ).scalar_one_or_none()
+    if (
+        comment_slot is None
+        or comment_slot.status != "ready"
+        or not comment_slot.provider_comment_id
+    ):
+        raise ReviewRunTransitionError(
+            "Review placeholder must be delivered before Agent execution."
         )
 
     resolved_workspace_path = workspace_path or review_run.workspace_path
@@ -724,10 +883,14 @@ async def collect_review_result(
         review_run.status = "failed"
         review_run.failure_code = "invalid_result"
         review_run.error = f"{exc.code}: {exc.message}"
-        await session.commit()
+        await enqueue_review_comment_status(
+            session,
+            review_run,
+            status_text="failed",
+        )
         raise
 
-    await persist_and_reconcile_findings(session, review_run, parsed)
+    await persist_and_reconcile_findings(session, review_run, parsed, commit=False)
     review_run.status = "completed"
     review_run.stage = "completed"
     review_run.review_summary = parsed.result.summary
@@ -740,8 +903,11 @@ async def collect_review_result(
         review_session.result_ref = f"review-run:{review_run.id}:result"
         review_session.error_message = None
         session.add(review_session)
-    await session.commit()
-    await session.refresh(review_run)
+    await enqueue_review_comment_status(
+        session,
+        review_run,
+        status_text="completed",
+    )
     return parsed
 
 
@@ -1268,6 +1434,8 @@ async def handle_review_requested(
     )
     review_run.pull_request_context_id = context.id
     context.latest_review_run_id = review_run.id
+    if created:
+        await ensure_review_placeholder_requested(session, review_run)
     if request.reason == "automatic" and created:
         await supersede_older_review_runs(session, review_run)
     session.add(context)
@@ -1285,10 +1453,14 @@ async def cancel_review_run(
         return None
     if review_run.status in CANCELLABLE_STATUSES:
         review_run.status = "cancelled"
+        review_run.execution_status = "cancelled"
         review_run.failure_code = "cancelled"
         session.add(review_run)
-        await session.commit()
-        await session.refresh(review_run)
+        await enqueue_review_comment_status(
+            session,
+            review_run,
+            status_text="cancelled",
+        )
     return review_run
 
 
@@ -2523,6 +2695,12 @@ def _worker_state(review_run: ReviewRun) -> str:
         return "locked_by_worker"
     if lock_state == "expired":
         return "worker_lock_expired"
+    if review_run.status == "awaiting_delivery":
+        return (
+            "waiting_for_placeholder"
+            if review_run.stage == "placeholder_delivery_pending"
+            else "waiting_for_result_delivery"
+        )
     if review_run.status == "queued":
         return "waiting_for_worker"
     if review_run.status == "running" and not review_run.agent_session_id:
@@ -2719,6 +2897,46 @@ async def _trigger_event_for_run(
     return result.scalar_one_or_none()
 
 
+async def _review_comment_slot_summary(
+    session: AsyncSession,
+    review_run_id: str,
+) -> ReviewCommentSlotSummary | None:
+    slot_result = await session.execute(
+        select(ReviewCommentSlot).where(
+            ReviewCommentSlot.review_run_id == review_run_id
+        )
+    )
+    slot = slot_result.scalar_one_or_none()
+    if slot is None:
+        return None
+    delivery_result = await session.execute(
+        select(DeliveryOutbox)
+        .where(
+            DeliveryOutbox.task_id == review_run_id,
+            DeliveryOutbox.operation == "review_placeholder",
+        )
+        .order_by(DeliveryOutbox.created_at.desc(), DeliveryOutbox.id.desc())
+        .limit(1)
+    )
+    delivery = delivery_result.scalar_one_or_none()
+    return ReviewCommentSlotSummary(
+        id=slot.id,
+        status=slot.status,
+        marker=slot.marker,
+        provider_comment_id=slot.provider_comment_id,
+        placeholder_version=slot.placeholder_version,
+        result_version=slot.result_version,
+        last_error=_safe_error_message(slot.last_error),
+        bound_at=slot.bound_at,
+        finalized_at=slot.finalized_at,
+        delivery_event_id=delivery.id if delivery else None,
+        delivery_status=delivery.status if delivery else None,
+        delivery_attempt=delivery.attempt if delivery else None,
+        delivery_available_at=delivery.available_at if delivery else None,
+        delivery_locked_until=delivery.locked_until if delivery else None,
+    )
+
+
 async def _agent_task_for_run(
     session: AsyncSession,
     review_run: ReviewRun,
@@ -2902,10 +3120,17 @@ async def cancel_active_review_runs_for_pr(
     now = utc_now()
     for review_run in review_runs:
         review_run.status = "cancelled"
+        review_run.execution_status = "cancelled"
         review_run.stage = "cleanup"
         review_run.failure_code = failure_code
         review_run.completed_at = now
         session.add(review_run)
+        await enqueue_review_comment_status(
+            session,
+            review_run,
+            status_text="cancelled",
+            commit=False,
+        )
     return review_runs
 
 
@@ -2927,11 +3152,18 @@ async def supersede_older_review_runs(
     now = utc_now()
     for review_run in older_runs:
         review_run.status = "superseded"
+        review_run.execution_status = "cancelled"
         review_run.stage = "cleanup"
         review_run.failure_code = "superseded_by_new_head"
         review_run.superseded_by_review_run_id = current_run.id
         review_run.completed_at = now
         session.add(review_run)
+        await enqueue_review_comment_status(
+            session,
+            review_run,
+            status_text="superseded",
+            commit=False,
+        )
     return older_runs
 
 

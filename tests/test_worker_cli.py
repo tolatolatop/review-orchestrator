@@ -104,3 +104,21 @@ async def test_worker_builds_and_reuses_one_provider_registry(monkeypatch) -> No
     assert registries[0].require("gitlab").client is gitlab_client
     assert github_client.closed is True
     assert engine.disposed is True
+
+    registries.clear()
+    await run_worker(
+        settings=Settings(),
+        once=True,
+        worker_id="delivery-test",
+        mode="delivery",
+    )
+    assert len(registries) == 1
+
+    registries.clear()
+    await run_worker(
+        settings=Settings(),
+        once=True,
+        worker_id="execution-test",
+        mode="execution",
+    )
+    assert len(registries) == 4

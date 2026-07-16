@@ -21,6 +21,8 @@ from review_orchestrator.application.scheduler import (
 from review_orchestrator.application.services import (
     ReviewRequest,
     collect_review_result,
+    enqueue_review_comment_status,
+    ensure_review_placeholder_requested,
     get_or_create_review_config,
     handle_review_requested,
     start_review_session,
@@ -31,6 +33,7 @@ from review_orchestrator.domain.models import (
     AgentTask,
     ProviderEventInbox,
     PullRequestContext,
+    ReviewCommentSlot,
     ReviewRun,
     utc_now,
 )
@@ -879,13 +882,19 @@ async def process_next_review_run(
         return review_run
 
     try:
-        if _should_publish_reviewing(review_run):
-            await publish_review_run_status_comment(
-                session,
-                review_run,
-                provider_registry=registry,
-                status_text="reviewing",
-            )
+        comment_slot = await _review_comment_slot(session, review_run.id)
+        if (
+            comment_slot is None
+            or comment_slot.status != "ready"
+            or not comment_slot.provider_comment_id
+        ):
+            if comment_slot is not None and comment_slot.status == "ready":
+                comment_slot.status = "pending"
+                session.add(comment_slot)
+            await ensure_review_placeholder_requested(session, review_run)
+            await session.commit()
+            await session.refresh(review_run)
+            return review_run
         context = await _review_run_context(session, review_run)
         if context is None:
             review_run.status = "failed"
@@ -1018,7 +1027,7 @@ async def process_next_review_run(
             )
         except Exception as exc:
             await session.refresh(review_run)
-            if review_run.status != "failed":
+            if review_run.execution_status != "failed":
                 review_run.status = "failed"
                 review_run.failure_code = "worker_exception"
                 review_run.error = str(exc)
@@ -1026,23 +1035,17 @@ async def process_next_review_run(
                 session.add(review_run)
                 await session.commit()
                 await session.refresh(review_run)
-            await publish_review_run_status_comment(
-                session,
-                review_run,
-                provider_registry=registry,
-                status_text="failed",
-            )
+                await publish_review_run_status_comment(
+                    session,
+                    review_run,
+                    provider_registry=registry,
+                    status_text="failed",
+                )
             return review_run
         config = await get_or_create_review_config(
             session,
             provider=review_run.provider,
             repo_full_name=review_run.repo_full_name,
-        )
-        await publish_review_run_status_comment(
-            session,
-            review_run,
-            provider_registry=registry,
-            status_text="completed",
         )
         if config.line_comments_enabled:
             if registry.capability(
@@ -1086,14 +1089,6 @@ async def process_next_review_run(
         return review_run
     finally:
         await release_review_run_lock(session, review_run.id)
-
-
-def _should_publish_reviewing(review_run: ReviewRun) -> bool:
-    return (
-        review_run.summary_comment_id is None
-        and review_run.soft_timeout_emitted_at is None
-        and review_run.stage in {None, "start"}
-    )
 
 
 async def process_agent_task_timeouts(
@@ -1237,39 +1232,23 @@ async def publish_review_run_status_comment(
     status_text: str,
 ) -> None:
     del provider_registry
-    terminal = status_text in {"completed", "failed"}
-    if terminal:
-        review_run.execution_status = status_text
-        review_run.status = "awaiting_delivery"
-        review_run.stage = f"{status_text}_delivery_pending"
-    payload: dict[str, Any] = {
-        "status_text": status_text,
-        "finding_stats": review_run.finding_count_by_severity,
-    }
-    if terminal:
-        payload["final_status"] = status_text
-        payload["final_stage"] = status_text
-    await enqueue_delivery(
+    await enqueue_review_comment_status(
         session,
         review_run,
-        provider=review_run.provider,
-        operation="review_summary",
-        destination_key=(
-            f"{review_run.provider}:{review_run.repo_full_name}:"
-            f"pr:{review_run.pull_request_number}:summary"
-        ),
-        idempotency_key=(
-            f"review:{review_run.id}:summary:{status_text}:attempt:"
-            f"{review_run.attempt}"
-        ),
-        payload=payload,
-        mandatory=terminal,
-        priority=review_run.priority,
-        supersede_pending=terminal,
+        status_text=status_text,
     )
-    session.add(review_run)
-    await session.commit()
-    await session.refresh(review_run)
+
+
+async def _review_comment_slot(
+    session: AsyncSession,
+    review_run_id: str,
+) -> ReviewCommentSlot | None:
+    result = await session.execute(
+        select(ReviewCommentSlot).where(
+            ReviewCommentSlot.review_run_id == review_run_id
+        )
+    )
+    return result.scalar_one_or_none()
 
 
 async def _enqueue_review_line_comments(

@@ -138,7 +138,7 @@ services:
     build:
       context: .
     image: review-orchestrator:self-host
-    command: ["review-orchestrator-worker"]
+    command: ["review-orchestrator-worker", "--mode", "execution"]
     env_file:
       - path: .env
         required: false
@@ -173,6 +173,27 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  review-orchestrator-delivery-worker:
+    build:
+      context: .
+    image: review-orchestrator:self-host
+    command: ["review-orchestrator-worker", "--mode", "delivery"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      APP_ENV: ${APP_ENV:-self_host}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-review}:${POSTGRES_PASSWORD:-review}@postgres:5432/${POSTGRES_DB:-review_orchestrator}
+      WORKER_POLL_INTERVAL_SECONDS: ${WORKER_POLL_INTERVAL_SECONDS:-5}
+      WORKER_LOCK_SECONDS: ${WORKER_LOCK_SECONDS:-300}
+    volumes:
+      - review_orchestrator_data:/var/lib/review-orchestrator
+      - ./secrets:/run/secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
   nginx:
     image: nginx:1.27-alpine
     environment:
@@ -186,6 +207,8 @@ services:
       review-orchestrator:
         condition: service_healthy
       review-orchestrator-worker:
+        condition: service_started
+      review-orchestrator-delivery-worker:
         condition: service_started
     healthcheck:
       test:

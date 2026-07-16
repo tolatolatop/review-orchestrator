@@ -15,6 +15,7 @@ from review_orchestrator.models import (
     ProviderEventInbox,
     PullRequestContext,
     ReviewCommentRef,
+    ReviewCommentSlot,
     ReviewRun,
     Workspace,
 )
@@ -53,6 +54,12 @@ def test_p0_pr_opened_runs_review_and_reconciles_published_state(
             client,
             payload,
             delivery_id="delivery-p0-opened",
+        )
+        asyncio.run(
+            _given_placeholder_is_delivered(
+                client.app.state.session_factory,
+                accepted["review_run_id"],
+            )
         )
         acquired = asyncio.run(
             _when_worker_acquires_next_run(client.app.state.session_factory)
@@ -120,7 +127,8 @@ def test_p0_pr_opened_runs_review_and_reconciles_published_state(
     assert start_response.json()["status"] == "running"
     assert start_response.json()["workspace_path"] == workspace["workspace_path"]
     assert sync_response.json()["status"] == "running"
-    assert collect_response.json()["review_run"]["status"] == "completed"
+    assert collect_response.json()["review_run"]["status"] == "awaiting_delivery"
+    assert collect_response.json()["review_run"]["execution_status"] == "completed"
     assert collect_response.json()["parsed"]["findings"][0][
         "publish_as_line_comment"
     ] is True
@@ -178,10 +186,12 @@ def test_p0_given_pr_synchronize_when_new_head_arrives_then_old_run_is_supersede
 
     assert synchronized["internal_event"] == "pr_updated"
     assert synchronized["review_run_id"] != opened["review_run_id"]
-    assert old_run["status"] == "superseded"
+    assert old_run["status"] == "awaiting_delivery"
+    assert old_run["execution_status"] == "cancelled"
     assert old_run["failure_code"] == "superseded_by_new_head"
     assert old_run["superseded_by_review_run_id"] == synchronized["review_run_id"]
-    assert new_run["status"] == "queued"
+    assert new_run["status"] == "awaiting_delivery"
+    assert new_run["stage"] == "placeholder_delivery_pending"
     assert new_run["head_sha"] == repo.second_head_sha
 
 
@@ -195,6 +205,29 @@ async def _when_worker_acquires_next_run(session_factory) -> dict[str, Any]:
             "stage": review_run.stage,
             "lock_owner": review_run.lock_owner,
         }
+
+
+async def _given_placeholder_is_delivered(
+    session_factory,
+    review_run_id: str,
+) -> None:
+    async with session_factory() as session:
+        review_run = await session.get(ReviewRun, review_run_id)
+        assert review_run is not None
+        slot = (
+            await session.execute(
+                select(ReviewCommentSlot).where(
+                    ReviewCommentSlot.review_run_id == review_run_id
+                )
+            )
+        ).scalar_one()
+        slot.status = "ready"
+        slot.provider_comment_id = f"placeholder-{review_run_id}"
+        review_run.status = "queued"
+        review_run.stage = "placeholder_ready"
+        review_run.delivery_status = "delivered"
+        session.add_all([slot, review_run])
+        await session.commit()
 
 
 async def _then_publish_and_read_review_artifacts(

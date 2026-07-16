@@ -1,10 +1,12 @@
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
 
 from review_orchestrator.application.delivery import process_next_delivery
+from review_orchestrator.application.services import ensure_review_placeholder_requested
 from review_orchestrator.config import Settings
 from review_orchestrator.db import create_engine, create_session_factory, init_models
 from review_orchestrator.github import GitHubAdapter, GitHubClientError
@@ -26,9 +28,11 @@ from review_orchestrator.worker import (
     acquire_next_review_run,
     emit_timeout_event,
     process_next_agent_task,
-    process_next_review_run,
     process_review_run_timeouts,
     release_review_run_lock,
+)
+from review_orchestrator.worker import (
+    process_next_review_run as _process_next_review_run,
 )
 from tests.factories import ReviewRunCreate, create_review_run
 
@@ -256,7 +260,7 @@ class CustomProviderAdapter:
     ):
         del session, review_run, finding_stats
         self.summary_statuses.append(status_text)
-        return None
+        return type("CommentRef", (), {"provider_comment_id": "custom-summary-1"})()
 
 
 class RoutingAdapter:
@@ -279,7 +283,7 @@ class RoutingAdapter:
         del session, finding_stats
         assert review_run.provider == self.provider
         self.summary_statuses.append(status_text)
-        return None
+        return SimpleNamespace(provider_comment_id=f"{self.provider}-summary")
 
     async def publish_line_comments(self, session, review_run, *, changed_files):
         del session, review_run, changed_files
@@ -320,6 +324,33 @@ async def deliver_github_all(session, github_client) -> None:
     await deliver_all(
         session,
         provider_registry=github_registry(github_client),
+    )
+
+
+async def process_next_review_run(
+    session,
+    *,
+    github_client=None,
+    provider_registry=None,
+    **kwargs,
+):
+    """Exercise the production placeholder gate before Agent execution."""
+
+    client = github_client or FakeGitHubClient()
+    registry = provider_registry or github_registry(client)
+    result = await session.execute(
+        select(ReviewRun).where(
+            ReviewRun.status.in_({"queued", "running", "awaiting_delivery"})
+        )
+    )
+    for review_run in result.scalars().all():
+        await ensure_review_placeholder_requested(session, review_run)
+    await session.commit()
+    await deliver_all(session, provider_registry=registry)
+    return await _process_next_review_run(
+        session,
+        provider_registry=registry,
+        **kwargs,
     )
 
 
@@ -976,7 +1007,7 @@ async def test_review_uses_matching_provider_for_result_upload(
 
     assert processed is not None
     assert processed.status == "completed"
-    assert adapter.summary_statuses == ["completed"]
+    assert adapter.summary_statuses == ["reviewing", "completed"]
     assert pi_agent.started_inputs[0][0].provider == provider
     assert pi_agent.started_inputs[0][0].workspace_path == workspace_path
 

@@ -23,6 +23,8 @@ async def persist_and_reconcile_findings(
     session: AsyncSession,
     review_run: ReviewRun,
     parsed_result: ParsedReviewResult,
+    *,
+    commit: bool = True,
 ) -> ReconciliationStats:
     previous_findings = await _previous_active_findings(session, review_run)
     previous_by_fingerprint = {
@@ -82,7 +84,10 @@ async def persist_and_reconcile_findings(
     review_run.finding_count_total = len(parsed_result.findings)
     review_run.finding_count_by_severity = _severity_counts(parsed_result)
     session.add(review_run)
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     return ReconciliationStats(**stats)
 
 

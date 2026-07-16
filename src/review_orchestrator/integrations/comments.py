@@ -11,6 +11,7 @@ from review_orchestrator.domain.models import (
     AgentTask,
     Finding,
     ReviewCommentRef,
+    ReviewCommentSlot,
     ReviewRun,
     utc_now,
 )
@@ -144,13 +145,20 @@ def build_summary_comment_body(
     *,
     status_text: str,
     finding_stats: dict[str, int] | None = None,
+    comment_slot: ReviewCommentSlot | None = None,
 ) -> str:
     stats = finding_stats or {}
     stat_text = ", ".join(f"{key}: {value}" for key, value in sorted(stats.items()))
     if not stat_text:
         stat_text = "no findings published"
+    marker = (
+        f"<!-- {comment_slot.marker}"
+        if comment_slot is not None
+        else SUMMARY_MARKER
+    )
     lines = [
-        f"{SUMMARY_MARKER} run_id={review_run.id} head_sha={review_run.head_sha} -->",
+        f"{marker} run_id={review_run.id} head_sha={review_run.head_sha} "
+        f"attempt={review_run.attempt} -->",
         f"Review status: {status_text}",
     ]
     if review_run.failure_code:
@@ -169,10 +177,12 @@ async def publish_github_summary_comment(
     status_text: str,
     finding_stats: dict[str, int] | None = None,
 ) -> ReviewCommentRef | None:
+    comment_slot = await _comment_slot_for_run(session, review_run.id)
     body = build_summary_comment_body(
         review_run,
         status_text=status_text,
         finding_stats=finding_stats,
+        comment_slot=comment_slot,
     )
     existing_ref = await _existing_summary_ref_with_body(session, review_run, body)
     if existing_ref is not None:
@@ -182,6 +192,7 @@ async def publish_github_summary_comment(
             github_client,
             review_run,
             body,
+            marker=(comment_slot.marker if comment_slot else SUMMARY_MARKER),
         )
     except GitHubClientError as exc:
         review_run.failure_code = "provider_permission_denied"
@@ -194,6 +205,7 @@ async def publish_github_summary_comment(
         review_run,
         provider_comment_id=provider_comment_id,
         body=body,
+        comment_slot=comment_slot,
     )
 
 
@@ -264,10 +276,12 @@ async def publish_gitlab_summary_comment(
     status_text: str,
     finding_stats: dict[str, int] | None = None,
 ) -> ReviewCommentRef | None:
+    comment_slot = await _comment_slot_for_run(session, review_run.id)
     body = build_summary_comment_body(
         review_run,
         status_text=status_text,
         finding_stats=finding_stats,
+        comment_slot=comment_slot,
     )
     existing_ref = await _existing_summary_ref_with_body(session, review_run, body)
     if existing_ref is not None:
@@ -277,6 +291,7 @@ async def publish_gitlab_summary_comment(
             gitlab_client,
             review_run,
             body,
+            marker=(comment_slot.marker if comment_slot else SUMMARY_MARKER),
         )
     except GitLabClientError as exc:
         review_run.failure_code = "provider_permission_denied"
@@ -289,6 +304,7 @@ async def publish_gitlab_summary_comment(
         review_run,
         provider_comment_id=provider_comment_id,
         body=body,
+        comment_slot=comment_slot,
     )
 
 
@@ -298,12 +314,11 @@ async def upsert_summary_comment_ref(
     *,
     provider_comment_id: str,
     body: str,
+    comment_slot: ReviewCommentSlot | None = None,
 ) -> ReviewCommentRef:
     result = await session.execute(
         select(ReviewCommentRef).where(
-            ReviewCommentRef.provider == review_run.provider,
-            ReviewCommentRef.repo_full_name == review_run.repo_full_name,
-            ReviewCommentRef.pull_request_number == review_run.pull_request_number,
+            ReviewCommentRef.review_run_id == review_run.id,
             ReviewCommentRef.comment_type == "summary",
         )
     )
@@ -322,6 +337,10 @@ async def upsert_summary_comment_ref(
     comment_ref.status = "active"
     comment_ref.last_published_body_hash = body_hash(body)
     review_run.summary_comment_id = provider_comment_id
+    if comment_slot is not None:
+        comment_slot.provider_comment_id = provider_comment_id
+        comment_slot.last_error = None
+        session.add(comment_slot)
     session.add(comment_ref)
     session.add(review_run)
     await session.commit()
@@ -375,11 +394,21 @@ async def _existing_summary_ref_with_body(
 ) -> ReviewCommentRef | None:
     result = await session.execute(
         select(ReviewCommentRef).where(
-            ReviewCommentRef.provider == review_run.provider,
-            ReviewCommentRef.repo_full_name == review_run.repo_full_name,
-            ReviewCommentRef.pull_request_number == review_run.pull_request_number,
+            ReviewCommentRef.review_run_id == review_run.id,
             ReviewCommentRef.comment_type == "summary",
             ReviewCommentRef.last_published_body_hash == body_hash(body),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def _comment_slot_for_run(
+    session: AsyncSession,
+    review_run_id: str,
+) -> ReviewCommentSlot | None:
+    result = await session.execute(
+        select(ReviewCommentSlot).where(
+            ReviewCommentSlot.review_run_id == review_run_id
         )
     )
     return result.scalar_one_or_none()
@@ -419,6 +448,8 @@ async def _upsert_github_issue_comment(
     github_client: GitHubClient,
     review_run: ReviewRun,
     body: str,
+    *,
+    marker: str,
 ) -> str:
     if review_run.summary_comment_id:
         return await github_client.update_issue_comment(
@@ -431,7 +462,7 @@ async def _upsert_github_issue_comment(
         review_run.repo_full_name,
         review_run.pull_request_number,
     ):
-        if comment.body and SUMMARY_MARKER in comment.body:
+        if comment.body and marker in comment.body:
             return await github_client.update_issue_comment(
                 review_run.repo_full_name,
                 str(comment.id),
@@ -448,6 +479,8 @@ async def _upsert_gitlab_note(
     gitlab_client: GitLabClient,
     review_run: ReviewRun,
     body: str,
+    *,
+    marker: str,
 ) -> str:
     if review_run.summary_comment_id:
         return await gitlab_client.update_merge_request_note(
@@ -461,7 +494,7 @@ async def _upsert_gitlab_note(
         review_run.repo_full_name,
         review_run.pull_request_number,
     ):
-        if note.body and SUMMARY_MARKER in note.body:
+        if note.body and marker in note.body:
             return await gitlab_client.update_merge_request_note(
                 review_run.repo_full_name,
                 review_run.pull_request_number,

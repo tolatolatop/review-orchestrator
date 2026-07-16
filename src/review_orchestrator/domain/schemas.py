@@ -36,6 +36,8 @@ class ReviewRunRead(BaseModel):
     trigger_type: str
     status: ReviewRunStatus
     stage: str | None
+    execution_status: str
+    delivery_status: str
     summary_comment_id: str | None
     workspace_path: str | None
     agent_session_id: str | None
@@ -176,6 +178,23 @@ class ReviewRunAvailableActions(BaseModel):
     rerun: ReviewRunActionAvailability
 
 
+class ReviewCommentSlotSummary(BaseModel):
+    id: str
+    status: str
+    marker: str
+    provider_comment_id: str | None
+    placeholder_version: int
+    result_version: int
+    last_error: str | None
+    bound_at: datetime | None
+    finalized_at: datetime | None
+    delivery_event_id: str | None = None
+    delivery_status: str | None = None
+    delivery_attempt: int | None = None
+    delivery_available_at: datetime | None = None
+    delivery_locked_until: datetime | None = None
+
+
 class ReviewRunDetail(ReviewRunListItem):
     workspace: ReviewRunWorkspaceSummary | None = None
     review_session: ReviewRunSessionSummary | None = None
@@ -184,6 +203,7 @@ class ReviewRunDetail(ReviewRunListItem):
     validation_errors: list = Field(default_factory=list)
     trigger_event: ReviewRunLinkedEventSummary | None = None
     agent_task: ReviewRunLinkedTaskSummary | None = None
+    placeholder: ReviewCommentSlotSummary | None = None
     available_actions: ReviewRunAvailableActions
 
 
@@ -544,6 +564,9 @@ class AgentTaskDetail(AgentTaskSummary):
 class ReviewRunActionResult(BaseModel):
     review_run_id: str
     status: ReviewRunStatus
+    stage: str | None = None
+    execution_status: str
+    delivery_status: str
 
 
 class PiAgentSessionDiagnostics(BaseModel):

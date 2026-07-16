@@ -15,10 +15,12 @@ from review_orchestrator.github import GitHubAdapter
 from review_orchestrator.main import create_app
 from review_orchestrator.models import (
     AgentTask,
+    DeliveryOutbox,
     Finding,
     ProviderEventInbox,
     PullRequestContext,
     ReviewCommentRef,
+    ReviewCommentSlot,
     ReviewRun,
     ReviewSession,
     SessionArchive,
@@ -123,6 +125,37 @@ def seed_review_run(client: TestClient, payload: dict) -> dict:
     response = client.get(f"/api/v1/review-runs/{review_run_id}")
     assert response.status_code == 200
     return response.json()
+
+
+async def make_review_placeholder_ready(
+    client: TestClient,
+    review_run_id: str,
+) -> None:
+    async with client.app.state.session_factory() as session:
+        review_run = await session.get(ReviewRun, review_run_id)
+        assert review_run is not None
+        slot = (
+            await session.execute(
+                select(ReviewCommentSlot).where(
+                    ReviewCommentSlot.review_run_id == review_run_id
+                )
+            )
+        ).scalar_one_or_none()
+        if slot is None:
+            slot = ReviewCommentSlot(
+                review_run_id=review_run.id,
+                provider=review_run.provider,
+                repo_full_name=review_run.repo_full_name,
+                pull_request_number=review_run.pull_request_number,
+                head_sha=review_run.head_sha,
+                marker=f"review-orchestrator:summary:slot:test-{review_run.id}",
+            )
+        slot.status = "ready"
+        slot.provider_comment_id = f"placeholder-{review_run.id}"
+        review_run.status = "queued"
+        review_run.stage = "placeholder_ready"
+        session.add_all([slot, review_run])
+        await session.commit()
 
 
 async def make_review_run_rerunnable(
@@ -1017,7 +1050,9 @@ def test_cancel_review_run(tmp_path: Path) -> None:
         response = client.post(f"/api/v1/review-runs/{review_run['id']}/cancel")
 
     assert response.status_code == 202
-    assert response.json()["status"] == "cancelled"
+    assert response.json()["status"] == "awaiting_delivery"
+    assert response.json()["execution_status"] == "cancelled"
+    assert response.json()["stage"] == "cancelled_delivery_pending"
 
 
 def test_accept_github_pull_request_webhook_creates_review_run(
@@ -1045,6 +1080,11 @@ def test_accept_github_pull_request_webhook_creates_review_run(
         review_run["head_sha"] == payload["pull_request"]["head"]["sha"]
     )
     assert review_run["trigger_type"] == "webhook"
+    assert review_run["status"] == "awaiting_delivery"
+    assert review_run["stage"] == "placeholder_delivery_pending"
+    assert review_run["agent_session_id"] is None
+    assert review_run["placeholder"]["status"] == "pending"
+    assert review_run["placeholder"]["delivery_status"] == "queued"
     assert review_run["trigger_event"] is not None
     assert review_run["trigger_event"]["provider_event"] == "pull_request"
     assert review_run["trigger_event"]["internal_event"] == "pr_opened"
@@ -1099,7 +1139,9 @@ def test_synchronize_supersedes_older_queued_review_run(tmp_path: Path) -> None:
 
     assert sync_response.status_code == 200
     assert sync_response.json()["review_run_id"] != opened_run_id
-    assert old_run["status"] == "superseded"
+    assert old_run["status"] == "awaiting_delivery"
+    assert old_run["execution_status"] == "cancelled"
+    assert old_run["stage"] == "superseded_delivery_pending"
     assert old_run["failure_code"] == "superseded_by_new_head"
 
 
@@ -1161,7 +1203,9 @@ def test_closed_pull_request_cancels_existing_queued_review_run(tmp_path: Path) 
 
     assert closed_response.status_code == 200
     assert closed_response.json()["internal_event"] == "pr_merged"
-    assert review_run["status"] == "cancelled"
+    assert review_run["status"] == "awaiting_delivery"
+    assert review_run["execution_status"] == "cancelled"
+    assert review_run["stage"] == "cancelled_delivery_pending"
     assert review_run["failure_code"] == "pr_merged"
 
 
@@ -1692,6 +1736,7 @@ def test_start_review_session_records_pi_agent_identifiers(tmp_path: Path) -> No
     with make_client(tmp_path) as client:
         client.app.state.pi_agent_client = fake_pi_agent
         review_run = seed_review_run(client, payload)
+        client.portal.call(make_review_placeholder_ready, client, review_run["id"])
 
         start_response = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
@@ -1723,6 +1768,7 @@ def test_start_review_session_requires_workspace_path(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
         client.app.state.pi_agent_client = FakePiAgentClient()
         review_run = seed_review_run(client, payload)
+        client.portal.call(make_review_placeholder_ready, client, review_run["id"])
         start_response = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
             json={},
@@ -1747,6 +1793,7 @@ def test_start_review_session_rejects_request_overrides_and_uses_domain_preset(
     with make_client(tmp_path) as client:
         client.app.state.pi_agent_client = fake_pi_agent
         review_run = seed_review_run(client, payload)
+        client.portal.call(make_review_placeholder_ready, client, review_run["id"])
         rejected = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
             json={
@@ -1791,6 +1838,7 @@ def test_sync_review_session_marks_pi_agent_failure(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
         client.app.state.pi_agent_client = fake_pi_agent
         review_run = seed_review_run(client, payload)
+        client.portal.call(make_review_placeholder_ready, client, review_run["id"])
         started = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
             json={"workspace_path": "/workspaces/example-repo/pr-42/bbbbbbb"},
@@ -1820,6 +1868,7 @@ def test_observability_pi_agent_session_returns_safe_metadata(
     with make_client(tmp_path) as client:
         client.app.state.pi_agent_client = fake_pi_agent
         review_run = seed_review_run(client, payload)
+        client.portal.call(make_review_placeholder_ready, client, review_run["id"])
         started = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
             json={"workspace_path": "/workspaces/example-repo/pr-42/bbbbbbb"},
@@ -1926,7 +1975,9 @@ def test_collect_review_result_completes_review_run(tmp_path: Path) -> None:
 
     assert collect_response.status_code == 200
     data = collect_response.json()
-    assert data["review_run"]["status"] == "completed"
+    assert data["review_run"]["status"] == "awaiting_delivery"
+    assert data["review_run"]["execution_status"] == "completed"
+    assert data["review_run"]["stage"] == "completed_delivery_pending"
     assert data["review_run"]["review_summary"] == "One issue found."
     assert data["parsed"]["findings"][0]["publish_as_line_comment"] is True
 
@@ -1944,6 +1995,7 @@ def test_cancel_review_session_cancels_pi_agent_session(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
         client.app.state.pi_agent_client = fake_pi_agent
         review_run = seed_review_run(client, payload)
+        client.portal.call(make_review_placeholder_ready, client, review_run["id"])
         started = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
             json={"workspace_path": "/workspaces/example-repo/pr-42/bbbbbbb"},
@@ -1971,6 +2023,7 @@ def test_review_session_does_not_expose_human_message_route(tmp_path: Path) -> N
     with make_client(tmp_path) as client:
         client.app.state.pi_agent_client = fake_pi_agent
         review_run = seed_review_run(client, payload)
+        client.portal.call(make_review_placeholder_ready, client, review_run["id"])
         started = client.post(
             f"/api/v1/review-runs/{review_run['id']}/session/start",
             json={"workspace_path": "/workspaces/example-repo/pr-42/bbbbbbb"},
@@ -2080,6 +2133,21 @@ def test_retry_failed_review_run_creates_next_attempt(tmp_path: Path) -> None:
             source = await session.get(ReviewRun, source_id)
             review_run = await session.get(ReviewRun, run_id)
             event = await session.get(ProviderEventInbox, event_id)
+            slot = (
+                await session.execute(
+                    select(ReviewCommentSlot).where(
+                        ReviewCommentSlot.review_run_id == run_id
+                    )
+                )
+            ).scalar_one()
+            delivery = (
+                await session.execute(
+                    select(DeliveryOutbox).where(
+                        DeliveryOutbox.task_id == run_id,
+                        DeliveryOutbox.operation == "review_placeholder",
+                    )
+                )
+            ).scalar_one()
             assert source is not None
             assert review_run is not None
             assert event is not None
@@ -2089,6 +2157,13 @@ def test_retry_failed_review_run_creates_next_attempt(tmp_path: Path) -> None:
             assert review_run.queue == "manual-review"
             assert review_run.priority == 60
             assert review_run.attempt == 2
+            assert review_run.status == "awaiting_delivery"
+            assert review_run.stage == "placeholder_delivery_pending"
+            assert slot.status == "pending"
+            assert delivery.status == "queued"
+            assert delivery.mandatory is True
+            assert delivery.max_attempts == 0
+            assert delivery.payload_json["slot_id"] == slot.id
             assert event.provider == "internal"
             assert event.provider_event == "review_request"
             assert event.provider_action == "retry"
@@ -2119,7 +2194,7 @@ def test_retry_failed_review_run_creates_next_attempt(tmp_path: Path) -> None:
         assert first.json()["source_review_run_id"] == original["id"]
         assert first.json()["review_run_id"] != original["id"]
         assert first.json()["attempt"] == 2
-        assert first.json()["status"] == "queued"
+        assert first.json()["status"] == "awaiting_delivery"
         assert first.json()["deduplicated"] is False
         assert duplicate.status_code == 202
         assert duplicate.json()["review_run_id"] == first.json()["review_run_id"]
@@ -2223,6 +2298,21 @@ def test_dashboard_rerun_records_internal_event_and_creates_new_attempt(
         async with client.app.state.session_factory() as session:
             review_run = await session.get(ReviewRun, run_id)
             event = await session.get(ProviderEventInbox, event_id)
+            slot = (
+                await session.execute(
+                    select(ReviewCommentSlot).where(
+                        ReviewCommentSlot.review_run_id == run_id
+                    )
+                )
+            ).scalar_one()
+            delivery = (
+                await session.execute(
+                    select(DeliveryOutbox).where(
+                        DeliveryOutbox.task_id == run_id,
+                        DeliveryOutbox.operation == "review_placeholder",
+                    )
+                )
+            ).scalar_one()
             assert review_run is not None
             assert event is not None
             assert review_run.trigger_type == "dashboard_rerun"
@@ -2230,6 +2320,11 @@ def test_dashboard_rerun_records_internal_event_and_creates_new_attempt(
             assert review_run.queue == "manual-review"
             assert review_run.priority == 60
             assert review_run.attempt == 2
+            assert review_run.status == "awaiting_delivery"
+            assert review_run.stage == "placeholder_delivery_pending"
+            assert slot.status == "pending"
+            assert delivery.status == "queued"
+            assert delivery.payload_json["slot_id"] == slot.id
             assert event.provider == "internal"
             assert event.provider_event == "review_request"
             assert event.provider_action == "rerun"
@@ -2261,7 +2356,7 @@ def test_dashboard_rerun_records_internal_event_and_creates_new_attempt(
         assert first.status_code == 202
         assert first.json()["source_review_run_id"] == original["id"]
         assert first.json()["attempt"] == 2
-        assert first.json()["status"] == "queued"
+        assert first.json()["status"] == "awaiting_delivery"
         assert first.json()["deduplicated"] is False
         assert duplicate.status_code == 202
         assert duplicate.json()["review_run_id"] == first.json()["review_run_id"]
