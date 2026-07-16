@@ -117,6 +117,7 @@ const config = {
   workspaceOwnerUid: parsePositiveInt(process.env.PI_AGENT_WORKSPACE_OWNER_UID, 1000),
   workspaceOwnerGid: parsePositiveInt(process.env.PI_AGENT_WORKSPACE_OWNER_GID, 1000),
   serviceToken: process.env.PI_AGENT_RUNTIME_TOKEN,
+  orchestratorUrl: process.env.PI_AGENT_ORCHESTRATOR_URL,
   defaultProvider: process.env.PI_AGENT_PROVIDER ?? "openai",
   defaultModel: process.env.PI_AGENT_MODEL ?? "gpt-5.4",
   defaultThinking: normalizeThinking(process.env.PI_AGENT_THINKING_LEVEL ?? "high"),
@@ -126,7 +127,10 @@ const config = {
 };
 
 const agentRegistry = createBuiltinAgentRegistry();
-const toolRegistry = createDefaultToolRegistry();
+const toolRegistry = createDefaultToolRegistry({
+  ...(config.orchestratorUrl === undefined ? {} : { baseUrl: config.orchestratorUrl }),
+  ...(config.serviceToken === undefined ? {} : { token: config.serviceToken }),
+});
 const sessions = new Map<string, SessionRecord>();
 const idempotentSessions = new Map<string, string>();
 const persistenceQueues = new Map<string, Promise<void>>();
@@ -724,6 +728,9 @@ function compatibilityRecord(
       ? {
         repository_context: repository,
         instruction: value.instruction ?? { text: "", author_login: "unknown", history: [] },
+        ...(value.orchestration_context === undefined
+          ? {}
+          : { orchestration_context: value.orchestration_context }),
       }
       : repository,
     repository_context: repository,

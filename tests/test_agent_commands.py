@@ -489,6 +489,8 @@ async def test_command_task_includes_bounded_completed_history(
         )
 
     instruction, _ = pi_agent_client.started_inputs[0]
+    assert instruction.orchestration_context is not None
+    assert instruction.orchestration_context.agent_task_id == current.id
     assert len(instruction.history) == 1
     assert instruction.history[0].command == "Where is retry configured?"
     assert instruction.history[0].answer == "In src/retry.py."

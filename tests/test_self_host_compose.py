@@ -51,6 +51,7 @@ def test_pi_agent_runtime_supports_configurable_models_and_skills() -> None:
     assert "PI_AGENT_SKILLS_PATH=./pi-agent-runtime/skills" in example_env
     assert "AGENT_COMMAND_SKILL=pr-assistant" in example_env
     assert "PI_AGENT_ENVIRONMENT_TEMPLATE_ROOT:" in compose
+    assert "PI_AGENT_ORCHESTRATOR_URL: http://review-orchestrator:8000" in compose
     assert "PI_AGENT_ENVIRONMENT_TEMPLATE_PATH=" in example_env
 
 

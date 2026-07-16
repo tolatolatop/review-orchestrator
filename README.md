@@ -294,10 +294,18 @@ starts pi-agent in `instruction` mode with the `pr-assistant` skill. A validated
 cancellation, soft timeout, and hard timeout also update the same comment.
 
 Commands for one PR execute in Task priority/resource order. A new command receives a bounded history of
-the six most recent successful command/answer exchanges. It never creates a
-`ReviewRun` or `Finding`. The Agent can read, write, build, and test inside its
-Task Workspace, but does not receive Provider/Git/Runtime/model credentials and
-cannot publish comments directly.
+the six most recent successful command/answer exchanges. The Agent can read,
+write, build, and test inside its Task Workspace, but does not receive
+Provider/Git/Runtime/model credentials and cannot publish comments directly.
+
+For an explicit command such as `@review-agent retry the failed review` or
+`@review-agent review this revision again`, `pr-assistant` can call the scoped
+`request_review_action` Tool. The Tool accepts only `retry|rerun`; AgentTask and
+Session identity determine the PR and current Head. The Orchestrator then
+applies the same eligibility and idempotency rules as the dashboard endpoints,
+stores an internal `review_requested` event, and starts the new ReviewRun with
+the durable placeholder gate. The Agent cannot supply another repository, PR,
+Head, or ReviewRun ID.
 
 ### Workspace MVP Contract
 

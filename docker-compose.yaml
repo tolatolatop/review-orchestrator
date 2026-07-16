@@ -16,6 +16,7 @@ services:
       PI_AGENT_SKILLS_ROOT: /opt/pi-agent/skills
       PI_AGENT_MODELS_FILE: /etc/pi-agent/models.json
       PI_AGENT_RUNTIME_TOKEN: ${PI_AGENT_RUNTIME_TOKEN:-}
+      PI_AGENT_ORCHESTRATOR_URL: http://review-orchestrator:8000
       PI_AGENT_PROVIDER: ${PI_AGENT_PROVIDER:-openai}
       PI_AGENT_MODEL: ${PI_AGENT_MODEL:-gpt-5.4}
       PI_AGENT_THINKING_LEVEL: ${PI_AGENT_THINKING_LEVEL:-high}

@@ -48,6 +48,10 @@ class AgentInstructionHistoryItem(BaseModel):
     head_sha: str
 
 
+class AgentInstructionOrchestrationContext(BaseModel):
+    agent_task_id: str = Field(min_length=1, max_length=36)
+
+
 class AgentInstructionInput(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=256)
     workspace_path: str = Field(min_length=1)
@@ -55,6 +59,7 @@ class AgentInstructionInput(BaseModel):
     text: str = Field(min_length=1, max_length=8000)
     author_login: str = Field(min_length=1, max_length=255)
     source_url: str | None = None
+    orchestration_context: AgentInstructionOrchestrationContext | None = None
     history: list[AgentInstructionHistoryItem] = Field(
         default_factory=list,
         max_length=6,
@@ -177,6 +182,15 @@ class PiAgentClient:
             input_data={
                 "repository_context": instruction.repository_context.model_dump(),
                 "instruction": instruction_payload,
+                **(
+                    {
+                        "orchestration_context": (
+                            instruction.orchestration_context.model_dump()
+                        )
+                    }
+                    if instruction.orchestration_context is not None
+                    else {}
+                ),
             },
             idempotency_key=instruction.idempotency_key,
             title=(

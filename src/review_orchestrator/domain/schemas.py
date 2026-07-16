@@ -232,6 +232,24 @@ class ReviewRunRetryResult(BaseModel):
     deduplicated: bool = False
 
 
+class AgentReviewActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_task_id: str = Field(min_length=1, max_length=36)
+    agent_session_id: str = Field(min_length=1, max_length=128)
+    action: Literal["retry", "rerun"]
+
+
+class AgentReviewActionResult(BaseModel):
+    action: Literal["retry", "rerun"]
+    source_review_run_id: str
+    review_request_event_id: str
+    review_run_id: str
+    attempt: int
+    status: ReviewRunStatus
+    deduplicated: bool = False
+
+
 class ReviewSessionStart(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

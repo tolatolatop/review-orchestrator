@@ -31,6 +31,8 @@ process.env.PI_AGENT_WORKSPACE_ROOT = workspaceRoot;
 process.env.PI_AGENT_SKILLS_ROOT = resolve("skills");
 process.env.PI_CODING_AGENT_DIR = join(stateRoot, "config");
 process.env.PI_AGENT_MODELS_FILE = join(stateRoot, "models.json");
+process.env.PI_AGENT_ORCHESTRATOR_URL = "http://orchestrator.test";
+process.env.PI_AGENT_RUNTIME_TOKEN = "runtime-tool-secret";
 const {
   createInstructionTools,
   createReviewTools,
@@ -92,6 +94,7 @@ function instructionRecord(workspace) {
       author_login: "alice",
       history: [],
     },
+    orchestration_context: { agent_task_id: "task-1" },
     provider: "openai",
     model: "gpt-5.4",
     thinking_level: "high",
@@ -243,6 +246,7 @@ test("instruction tools expose full workspace capability and submit_task_result"
         "git_diff",
         "write_file",
         "shell",
+        "request_review_action",
         "submit_task_result",
       ],
     );
@@ -267,6 +271,51 @@ test("instruction tools expose full workspace capability and submit_task_result"
     assert.deepEqual(state.result, payload);
     assert.equal(result.terminate, true);
   } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("request_review_action sends only the scoped AgentTask identity and action", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "pi-agent-review-action-"));
+  const originalFetch = globalThis.fetch;
+  let captured;
+  try {
+    globalThis.fetch = async (url, init) => {
+      captured = { url: String(url), init };
+      return new Response(JSON.stringify({
+        action: "retry",
+        source_review_run_id: "source-run",
+        review_request_event_id: "request-event",
+        review_run_id: "new-run",
+        attempt: 2,
+        status: "awaiting_delivery",
+        deduplicated: false,
+      }), {
+        status: 202,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const state = instructionRecord(workspace);
+    const result = await tool(
+      createInstructionTools(state),
+      "request_review_action",
+    ).execute("review-action-1", { action: "retry" });
+
+    assert.equal(
+      captured.url,
+      "http://orchestrator.test/api/v1/internal/agent-tools/review-action",
+    );
+    assert.equal(captured.init.headers.authorization, "Bearer runtime-tool-secret");
+    assert.deepEqual(JSON.parse(captured.init.body), {
+      agent_task_id: "task-1",
+      agent_session_id: "instruction-session",
+      action: "retry",
+    });
+    assert.equal(result.details.review_run_id, "new-run");
+    assert.equal(result.details.attempt, 2);
+    assert.equal(state.events.at(-1).type, "review_action_requested");
+  } finally {
+    globalThis.fetch = originalFetch;
     await rm(workspace, { recursive: true, force: true });
   }
 });

@@ -149,6 +149,8 @@ Set `REVIEW_BOT_LOGIN` to the GitHub App bot login, for example
 
 ```text
 @bitbakedev[bot] explain why the retry loop cannot run forever
+@bitbakedev[bot] retry the failed review
+@bitbakedev[bot] run the completed review again
 ```
 
 The webhook stores a `message_command` AgentTask and returns immediately. The
@@ -156,6 +158,13 @@ worker must create or recover its placeholder before starting pi-agent. It then
 updates the same comment with the validated answer. The Agent may edit, build,
 and test in its Task Workspace; Provider delivery and credentialed Git side
 effects remain deterministic Orchestrator operations.
+
+`pr-assistant` exposes `request_review_action` only for explicit retry/rerun
+commands. It sends the current AgentTask and Session identity over the internal
+Compose network, authenticated with `PI_AGENT_RUNTIME_TOKEN`. The Orchestrator
+selects the latest ReviewRun for that Task's PR and Head, validates its state,
+and persists the normal internal `review_requested` event. Keep the runtime
+token non-empty; the callback endpoint fails closed when it is not configured.
 
 Inspect or control a command:
 

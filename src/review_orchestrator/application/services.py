@@ -148,6 +148,12 @@ class ReviewRequestRejected(ReviewRunTransitionError):
         self.existing_review_run_id = existing_review_run_id
 
 
+class AgentReviewActionRejected(ReviewRunTransitionError):
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message, status_code=409)
+        self.code = code
+
+
 async def _create_review_run_record(
     session: AsyncSession,
     spec: ReviewRunSpec,
@@ -976,10 +982,29 @@ async def get_review_run_retry_availability(
     context: PullRequestContext | None = None,
     request_event_id: str | None = None,
 ) -> ReviewRunActionAvailability:
-    existing_event = await get_provider_event(
-        session,
-        "internal",
-        f"review-retry:{review_run.id}",
+    retry_events = list(
+        (
+            await session.execute(
+                select(ProviderEventInbox)
+                .where(
+                    ProviderEventInbox.provider == "internal",
+                    ProviderEventInbox.provider_action == "retry",
+                    ProviderEventInbox.internal_event == "review_requested",
+                    ProviderEventInbox.repo_full_name == review_run.repo_full_name,
+                    ProviderEventInbox.pull_request_number
+                    == review_run.pull_request_number,
+                )
+                .order_by(ProviderEventInbox.created_at.desc())
+            )
+        ).scalars()
+    )
+    existing_event = next(
+        (
+            event
+            for event in retry_events
+            if (event.payload or {}).get("source_review_run_id") == review_run.id
+        ),
+        None,
     )
     if existing_event is not None and existing_event.id != request_event_id:
         if existing_event.review_run_id:
@@ -1146,6 +1171,113 @@ async def request_review_retry(
         delivery_id=f"review-retry:{review_run_id}",
     )
     return ReviewRunRetryResult(**result) if result is not None else None
+
+
+async def request_review_action_from_agent(
+    session: AsyncSession,
+    *,
+    agent_task_id: str,
+    agent_session_id: str,
+    action: Literal["retry", "rerun"],
+) -> dict[str, Any] | None:
+    """Run a review action requested by the scoped pr-assistant Tool."""
+
+    task = await session.get(AgentTask, agent_task_id)
+    if task is None:
+        return None
+    if (
+        task.task_type != "message_command"
+        or task.status != "running"
+        or task.stage not in {"starting_agent", "waiting_for_agent"}
+    ):
+        raise AgentReviewActionRejected(
+            "Review actions are only available to a running message command.",
+            code="agent_task_not_running",
+        )
+    if task.agent_session_id is not None and task.agent_session_id != agent_session_id:
+        raise AgentReviewActionRejected(
+            "The pi-agent session does not own this message command.",
+            code="agent_session_mismatch",
+        )
+    if not task.head_sha:
+        raise AgentReviewActionRejected(
+            "The message command is missing its pull-request revision.",
+            code="agent_task_revision_missing",
+        )
+
+    # The Runtime starts asynchronously and can invoke its first Tool before the
+    # worker persists the returned session ID. Bind that one narrow race here;
+    # an already-bound task must always match exactly.
+    if task.agent_session_id is None:
+        task.agent_session_id = agent_session_id
+        session.add(task)
+        await session.flush()
+
+    delivery_id = f"agent-review-action:{task.id}:{action}"
+    existing_event = await get_provider_event(session, "internal", delivery_id)
+    if existing_event is not None:
+        existing_source_id = (existing_event.payload or {}).get(
+            "source_review_run_id"
+        )
+        if not isinstance(existing_source_id, str) or not existing_source_id:
+            raise AgentReviewActionRejected(
+                "The existing Agent review request is missing its source review.",
+                code="agent_review_action_invalid",
+            )
+        existing = await _request_source_review_action(
+            session,
+            existing_source_id,
+            action=action,
+            delivery_id=delivery_id,
+        )
+        if existing is None:
+            raise AgentReviewActionRejected(
+                "The source review no longer exists.",
+                code="review_run_not_found",
+            )
+        return {"action": action, **existing}
+
+    source = await get_latest_review_run_by_head(
+        session,
+        provider=task.provider,
+        repo_full_name=task.repo_full_name,
+        pull_request_number=task.pull_request_number,
+        head_sha=task.head_sha,
+    )
+    if source is None:
+        raise AgentReviewActionRejected(
+            "No review exists for the current pull-request revision.",
+            code="review_run_not_found",
+        )
+    if action == "retry" and source.status != "failed":
+        raise AgentReviewActionRejected(
+            "The latest review is not failed; use rerun after a completed or "
+            "cancelled review.",
+            code="run_not_failed",
+        )
+    if action == "rerun" and source.status not in RERUN_SOURCE_STATUSES:
+        raise AgentReviewActionRejected(
+            "The latest review is not completed or cancelled; failed reviews "
+            "must use retry.",
+            code=(
+                "failed_run_requires_retry"
+                if source.status == "failed"
+                else "run_not_terminal"
+            ),
+        )
+
+    requested = await _request_source_review_action(
+        session,
+        source.id,
+        action=action,
+        delivery_id=delivery_id,
+    )
+    if requested is None:
+        raise AgentReviewActionRejected(
+            "The source review no longer exists.",
+            code="review_run_not_found",
+        )
+    return {"action": action, **requested}
 
 
 async def _request_source_review_action(

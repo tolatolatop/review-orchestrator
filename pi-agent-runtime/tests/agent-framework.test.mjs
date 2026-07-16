@@ -157,6 +157,7 @@ test("domain preset composition applies field-specific ownership", () => {
     "repository.git-diff",
     "workspace.write-file",
     "workspace.shell",
+    "orchestrator.review-action",
   ]);
   assert.equal(preset.model.id, "gpt-5.4");
   assert.equal(preset.composition.agent.id, "pr-assistant");

@@ -1,11 +1,15 @@
 """FastAPI routes and transport-level error mapping."""
 
+import hmac
 from datetime import datetime
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from review_orchestrator.application.services import (
+    AgentReviewActionRejected,
     ReviewRequestRejected,
     ReviewRunTransitionError,
     accept_provider_webhook,
@@ -30,6 +34,7 @@ from review_orchestrator.application.services import (
     list_review_runs,
     list_task_session_archives,
     list_tasks,
+    request_review_action_from_agent,
     request_review_rerun,
     request_review_retry,
     retry_agent_task,
@@ -42,6 +47,8 @@ from review_orchestrator.application.services import (
 from review_orchestrator.domain.models import AgentTask
 from review_orchestrator.domain.review_results import ReviewResultError
 from review_orchestrator.domain.schemas import (
+    AgentReviewActionRequest,
+    AgentReviewActionResult,
     AgentTaskDetail,
     AgentTaskListResponse,
     CleanupSummary,
@@ -106,6 +113,36 @@ from review_orchestrator.integrations.providers import (
 
 router = APIRouter(prefix="/api/v1")
 session_dependency = Depends(get_session)
+agent_tool_bearer_scheme = HTTPBearer(auto_error=False)
+
+
+async def _authorize_pi_agent_tool(
+    request: Request,
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None,
+        Depends(agent_tool_bearer_scheme),
+    ],
+) -> None:
+    expected = request.app.state.settings.pi_agent_runtime_token
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="pi-agent Tool callback token is not configured.",
+        )
+    supplied = credentials.credentials if credentials is not None else ""
+    if (
+        credentials is None
+        or credentials.scheme.lower() != "bearer"
+        or not hmac.compare_digest(supplied, expected)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid pi-agent Tool callback token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+pi_agent_tool_auth = Depends(_authorize_pi_agent_tool)
 
 
 def get_configured_provider_registry(request: Request) -> ProviderRegistry:
@@ -815,6 +852,38 @@ async def retry_review_run_endpoint(
     if result is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return result
+
+
+@router.post(
+    "/internal/agent-tools/review-action",
+    response_model=AgentReviewActionResult,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[pi_agent_tool_auth],
+)
+async def request_agent_review_action_endpoint(
+    payload: AgentReviewActionRequest,
+    session: AsyncSession = session_dependency,
+) -> AgentReviewActionResult:
+    try:
+        result = await request_review_action_from_agent(
+            session,
+            agent_task_id=payload.agent_task_id,
+            agent_session_id=payload.agent_session_id,
+            action=payload.action,
+        )
+    except AgentReviewActionRejected as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+    except ReviewRequestRejected as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=_review_request_rejection_detail(exc),
+        ) from exc
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return AgentReviewActionResult.model_validate(result)
 
 
 @router.post(

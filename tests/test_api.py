@@ -158,6 +158,36 @@ async def make_review_placeholder_ready(
         await session.commit()
 
 
+async def create_running_review_action_task(
+    client: TestClient,
+    review_run_id: str,
+    agent_session_id: str | None = "agent-tool-session",
+) -> AgentTask:
+    async with client.app.state.session_factory() as session:
+        review_run = await session.get(ReviewRun, review_run_id)
+        assert review_run is not None
+        task = AgentTask(
+            provider=review_run.provider,
+            repo_full_name=review_run.repo_full_name,
+            pull_request_number=review_run.pull_request_number,
+            pull_request_context_id=review_run.pull_request_context_id,
+            task_type="message_command",
+            source_kind="issue_comment",
+            source_comment_id=f"tool-comment-{review_run.id}",
+            source_author_login="alice",
+            command_text="retry the review",
+            head_sha=review_run.head_sha,
+            status="running",
+            stage="waiting_for_agent",
+            execution_status="running",
+            agent_session_id=agent_session_id,
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        return task
+
+
 async def make_review_run_rerunnable(
     client: TestClient,
     review_run_id: str,
@@ -2213,6 +2243,128 @@ def test_retry_failed_review_run_creates_next_attempt(tmp_path: Path) -> None:
             first.json()["review_run_id"],
             first.json()["review_request_event_id"],
         )
+
+
+def test_pi_agent_tool_can_request_retry_and_rerun_for_its_current_pr(
+    tmp_path: Path,
+) -> None:
+    headers = {"Authorization": "Bearer runtime-tool-secret"}
+    with make_client_with_settings(
+        tmp_path,
+        pi_agent_runtime_token="runtime-tool-secret",
+    ) as client:
+        for offset, action in enumerate(("retry", "rerun")):
+            payload = {
+                "provider": "github",
+                "repo_full_name": "example/repo",
+                "pull_request_number": 42 + offset,
+                "base_sha": "a" * 40,
+                "head_sha": chr(ord("b") + offset) * 40,
+            }
+            source = seed_review_run(client, payload)
+            if action == "retry":
+                client.portal.call(
+                    make_review_run_retryable,
+                    client,
+                    source["id"],
+                )
+            else:
+                client.portal.call(
+                    make_review_run_rerunnable,
+                    client,
+                    source["id"],
+                )
+            task = client.portal.call(
+                create_running_review_action_task,
+                client,
+                source["id"],
+                None if offset == 0 else "agent-tool-session",
+            )
+            request = {
+                "agent_task_id": task.id,
+                "agent_session_id": "agent-tool-session",
+                "action": action,
+            }
+
+            unauthorized = client.post(
+                "/api/v1/internal/agent-tools/review-action",
+                json=request,
+            )
+            first = client.post(
+                "/api/v1/internal/agent-tools/review-action",
+                headers=headers,
+                json=request,
+            )
+            duplicate = client.post(
+                "/api/v1/internal/agent-tools/review-action",
+                headers=headers,
+                json=request,
+            )
+            wrong_session = client.post(
+                "/api/v1/internal/agent-tools/review-action",
+                headers=headers,
+                json={**request, "agent_session_id": "another-session"},
+            )
+            event = client.get(
+                "/api/v1/observability/provider-events/"
+                f"{first.json()['review_request_event_id']}"
+            )
+            created = client.get(
+                f"/api/v1/review-runs/{first.json()['review_run_id']}"
+            )
+
+            assert unauthorized.status_code == 401
+            assert first.status_code == 202
+            assert first.json()["action"] == action
+            assert first.json()["source_review_run_id"] == source["id"]
+            assert first.json()["attempt"] == 2
+            assert first.json()["status"] == "awaiting_delivery"
+            assert duplicate.status_code == 202
+            assert duplicate.json()["review_run_id"] == first.json()["review_run_id"]
+            assert duplicate.json()["deduplicated"] is True
+            assert wrong_session.status_code == 409
+            assert wrong_session.json()["detail"]["code"] == (
+                "agent_session_mismatch"
+            )
+            assert event.status_code == 200
+            assert event.json()["provider"] == "internal"
+            assert event.json()["provider_action"] == action
+            assert event.json()["internal_event"] == "review_requested"
+            assert created.status_code == 200
+            assert created.json()["stage"] == "placeholder_delivery_pending"
+            if action == "retry":
+                source_detail = client.get(
+                    f"/api/v1/observability/review-runs/{source['id']}"
+                )
+                assert source_detail.status_code == 200
+                assert (
+                    source_detail.json()["available_actions"]["retry"][
+                        "reason_code"
+                    ]
+                    == "retry_already_requested"
+                )
+
+
+def test_pi_agent_review_action_tool_fails_closed_without_callback_token(
+    tmp_path: Path,
+) -> None:
+    with make_client_with_settings(
+        tmp_path,
+        pi_agent_runtime_token=None,
+    ) as client:
+        response = client.post(
+            "/api/v1/internal/agent-tools/review-action",
+            json={
+                "agent_task_id": "task-id",
+                "agent_session_id": "session-id",
+                "action": "retry",
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "pi-agent Tool callback token is not configured."
+    )
 
 
 def test_retry_rejections_keep_explainable_internal_events(tmp_path: Path) -> None:

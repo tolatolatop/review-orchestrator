@@ -45,6 +45,7 @@ from review_orchestrator.integrations.pi_agent import (
     AgentDomainPreset,
     AgentInstructionHistoryItem,
     AgentInstructionInput,
+    AgentInstructionOrchestrationContext,
     AgentInstructionRepositoryContext,
     AgentTaskResult,
     PiAgentClient,
@@ -567,6 +568,9 @@ async def _build_agent_instruction(
         text=task.command_text or "",
         author_login=task.source_author_login or "user",
         source_url=task.source_url,
+        orchestration_context=AgentInstructionOrchestrationContext(
+            agent_task_id=task.id,
+        ),
         history=history,
     )
 
